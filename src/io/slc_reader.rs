@@ -1,14 +1,14 @@
 use crate::types::{
     AcquisitionMode, BoundingBox, CoordinateSystem, Polarization, SarComplex, SarError, 
-    SarImage, SarMetadata, SarResult, SubSwath
+    SarImage, SarMetadata, SarResult, OrbitStatus, OrbitData, BurstOrbitData, SubSwath
 };
+use crate::io::orbit::OrbitManager;
 use chrono::{DateTime, Utc};
 use ndarray::Array2;
-use quick_xml::de::from_str;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
@@ -173,12 +173,18 @@ impl SlcReader {
         Self::parse_annotation_xml(&xml_content, pol)
     }
 
-    /// Parse annotation XML content
+    /// Parse annotation XML content with sub-swath extraction
     fn parse_annotation_xml(xml_content: &str, pol: Polarization) -> SarResult<SarMetadata> {
-        // This is a simplified parser. In practice, you'd need more robust XML parsing
-        // for the complex Sentinel-1 annotation format
+        // First try to parse with the full annotation parser
+        let mut sub_swaths = HashMap::new();
         
-        // Extract basic information using string parsing (temporary approach)
+        if let Ok(annotation) = crate::io::annotation::AnnotationParser::parse_annotation(xml_content) {
+            // Extract sub-swaths using the detailed parser
+            sub_swaths = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
+                .unwrap_or_else(|_| HashMap::new());
+        }
+        
+        // Extract basic information using string parsing (fallback approach)
         let product_id = Self::extract_value(&xml_content, "missionId")
             .unwrap_or_else(|| "S1A_UNKNOWN".to_string());
         
@@ -195,7 +201,7 @@ impl SlcReader {
         let start_time = Self::parse_time_flexible(&start_time_str)?;
         let stop_time = Self::parse_time_flexible(&stop_time_str)?;
 
-        // Create minimal metadata structure
+        // Create metadata structure with sub-swaths
         Ok(SarMetadata {
             product_id,
             mission: "Sentinel-1".to_string(),
@@ -212,7 +218,7 @@ impl SlcReader {
                 max_lat: 90.0,
             },
             coordinate_system: CoordinateSystem::Radar,
-            sub_swaths: HashMap::new(),
+            sub_swaths,
             orbit_data: None,
             range_looks: 1,
             azimuth_looks: 1,
@@ -283,7 +289,7 @@ impl SlcReader {
 
     /// Read SLC data for a specific polarization
     pub fn read_slc_data(&mut self, pol: Polarization) -> SarResult<SarImage> {
-        use std::io::Write;
+        
         use tempfile::NamedTempFile;
         
         let measurements = self.find_measurement_files()?;
@@ -430,7 +436,7 @@ impl SlcReader {
 
     /// Read SLC data with optimized parallel processing
     pub fn read_slc_data_parallel(&mut self, pol: Polarization) -> SarResult<SarImage> {
-        use std::io::Write;
+        
         use tempfile::NamedTempFile;
         use rayon::prelude::*;
         
@@ -583,6 +589,580 @@ impl SlcReader {
 
         Ok(slc_data)
     }
+
+    /// Get comprehensive orbit data for the product
+    /// Checks: 1) SLC embedded data, 2) Local cache, 3) Download from ESA
+    pub fn get_orbit_data(&mut self, orbit_cache_dir: Option<&Path>) -> SarResult<OrbitData> {
+        log::info!("Getting orbit data for SLC product");
+        
+        // Get product metadata first
+        let annotations = self.find_annotation_files()?;
+        let first_pol = annotations.keys().next().cloned()
+            .ok_or_else(|| SarError::Processing("No polarizations found".to_string()))?;
+        let metadata = self.read_annotation(first_pol)?;
+        
+        // Extract product ID from filename
+        let product_id = self.zip_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| SarError::Processing("Invalid filename".to_string()))?
+            .replace(".SAFE", "");
+        
+        // Check if SLC contains orbit data (it won't for Sentinel-1, but check anyway)
+        let slc_orbit_data = metadata.orbit_data.as_ref();
+        if slc_orbit_data.is_some() {
+            log::info!("Orbit data found embedded in SLC");
+        } else {
+            log::info!("No orbit data in SLC - will use external sources");
+        }
+        
+        // Use orbit manager to get orbit data
+        let cache_dir = orbit_cache_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+            std::env::temp_dir().join("sardine_orbit_cache")
+        });
+        let orbit_manager = OrbitManager::new(cache_dir);
+        orbit_manager.get_orbit_data(
+            &product_id,
+            metadata.start_time,
+        )
+    }
+    
+    /// Check orbit data availability status
+    pub fn check_orbit_status(&mut self, orbit_cache_dir: Option<&Path>) -> SarResult<OrbitStatus> {
+        let annotations = self.find_annotation_files()?;
+        let first_pol = annotations.keys().next().cloned()
+            .ok_or_else(|| SarError::Processing("No polarizations found".to_string()))?;
+        let metadata = self.read_annotation(first_pol)?;
+        
+        // Extract product ID
+        let product_id = self.zip_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| SarError::Processing("Invalid filename".to_string()))?
+            .replace(".SAFE", "");
+        
+        // Check SLC embedded data
+        let has_embedded = metadata.orbit_data.is_some();
+        
+        // Check cache
+        let cache_dir = orbit_cache_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+            std::env::temp_dir().join("sardine_orbit_cache")
+        });
+        let orbit_manager = OrbitManager::new(cache_dir);
+        let primary_orbit_type = crate::io::orbit::OrbitReader::determine_orbit_type(metadata.start_time);
+        let fallback_orbit_type = match primary_orbit_type {
+            crate::io::orbit::OrbitType::POEORB => crate::io::orbit::OrbitType::RESORB,
+            crate::io::orbit::OrbitType::RESORB => crate::io::orbit::OrbitType::POEORB,
+        };
+        
+        let has_primary_cached = orbit_manager.has_orbit_cached(&product_id, primary_orbit_type);
+        let has_fallback_cached = orbit_manager.has_orbit_cached(&product_id, fallback_orbit_type);
+        
+        Ok(OrbitStatus {
+            product_id,
+            start_time: metadata.start_time,
+            has_embedded,
+            primary_orbit_type,
+            has_primary_cached,
+            fallback_orbit_type,
+            has_fallback_cached,
+            cache_dir: orbit_manager.get_cache_dir().to_path_buf(),
+        })
+    }
+    
+    /// Download orbit files to cache without loading
+    pub fn download_orbit_files(&mut self, orbit_cache_dir: Option<&Path>) -> SarResult<Vec<PathBuf>> {
+        let annotations = self.find_annotation_files()?;
+        let first_pol = annotations.keys().next().cloned()
+            .ok_or_else(|| SarError::Processing("No polarizations found".to_string()))?;
+        let metadata = self.read_annotation(first_pol)?;
+        
+        let product_id = self.zip_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| SarError::Processing("Invalid filename".to_string()))?
+            .replace(".SAFE", "");
+        
+        let cache_dir = orbit_cache_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+            std::env::temp_dir().join("sardine_orbit_cache")
+        });
+        let orbit_manager = OrbitManager::new(cache_dir);
+        let primary_orbit_type = crate::io::orbit::OrbitReader::determine_orbit_type(metadata.start_time);
+        
+        let mut downloaded_files = Vec::new();
+        
+        // Try to download primary orbit type
+        match orbit_manager.download_and_cache_orbit_public(&product_id, metadata.start_time, primary_orbit_type) {
+            Ok(_) => {
+                let path = orbit_manager.get_cache_dir().join(format!("{}_{}.EOF", product_id, primary_orbit_type));
+                downloaded_files.push(path);
+                log::info!("Downloaded {} orbit file", primary_orbit_type);
+            },
+            Err(e) => {
+                log::warn!("Failed to download {} orbit: {}", primary_orbit_type, e);
+                
+                // Try fallback
+                let fallback_orbit_type = match primary_orbit_type {
+                    crate::io::orbit::OrbitType::POEORB => crate::io::orbit::OrbitType::RESORB,
+                    crate::io::orbit::OrbitType::RESORB => crate::io::orbit::OrbitType::POEORB,
+                };
+                
+                match orbit_manager.download_and_cache_orbit_public(&product_id, metadata.start_time, fallback_orbit_type) {
+                    Ok(_) => {
+                        let path = orbit_manager.get_cache_dir().join(format!("{}_{}.EOF", product_id, fallback_orbit_type));
+                        downloaded_files.push(path);
+                        log::info!("Downloaded fallback {} orbit file", fallback_orbit_type);
+                    },
+                    Err(e2) => {
+                        return Err(SarError::Processing(
+                            format!("Failed to download both {} and {} orbit files: {}, {}", 
+                                   primary_orbit_type, fallback_orbit_type, e, e2)
+                        ));
+                    }
+                }
+            }
+        }
+        
+        Ok(downloaded_files)
+    }
+
+    /// Get satellite position and velocity for each pixel row in a burst
+    /// This is essential for accurate geolocation and Doppler processing
+    pub fn get_burst_orbit_data(
+        &mut self,
+        pol: Polarization,
+        orbit_cache_dir: Option<&Path>,
+    ) -> SarResult<BurstOrbitData> {
+        log::info!("Computing burst orbit data for polarization {}", pol);
+        
+        // Get orbit data
+        let orbit_data = self.get_orbit_data(orbit_cache_dir)?;
+        
+        // Get annotation data to extract timing information
+        let annotation = self.read_annotation(pol)?;
+        
+        // Extract burst timing parameters from annotation
+        // These would typically come from the annotation XML, but for now use defaults
+        let burst_start_time = annotation.start_time;
+        
+        // Get image dimensions to determine number of azimuth lines
+        let measurements = self.find_measurement_files()?;
+        let measurement_file = measurements.get(&pol)
+            .ok_or_else(|| SarError::InvalidFormat(
+                format!("No measurement found for polarization {}", pol)
+            ))?;
+        
+        // Extract TIFF to get dimensions
+        let archive = self.open_archive()?;
+        let mut zip_file = archive.by_name(measurement_file)
+            .map_err(|e| SarError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to access {}: {}", measurement_file, e),
+            )))?;
+        
+        // Create temporary file to get dimensions
+        use tempfile::NamedTempFile;
+        let mut temp_file = NamedTempFile::new()
+            .map_err(|e| SarError::Io(e))?;
+        
+        // Copy ZIP content to temp file
+        std::io::copy(&mut zip_file, &mut temp_file)
+            .map_err(|e| SarError::Io(e))?;
+        
+        // Open with GDAL to get dimensions
+        let dataset = gdal::Dataset::open(temp_file.path())
+            .map_err(|e| SarError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open TIFF with GDAL: {}", e),
+            )))?;
+        
+        let raster_size = dataset.raster_size();
+        let (width, height) = (raster_size.0, raster_size.1);
+        
+        log::info!("Image dimensions: {} x {} pixels", width, height);
+        
+        // Calculate azimuth time interval
+        // For Sentinel-1 IW mode, typical azimuth time interval is ~2.8e-4 seconds
+        let acquisition_duration = (annotation.stop_time - annotation.start_time).num_milliseconds() as f64 / 1000.0;
+        let azimuth_time_interval = acquisition_duration / height as f64;
+        
+        log::info!("Azimuth timing: duration={:.3}s, interval={:.6}s, lines={}", 
+                  acquisition_duration, azimuth_time_interval, height);
+        
+        // Interpolate orbit for burst
+        crate::io::orbit::OrbitReader::interpolate_burst_orbit(
+            &orbit_data,
+            burst_start_time,
+            azimuth_time_interval,
+            height,
+        )
+    }
+    
+    /// Calculate satellite position at a specific pixel (azimuth line, range sample)
+    pub fn get_satellite_position_at_pixel(
+        &mut self,
+        pol: Polarization,
+        azimuth_line: usize,
+        range_sample: usize,
+        orbit_cache_dir: Option<&Path>,
+    ) -> SarResult<([f64; 3], [f64; 3])> { // Returns (position, velocity)
+        let burst_orbit = self.get_burst_orbit_data(pol, orbit_cache_dir)?;
+        
+        let position = burst_orbit.get_position_at_line(azimuth_line)
+            .ok_or_else(|| SarError::Processing(
+                format!("Azimuth line {} out of range (max: {})", azimuth_line, burst_orbit.num_lines())
+            ))?;
+            
+        let velocity = burst_orbit.get_velocity_at_line(azimuth_line)
+            .ok_or_else(|| SarError::Processing(
+                format!("Azimuth line {} out of range for velocity", azimuth_line)
+            ))?;
+        
+        log::debug!("Satellite at pixel [{}, {}]: pos=[{:.1}, {:.1}, {:.1}] km, vel=[{:.1}, {:.1}, {:.1}] m/s",
+                   azimuth_line, range_sample,
+                   position[0]/1000.0, position[1]/1000.0, position[2]/1000.0,
+                   velocity[0], velocity[1], velocity[2]);
+        
+        Ok((position, velocity))
+    }
+    
+    /// Calculate Doppler centroid frequency for SAR focusing
+    /// This uses satellite velocity and geometry to estimate Doppler shift
+    pub fn calculate_doppler_centroid(
+        &mut self,
+        pol: Polarization,
+        azimuth_line: usize,
+        range_sample: usize,
+        orbit_cache_dir: Option<&Path>,
+    ) -> SarResult<f64> {
+        let (position, velocity) = self.get_satellite_position_at_pixel(
+            pol, azimuth_line, range_sample, orbit_cache_dir
+        )?;
+        
+        // For now, use a simplified look direction calculation
+        // In a full implementation, this would use the range geometry and target position
+        // Here we approximate the look direction as perpendicular to velocity
+        let velocity_mag = (velocity[0].powi(2) + velocity[1].powi(2) + velocity[2].powi(2)).sqrt();
+        let velocity_unit = [
+            velocity[0] / velocity_mag,
+            velocity[1] / velocity_mag,
+            velocity[2] / velocity_mag,
+        ];
+        
+        // Simplified look direction (perpendicular to velocity, towards Earth)
+        let earth_center = [0.0, 0.0, 0.0];
+        let to_earth = [
+            earth_center[0] - position[0],
+            earth_center[1] - position[1],
+            earth_center[2] - position[2],
+        ];
+        let to_earth_mag = (to_earth[0].powi(2) + to_earth[1].powi(2) + to_earth[2].powi(2)).sqrt();
+        let look_direction = [
+            to_earth[0] / to_earth_mag,
+            to_earth[1] / to_earth_mag,
+            to_earth[2] / to_earth_mag,
+        ];
+        
+        // C-band wavelength (Sentinel-1)
+        let wavelength = 0.055; // meters
+        
+        let doppler = crate::io::orbit::OrbitReader::calculate_doppler_centroid(
+            velocity, look_direction, wavelength
+        );
+        
+        log::debug!("Doppler at pixel [{}, {}]: {:.2} Hz", azimuth_line, range_sample, doppler);
+        
+        Ok(doppler)
+    }
+
+    /// Extract IW sub-swaths information from annotation files
+    /// This implements the "IW split" step in the SAR processing pipeline
+    pub fn extract_iw_subswaths(&mut self, pol: Polarization) -> SarResult<HashMap<String, SubSwath>> {
+        let annotations = self.find_annotation_files()?;
+        let annotation_file = annotations.get(&pol)
+            .ok_or_else(|| SarError::InvalidFormat(
+                format!("No annotation found for polarization {}", pol)
+            ))?
+            .clone();
+
+        let archive = self.open_archive()?;
+        let mut file = archive.by_name(&annotation_file)
+            .map_err(|e| SarError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to read {}: {}", annotation_file, e),
+            )))?;
+
+        let mut xml_content = String::new();
+        file.read_to_string(&mut xml_content)?;
+
+        // First, try the detailed annotation parser
+        if let Ok(annotation) = crate::io::annotation::AnnotationParser::parse_annotation(&xml_content) {
+            if let Ok(subswaths) = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation) {
+                return Ok(subswaths);
+            }
+        }
+
+        // Fallback: Parse using simple string extraction for IW sub-swaths
+        Self::extract_iw_subswaths_fallback(&xml_content, &annotation_file)
+    }
+
+    /// Fallback method to extract IW sub-swaths using simple string parsing
+    fn extract_iw_subswaths_fallback(xml_content: &str, file_path: &str) -> SarResult<HashMap<String, SubSwath>> {
+        let mut subswaths = HashMap::new();
+        
+        // Extract swath ID from filename (e.g., "iw1", "iw2", "iw3")
+        let swath_id = if let Some(captures) = regex::Regex::new(r"-(iw\d+)-")
+            .unwrap()
+            .captures(file_path) {
+            captures.get(1).unwrap().as_str().to_uppercase()
+        } else {
+            "IW1".to_string() // Default fallback
+        };
+        
+        // Extract basic parameters using simple string parsing
+        let range_samples = Self::extract_numeric_value(&xml_content, "numberOfSamples")
+            .unwrap_or(25824.0) as usize;  // Typical IW value
+        
+        let azimuth_samples = Self::extract_numeric_value(&xml_content, "numberOfLines")
+            .unwrap_or(16800.0) as usize;  // Typical IW value
+        
+        let range_pixel_spacing = Self::extract_numeric_value(&xml_content, "rangePixelSpacing")
+            .unwrap_or(2.3); // Typical IW range pixel spacing
+        
+        let azimuth_pixel_spacing = Self::extract_numeric_value(&xml_content, "azimuthPixelSpacing")
+            .unwrap_or(14.0); // Typical IW azimuth pixel spacing
+        
+        let slant_range_time = Self::extract_numeric_value(&xml_content, "slantRangeTime")
+            .unwrap_or(0.005331); // Typical IW slant range time
+        
+        // Count bursts by counting <burst> elements
+        let burst_count = xml_content.matches("<burst>").count();
+        let burst_count = if burst_count > 0 { burst_count } else { 9 }; // Typical IW burst count
+        
+        let subswath = SubSwath {
+            id: swath_id.clone(),
+            burst_count,
+            range_samples,
+            azimuth_samples,
+            range_pixel_spacing,
+            azimuth_pixel_spacing,
+            slant_range_time,
+            burst_duration: 2.758277, // Standard IW burst duration
+        };
+        
+        subswaths.insert(swath_id, subswath);
+        
+        Ok(subswaths)
+    }
+    
+    /// Extract numeric value from XML using simple string parsing
+    fn extract_numeric_value(xml_content: &str, tag_name: &str) -> Option<f64> {
+        let pattern = format!("<{}>(.*?)</{}>", tag_name, tag_name);
+        if let Ok(regex) = regex::Regex::new(&pattern) {
+            if let Some(captures) = regex.captures(xml_content) {
+                if let Some(value_match) = captures.get(1) {
+                    return value_match.as_str().trim().parse::<f64>().ok();
+                }
+            }
+        }
+        None
+    }
+
+    /// Get available IW sub-swaths for all polarizations
+    pub fn get_all_iw_subswaths(&mut self) -> SarResult<HashMap<Polarization, HashMap<String, SubSwath>>> {
+        let annotations = self.find_annotation_files()?;
+        let mut all_subswaths = HashMap::new();
+        
+        for (pol, _) in annotations {
+            match self.extract_iw_subswaths(pol) {
+                Ok(subswaths) => {
+                    all_subswaths.insert(pol, subswaths);
+                },
+                Err(e) => {
+                    eprintln!("Warning: Failed to extract sub-swaths for {}: {}", pol, e);
+                }
+            }
+        }
+        
+        Ok(all_subswaths)
+    }
+
+    /// Check if this is an IW mode SLC product
+    pub fn is_iw_mode(&mut self) -> SarResult<bool> {
+        // Check if annotation files contain IW mode indicators
+        let files = self.list_files()?;
+        
+        for file in files {
+            if file.contains("annotation/") && file.ends_with(".xml") && file.contains("-iw") {
+                return Ok(true);
+            }
+        }
+        
+        Ok(false)
+    }
+
+    /// Deburst SLC data for a specific polarization
+    pub fn deburst_slc(&mut self, pol: Polarization) -> SarResult<SarImage> {
+        use crate::core::deburst::{DeburstProcessor, DeburstConfig};
+        
+        log::info!("Starting deburst processing for polarization {:?}", pol);
+        
+        // Read SLC data
+        let slc_data = self.read_slc_data(pol)?;
+        log::debug!("Read SLC data with dimensions: {:?}", slc_data.dim());
+        
+        // Get annotation for burst information
+        let annotation_files = self.find_annotation_files()?;
+        let annotation_file = annotation_files.get(&pol)
+            .ok_or_else(|| SarError::Processing(format!("No annotation file found for {:?}", pol)))?;
+        
+        // Read annotation content
+        let annotation_content = self.read_file_as_string(annotation_file)?;
+        
+        // Extract burst information
+        let (total_lines, total_samples) = slc_data.dim();
+        let burst_info = DeburstProcessor::extract_burst_info_from_annotation(
+            &annotation_content, 
+            total_lines, 
+            total_samples
+        )?;
+        
+        log::info!("Extracted {} bursts for deburst processing", burst_info.len());
+        
+        // Create deburst processor
+        let processor = DeburstProcessor::new(burst_info);
+        
+        // Configure deburst processing
+        let config = DeburstConfig {
+            blend_overlap: true,
+            blend_lines: 10,
+            remove_invalid_data: true,
+            seamless_stitching: true,
+        };
+        
+        // Perform deburst
+        let deburst_data = processor.deburst(&slc_data, &config)?;
+        
+        log::info!("Deburst completed. Output dimensions: {:?}", deburst_data.dim());
+        Ok(deburst_data)
+    }
+    
+    /// Deburst SLC data for all available polarizations
+    pub fn deburst_all_polarizations(&mut self) -> SarResult<HashMap<Polarization, SarImage>> {
+        log::info!("Starting deburst processing for all polarizations");
+        
+        let annotation_files = self.find_annotation_files()?;
+        let mut deburst_results = HashMap::new();
+        
+        for &pol in annotation_files.keys() {
+            log::info!("Processing deburst for polarization {:?}", pol);
+            
+            match self.deburst_slc(pol) {
+                Ok(deburst_data) => {
+                    deburst_results.insert(pol, deburst_data);
+                    log::info!("Successfully deburst polarization {:?}", pol);
+                }
+                Err(e) => {
+                    log::error!("Failed to deburst polarization {:?}: {}", pol, e);
+                    return Err(e);
+                }
+            }
+        }
+        
+        log::info!("Completed deburst processing for {} polarizations", deburst_results.len());
+        Ok(deburst_results)
+    }
+
+    /// Find calibration files for each polarization in the ZIP
+    pub fn find_calibration_files(&mut self) -> SarResult<HashMap<Polarization, String>> {
+        log::debug!("Finding calibration files");
+        
+        let files = self.list_files()?;
+        let mut calibration_files = HashMap::new();
+        
+        for file in files {
+            if file.contains("annotation/calibration/") && file.ends_with(".xml") {
+                if let Some(pol) = self.extract_polarization_from_filename(&file) {
+                    calibration_files.insert(pol, file);
+                }
+            }
+        }
+        
+        log::info!("Found {} calibration files", calibration_files.len());
+        Ok(calibration_files)
+    }
+    
+    /// Read calibration data for a specific polarization
+    pub fn read_calibration_data(&mut self, pol: Polarization) -> SarResult<crate::core::calibrate::CalibrationCoefficients> {
+        log::debug!("Reading calibration data for polarization {:?}", pol);
+        
+        let calibration_files = self.find_calibration_files()?;
+        let file_path = calibration_files.get(&pol)
+            .ok_or_else(|| SarError::Processing(
+                format!("No calibration file found for polarization {:?}", pol)
+            ))?;
+        
+        let xml_content = self.read_file_as_string(file_path)?;
+        let calibration_data = crate::core::calibrate::parse_calibration_from_xml(&xml_content)?;
+        
+        log::info!("Successfully parsed calibration data for polarization {:?}", pol);
+        Ok(calibration_data)
+    }
+    
+    /// Read calibration data for all available polarizations
+    pub fn read_all_calibration_data(&mut self) -> SarResult<HashMap<Polarization, crate::core::calibrate::CalibrationCoefficients>> {
+        log::info!("Reading calibration data for all polarizations");
+        
+        let calibration_files = self.find_calibration_files()?;
+        let mut calibration_data = HashMap::new();
+        
+        for &pol in calibration_files.keys() {
+            match self.read_calibration_data(pol) {
+                Ok(cal_data) => {
+                    calibration_data.insert(pol, cal_data);
+                    log::info!("Successfully loaded calibration for polarization {:?}", pol);
+                }
+                Err(e) => {
+                    log::error!("Failed to load calibration for polarization {:?}: {}", pol, e);
+                    return Err(e);
+                }
+            }
+        }
+        
+        log::info!("Completed loading calibration data for {} polarizations", calibration_data.len());
+        Ok(calibration_data)
+    }
+
+    /// Extract polarization from filename
+    fn extract_polarization_from_filename(&self, filename: &str) -> Option<Polarization> {
+        if filename.contains("-vv-") {
+            Some(Polarization::VV)
+        } else if filename.contains("-vh-") {
+            Some(Polarization::VH)
+        } else if filename.contains("-hv-") {
+            Some(Polarization::HV)
+        } else if filename.contains("-hh-") {
+            Some(Polarization::HH)
+        } else {
+            None
+        }
+    }
+
+    /// Read a file from the ZIP archive as a string
+    fn read_file_as_string(&mut self, file_path: &str) -> SarResult<String> {
+        let archive = self.open_archive()?;
+        let mut file = archive.by_name(file_path)
+            .map_err(|e| SarError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to read {}: {}", file_path, e),
+            )))?;
+
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    // ...existing code...
 }
 
 #[cfg(test)]

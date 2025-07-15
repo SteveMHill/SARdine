@@ -4,14 +4,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 /// Detailed annotation structures for Sentinel-1
+/// This represents the root <product> element directly
 #[derive(Debug, Deserialize)]
 pub struct AnnotationRoot {
-    #[serde(rename = "product")]
-    pub product: ProductAnnotation,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ProductAnnotation {
     #[serde(rename = "swathTiming")]
     pub swath_timing: SwathTiming,
     #[serde(rename = "imageAnnotation")]
@@ -152,14 +147,14 @@ impl AnnotationParser {
     pub fn extract_subswaths(annotation: &AnnotationRoot) -> SarResult<HashMap<String, SubSwath>> {
         let mut subswaths = HashMap::new();
         
-        let image_info = &annotation.product.image_annotation.image_information;
-        let proc_params = &annotation.product.image_annotation.processing_information
+        let image_info = &annotation.image_annotation.image_information;
+        let proc_params = &annotation.image_annotation.processing_information
             .swath_proc_params_list.swath_proc_params;
 
         for params in proc_params {
             let subswath = SubSwath {
                 id: params.swath.clone(),
-                burst_count: annotation.product.swath_timing.burst_list.bursts.len(),
+                burst_count: annotation.swath_timing.burst_list.bursts.len(),
                 range_samples: image_info.number_of_samples,
                 azimuth_samples: image_info.number_of_lines,
                 range_pixel_spacing: image_info.range_pixel_spacing,
@@ -182,7 +177,7 @@ impl AnnotationParser {
 
     /// Extract burst timing information
     pub fn extract_burst_times(annotation: &AnnotationRoot) -> SarResult<Vec<String>> {
-        let bursts = &annotation.product.swath_timing.burst_list.bursts;
+        let bursts = &annotation.swath_timing.burst_list.bursts;
         let mut burst_times = Vec::new();
         
         for burst in bursts {
@@ -194,7 +189,7 @@ impl AnnotationParser {
 
     /// Extract Doppler centroid information
     pub fn extract_doppler_centroid(annotation: &AnnotationRoot) -> SarResult<Vec<f64>> {
-        let dc_estimates = &annotation.product.doppler_centroid.dc_estimate_list.dc_estimates;
+        let dc_estimates = &annotation.doppler_centroid.dc_estimate_list.dc_estimates;
         let mut frequencies = Vec::new();
         
         for estimate in dc_estimates {

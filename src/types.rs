@@ -3,6 +3,7 @@ use ndarray::{Array2, Array3};
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Complex-valued SAR data type (I + jQ)
 pub type SarComplex = Complex<f32>;
@@ -169,3 +170,117 @@ pub enum SarError {
 
 /// Result type for SAR operations
 pub type SarResult<T> = Result<T, SarError>;
+
+/// Orbit file availability status
+#[derive(Debug, Clone)]
+pub struct OrbitStatus {
+    /// Product identifier
+    pub product_id: String,
+    /// Product acquisition start time
+    pub start_time: DateTime<Utc>,
+    /// Whether orbit data is embedded in SLC
+    pub has_embedded: bool,
+    /// Primary recommended orbit type
+    pub primary_orbit_type: crate::io::orbit::OrbitType,
+    /// Whether primary orbit is cached locally
+    pub has_primary_cached: bool,
+    /// Fallback orbit type
+    pub fallback_orbit_type: crate::io::orbit::OrbitType,
+    /// Whether fallback orbit is cached locally
+    pub has_fallback_cached: bool,
+    /// Path to orbit cache directory
+    pub cache_dir: PathBuf,
+}
+
+impl OrbitStatus {
+    /// Check if any orbit data is available (embedded or cached)
+    pub fn has_any_orbit(&self) -> bool {
+        self.has_embedded || self.has_primary_cached || self.has_fallback_cached
+    }
+    
+    /// Get recommended action for obtaining orbit data
+    pub fn recommended_action(&self) -> OrbitAction {
+        if self.has_embedded {
+            OrbitAction::UseEmbedded
+        } else if self.has_primary_cached {
+            OrbitAction::UseCached(self.primary_orbit_type)
+        } else if self.has_fallback_cached {
+            OrbitAction::UseCached(self.fallback_orbit_type)
+        } else {
+            OrbitAction::Download(self.primary_orbit_type)
+        }
+    }
+}
+
+/// Recommended action for orbit data
+#[derive(Debug, Clone, Copy)]
+pub enum OrbitAction {
+    /// Use orbit data embedded in SLC
+    UseEmbedded,
+    /// Use cached orbit file of specified type
+    UseCached(crate::io::orbit::OrbitType),
+    /// Download orbit file of specified type
+    Download(crate::io::orbit::OrbitType),
+}
+
+/// Burst-specific orbit data for pixel-level satellite position/velocity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurstOrbitData {
+    /// Satellite positions for each azimuth line [ECEF coordinates in meters]
+    pub positions: Vec<[f64; 3]>,
+    /// Satellite velocities for each azimuth line [ECEF in m/s]
+    pub velocities: Vec<[f64; 3]>,
+    /// Azimuth times for each line
+    pub azimuth_times: Vec<DateTime<Utc>>,
+    /// Burst start time
+    pub burst_start_time: DateTime<Utc>,
+    /// Time interval between azimuth samples (seconds)
+    pub azimuth_time_interval: f64,
+}
+
+impl BurstOrbitData {
+    /// Get satellite position for a specific azimuth line
+    pub fn get_position_at_line(&self, line_idx: usize) -> Option<[f64; 3]> {
+        self.positions.get(line_idx).copied()
+    }
+    
+    /// Get satellite velocity for a specific azimuth line
+    pub fn get_velocity_at_line(&self, line_idx: usize) -> Option<[f64; 3]> {
+        self.velocities.get(line_idx).copied()
+    }
+    
+    /// Get azimuth time for a specific line
+    pub fn get_azimuth_time_at_line(&self, line_idx: usize) -> Option<DateTime<Utc>> {
+        self.azimuth_times.get(line_idx).copied()
+    }
+    
+    /// Calculate Doppler centroid for a given line and range direction
+    pub fn calculate_doppler_at_line(
+        &self,
+        line_idx: usize,
+        look_direction: [f64; 3], // unit vector towards target
+        wavelength: f64, // radar wavelength (C-band ≈ 0.055 m)
+    ) -> Option<f64> {
+        let velocity = self.get_velocity_at_line(line_idx)?;
+        
+        // Doppler frequency = 2 * (v_sat · look_dir) / λ
+        let velocity_dot_look = velocity[0] * look_direction[0] +
+                               velocity[1] * look_direction[1] +
+                               velocity[2] * look_direction[2];
+        
+        Some(2.0 * velocity_dot_look / wavelength)
+    }
+    
+    /// Get number of azimuth lines
+    pub fn num_lines(&self) -> usize {
+        self.positions.len()
+    }
+}
+
+/// EOF orbit file header information
+#[derive(Debug, Clone, Default)]
+pub struct EofHeader {
+    pub coordinate_system: Option<String>,
+    pub time_reference: Option<String>,
+    pub file_name: Option<String>,
+}

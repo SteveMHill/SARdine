@@ -2,7 +2,7 @@
 
 ## 📦 Project Overview
 
-SARius is an open-source Python+Rust library for processing Sentinel-1 SLC data into calibrated, terrain-corrected backscatter products (Gamma0). It is designed as a modern alternative to ESA SNAP and GAMMA, with a focus on speed, modularity, and full transparency.
+SARdine is an open-source Python+Rust library for processing Sentinel-1 SLC data into calibrated, terrain-corrected backscatter products (Gamma0). It is designed as a modern alternative to ESA SNAP and GAMMA, with a focus on speed, modularity, and full transparency.
 
 ---
 

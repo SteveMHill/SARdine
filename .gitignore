@@ -100,3 +100,10 @@ Pipfile.lock
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Debug and test scripts (should not be committed)
+debug_*.py
+test_*.py
+check_*.py
+*_debug.py
+*_test.py
