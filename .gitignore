@@ -85,6 +85,8 @@ orbit_cache/
 *.npz
 processed_data/
 output/
+data/*_backscatter_*/
+data/output_*/
 
 # =============================================================================
 # Development & Testing Files

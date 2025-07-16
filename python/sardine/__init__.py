@@ -9,11 +9,34 @@ from . import _core
 from ._core import (
     SlcReader, 
     Polarization, 
-    Metadata, 
+    Metadata,
+    OrbitData,
+    StateVector,
     test_srtm_download, 
     apply_speckle_filter, 
-    estimate_num_looks
+    estimate_num_looks,
+    terrain_correction,
+    enhanced_terrain_correction_pipeline,
+    adaptive_terrain_correction,
+    create_terrain_corrector,
+    latlon_to_ecef,
+    topsar_merge,
+    apply_masking_workflow,
+    apply_mask_to_gamma0,
+    PyMaskingWorkflow,
+    PyMaskResult,
+    linear_to_db,
+    linear_to_db_f32,
+    db_to_linear,
+    apply_terrain_flattening,
+    apply_terrain_flattening_with_mask,
+    create_terrain_flattening_params,
+    apply_complete_terrain_flattening,
+    prepare_dem_for_scene
 )
+
+# Create alias for backward compatibility
+PyOrbitData = OrbitData
 
 __version__ = "0.1.0"
 __author__ = "Steven Hill and contributors"
@@ -23,12 +46,41 @@ __all__ = [
     "SlcReader",
     "Polarization", 
     "Metadata",
+    "OrbitData",
+    "StateVector",
+    "PyOrbitData",
     "test_srtm_download",
     "apply_speckle_filter",
     "estimate_num_looks",
+    "terrain_correction",
+    "enhanced_terrain_correction_pipeline",
+    "adaptive_terrain_correction",
+    "create_terrain_corrector",
+    "latlon_to_ecef",
+    "topsar_merge",
+    "apply_masking_workflow",
+    "apply_mask_to_gamma0",
+    "PyMaskingWorkflow",
+    "PyMaskResult",
+    "linear_to_db",
+    "linear_to_db_f32",
+    "db_to_linear",
+    "apply_terrain_flattening",
+    "apply_terrain_flattening_with_mask", 
+    "create_terrain_flattening_params",
+    "apply_complete_terrain_flattening",
+    "prepare_dem_for_scene",
     "process_slc",
     "get_product_info",
 ]
+
+# GeoTIFF export utilities (requires rasterio)
+try:
+    from .geotiff import export_geotiff, export_cog, export_multiband_geotiff, validate_geotiff
+    __all__.extend(['export_geotiff', 'export_cog', 'export_multiband_geotiff', 'validate_geotiff'])
+except ImportError:
+    # rasterio not available, GeoTIFF functions will not be available
+    pass
 
 def process_slc(input_path, output_path=None, **kwargs):
     """

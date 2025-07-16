@@ -16,6 +16,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 # Python bindings
 pyo3 = { version = "0.20", features = ["extension-module"] }
+numpy = "0.20"
 
 # Core numerical computing
 ndarray = { version = "0.15", features = ["rayon"] }
@@ -41,7 +42,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 thiserror = "1.0"
 log = "0.4"
-rayon = "1.7"  # Parallel processing
+rayon = { version = "1.7", optional = true }  # Parallel processing
 dirs = "5.0"   # Platform-specific directories
 
 # Math and signal processing
@@ -53,6 +54,10 @@ regex = "1.11.1"
 approx = "0.5"
 tempfile = "3.8"
 env_logger = "0.10"
+
+[features]
+default = []
+parallel = ["rayon"]
 
 [profile.release]
 opt-level = 3

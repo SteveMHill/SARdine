@@ -786,6 +786,157 @@ def cmd_calibrate(args):
         return 1
 
 
+def cmd_topsar_merge(args):
+    """Handle the 'topsar-merge' command."""
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"❌ Error: File not found: {input_path}")
+        return 1
+    
+    print(f"🔄 Starting TOPSAR merge processing: {input_path.name}")
+    
+    try:
+        # Initialize reader
+        reader = sardine.SlcReader(str(input_path))
+        
+        # Find available polarizations
+        annotation_files = reader.find_annotation_files()
+        available_polarizations = list(annotation_files.keys())
+        
+        print(f"📡 Available polarizations: {', '.join(available_polarizations)}")
+        
+        # Determine which polarizations to process
+        if args.polarization:
+            if args.polarization.upper() not in available_polarizations:
+                print(f"❌ Error: Polarization {args.polarization} not found")
+                print(f"   Available: {', '.join(available_polarizations)}")
+                return 1
+            polarizations_to_process = [args.polarization.upper()]
+        else:
+            polarizations_to_process = available_polarizations
+        
+        print(f"🎯 Processing polarizations: {', '.join(polarizations_to_process)}")
+        print(f"🎯 Calibration type: {args.calibration_type}")
+        print(f"🎯 Overlap method: {args.overlap_method}")
+        
+        # Process each polarization
+        results = {}
+        total_start_time = time.time()
+        
+        for pol in polarizations_to_process:
+            pol_start_time = time.time()
+            print(f"\n🔄 Processing {pol} TOPSAR merge...")
+            
+            try:
+                # Get sub-swath information
+                subswaths = reader.get_subswath_info(pol)
+                print(f"   • Sub-swaths found: {len(subswaths)}")
+                
+                if len(subswaths) < 2:
+                    print(f"⚠️  Warning: Only {len(subswaths)} sub-swaths found, merge not needed")
+                    continue
+                
+                # Perform calibration + TOPSAR merge
+                merged_data = sardine.topsar_merge(
+                    str(input_path),
+                    pol,
+                    args.calibration_type,
+                    args.overlap_method,
+                    args.output_grid or "auto"
+                )
+                
+                pol_end_time = time.time()
+                
+                # Calculate data statistics
+                import numpy as np
+                
+                merged_array = merged_data["intensity_data"]
+                data_min = np.min(merged_array)
+                data_max = np.max(merged_array)
+                data_mean = np.mean(merged_array)
+                valid_pixels = np.sum(merged_data["valid_mask"])
+                total_pixels = merged_data["valid_mask"].size
+                
+                print(f"✅ TOPSAR merge completed for {pol}")
+                print(f"   • Output dimensions: {merged_array.shape[0]:,} x {merged_array.shape[1]:,}")
+                print(f"   • Sub-swaths merged: {merged_data['metadata']['num_swaths']}")
+                print(f"   • Overlap regions: {merged_data['metadata']['overlap_count']}")
+                print(f"   • Valid pixels: {valid_pixels:,} / {total_pixels:,} ({100*valid_pixels/total_pixels:.1f}%)")
+                print(f"   • Data range: {data_min:.2e} to {data_max:.2e}")
+                print(f"   • Mean value: {data_mean:.2e}")
+                print(f"   • Processing time: {pol_end_time - pol_start_time:.2f} seconds")
+                
+                results[pol] = {
+                    "output_dimensions": merged_array.shape,
+                    "processing_time": pol_end_time - pol_start_time,
+                    "data_size_mb": (merged_array.size * 4) / (1024 * 1024),  # float32 = 4 bytes
+                    "num_swaths": merged_data['metadata']['num_swaths'],
+                    "overlap_count": merged_data['metadata']['overlap_count'],
+                    "valid_fraction": valid_pixels / total_pixels,
+                    "data_stats": {
+                        "min": float(data_min),
+                        "max": float(data_max),
+                        "mean": float(data_mean)
+                    }
+                }
+                
+                # Save to binary file if requested
+                if args.output:
+                    output_path = Path(args.output)
+                    if len(polarizations_to_process) > 1:
+                        # Multiple polarizations: create separate files
+                        pol_output_path = output_path.parent / f"{output_path.stem}_{pol.lower()}_merged_{args.calibration_type}{output_path.suffix}"
+                    else:
+                        pol_output_path = output_path.parent / f"{output_path.stem}_merged_{args.calibration_type}{output_path.suffix}"
+                    
+                    # Save as numpy array
+                    np.save(pol_output_path.with_suffix('.npy'), merged_array.astype(np.float32))
+                    print(f"💾 Merged data saved to: {pol_output_path.with_suffix('.npy')}")
+                    
+                    # Also save valid mask
+                    mask_output_path = pol_output_path.parent / f"{pol_output_path.stem}_mask.npy"
+                    np.save(mask_output_path, merged_data["valid_mask"])
+                    print(f"💾 Valid mask saved to: {mask_output_path}")
+                
+            except Exception as e:
+                print(f"❌ Error processing {pol}: {e}")
+                if hasattr(args, 'verbose') and args.verbose:
+                    import traceback
+                    traceback.print_exc()
+                return 1
+        
+        total_end_time = time.time()
+        
+        # Print summary
+        print(f"\n" + "="*70)
+        print("🔗 TOPSAR MERGE PROCESSING SUMMARY")
+        print("="*70)
+        
+        for pol, result in results.items():
+            print(f"📡 {pol}:")
+            print(f"   • Output dimensions: {result['output_dimensions'][0]:,} x {result['output_dimensions'][1]:,}")
+            print(f"   • Sub-swaths merged: {result['num_swaths']}")
+            print(f"   • Overlap regions: {result['overlap_count']}")
+            print(f"   • Valid data: {result['valid_fraction']:.1%}")
+            print(f"   • Data size: {result['data_size_mb']:.1f} MB")
+            print(f"   • Data range: {result['data_stats']['min']:.2e} to {result['data_stats']['max']:.2e}")
+            print(f"   • Processing time: {result['processing_time']:.2f} seconds")
+        
+        print(f"\n⏱️  Total processing time: {total_end_time - total_start_time:.2f} seconds")
+        print(f"🚀 TOPSAR merge processing complete!")
+        print(f"Next step: Apply multilooking and terrain correction")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Error during TOPSAR merge: {e}")
+        import traceback
+        if hasattr(args, 'verbose') and args.verbose:
+            traceback.print_exc()
+        return 1
+
+
 def cmd_multilook(args):
     """Handle the 'multilook' command."""
     input_path = Path(args.input)
@@ -1003,7 +1154,7 @@ def cmd_terrain_flatten(args):
             
             print(f"✅ Terrain flattening completed in {processing_time:.2f}s")
             print(f"📊 Output shape: {gamma0_data.shape}")
-            print(f"📏 Pixel spacing: {range_spacing:.2f}m (range) x {azimuth_spacing:.2f}m (azimuth)")
+            print(f"📏 Pixel spacing: {range_spacing:.2f}m x {azimuth_spacing:.2f}m (azimuth)")
             
             # Save gamma0 data
             output_gamma0 = f"gamma0_{polarization}_{args.range_looks}x{args.azimuth_looks}.npy"
@@ -1043,6 +1194,272 @@ def cmd_terrain_flatten(args):
             
     except Exception as e:
         print(f"❌ Error: {e}")
+        return 1
+
+
+def cmd_geocode(args):
+    """Perform terrain correction (geocoding) to map coordinates."""
+    try:
+        print("🗺️  Starting terrain correction (geocoding)...")
+        start_time = time.time()
+        
+        import numpy as np
+        from sardine import _core
+        
+        # Load SAR image
+        if args.input.endswith('.npy'):
+            sar_image = np.load(args.input).tolist()
+        else:
+            print(f"❌ Unsupported input format: {args.input}")
+            print("Currently supported: .npy files")
+            return 1
+        
+        # Parse bounding box
+        try:
+            bbox_parts = [float(x.strip()) for x in args.bbox.split(',')]
+            if len(bbox_parts) != 4:
+                raise ValueError("Bounding box must have 4 values")
+            bbox = tuple(bbox_parts)
+        except ValueError as e:
+            print(f"❌ Invalid bounding box format: {e}")
+            print("Expected format: 'min_lat,max_lat,min_lon,max_lon'")
+            return 1
+        
+        # Load orbit data (simplified - would need proper orbit file parsing)
+        # For now, create dummy orbit data
+        orbit_data = []
+        
+        print(f"📊 Input image shape: {len(sar_image)}x{len(sar_image[0]) if sar_image else 0}")
+        print(f"🌍 DEM file: {args.dem}")
+        print(f"📡 Orbit file: {args.orbit}")
+        print(f"📦 Bounding box: {bbox}")
+        print(f"🎯 Output CRS: EPSG:{args.output_crs}")
+        print(f"📏 Output spacing: {args.output_spacing}m")
+        
+        # Perform terrain correction
+        _core.terrain_correction(
+            sar_image,
+            args.dem,
+            orbit_data,
+            bbox,
+            args.output,
+            args.output_crs,
+            args.output_spacing
+        )
+        
+        processing_time = time.time() - start_time
+        print(f"\n✅ Terrain correction completed in {processing_time:.2f} seconds")
+        print(f"📁 Output saved to: {args.output}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"\n❌ Terrain correction failed: {e}")
+        return 1
+
+
+def cmd_test_dem(args):
+    """Test DEM loading for terrain correction."""
+    try:
+        print("🧪 Testing DEM loading for terrain correction...")
+        start_time = time.time()
+        
+        from sardine import _core
+        
+        # Test DEM loading
+        result = _core.create_terrain_corrector(
+            args.dem,
+            args.output_crs,
+            args.output_spacing
+        )
+        
+        processing_time = time.time() - start_time
+        print(f"\n✅ DEM test completed in {processing_time:.2f} seconds")
+        print(f"📊 Result: {result}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"\n❌ DEM test failed: {e}")
+        return 1
+
+
+def cmd_latlon_to_ecef(args):
+    """Convert lat/lon coordinates to ECEF."""
+    try:
+        from sardine import _core
+        
+        ecef = _core.latlon_to_ecef(args.lat, args.lon, args.elevation)
+        
+        print(f"📍 Input coordinates:")
+        print(f"   Latitude: {args.lat}°")
+        print(f"   Longitude: {args.lon}°") 
+        print(f"   Elevation: {args.elevation}m")
+        print(f"\n🌍 ECEF coordinates:")
+        print(f"   X: {ecef[0]:.3f}m")
+        print(f"   Y: {ecef[1]:.3f}m")
+        print(f"   Z: {ecef[2]:.3f}m")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"\n❌ Coordinate conversion failed: {e}")
+        return 1
+
+
+def cmd_mask(args):
+    """Apply masking workflow to terrain-corrected data."""
+    try:
+        print(f"🎭 Starting masking workflow...")
+        print(f"📁 Input gamma0 file: {args.gamma0_file}")
+        print(f"📁 Input DEM file: {args.dem_file}")
+        print(f"📁 Output file: {args.output_file}")
+        print(f"📏 LIA threshold: {args.lia_threshold}")
+        print(f"📏 DEM threshold: {args.dem_threshold}")
+        print(f"📊 Gamma0 range: {args.gamma0_min} to {args.gamma0_max} dB")
+        
+        start_time = time.time()
+        
+        # Load gamma0 data
+        gamma0_data = None
+        if args.gamma0_file.endswith('.npy'):
+            import numpy as np
+            gamma0_data = np.load(args.gamma0_file)
+        else:
+            print(f"❌ Unsupported gamma0 file format: {args.gamma0_file}")
+            return 1
+        
+        # Load DEM data
+        dem_data = None
+        if args.dem_file.endswith('.npy'):
+            import numpy as np
+            dem_data = np.load(args.dem_file)
+        else:
+            print(f"❌ Unsupported DEM file format: {args.dem_file}")
+            return 1
+        
+        # Perform masking
+        import numpy as np
+        
+        # Compute masks
+        lia_mask = np.abs(gamma0_data['incidence_angle']) >= args.lia_threshold
+        dem_mask = dem_data['elevation'] >= args.dem_threshold
+        gamma0_mask = (gamma0_data['gamma0'] >= args.gamma0_min) & (gamma0_data['gamma0'] <= args.gamma0_max)
+        
+        # Combined mask
+        combined_mask = lia_mask & dem_mask & gamma0_mask
+        
+        # Apply mask to gamma0 data
+        masked_gamma0 = np.where(combined_mask, gamma0_data['gamma0'], args.fill_value)
+        
+        # Save output
+        output_data = {
+            'gamma0': masked_gamma0,
+            'valid_mask': combined_mask
+        }
+        
+        import numpy as np
+        np.save(args.output_file, output_data)
+        
+        processing_time = time.time() - start_time
+        
+        print(f"✅ Masking workflow completed in {processing_time:.2f}s")
+        print(f"📊 Output data range: {output_data['gamma0'].min()} to {output_data['gamma0'].max()}")
+        print(f"📁 Output saved to: {args.output_file}")
+        
+        # Save individual mask components if requested
+        if args.save_masks:
+            mask_dir = Path(args.output_file).parent / "masks"
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save LIA mask
+            np.save(mask_dir / "lia_mask.npy", lia_mask)
+            print(f"💾 LIA mask saved to: {mask_dir / 'lia_mask.npy'}")
+            
+            # Save DEM mask
+            np.save(mask_dir / "dem_mask.npy", dem_mask)
+            print(f"💾 DEM mask saved to: {mask_dir / 'dem_mask.npy'}")
+            
+            # Save gamma0 mask
+            np.save(mask_dir / "gamma0_mask.npy", gamma0_mask)
+            print(f"💾 Gamma0 mask saved to: {mask_dir / 'gamma0_mask.npy'}")
+        
+        # Save LIA values if requested
+        if args.save_lia:
+            lia_values = np.abs(gamma0_data['incidence_angle'])
+            np.save(args.output_file.with_suffix('_lia.npy'), lia_values)
+            print(f"💾 LIA values saved to: {args.output_file.with_suffix('_lia.npy')}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Error during masking workflow: {e}")
+        return 1
+
+
+def cmd_backscatter(args):
+    """Handle the 'backscatter' command - complete processing pipeline."""
+    import subprocess
+    import sys
+    
+    try:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"❌ Error: Input file not found: {input_path}")
+            return 1
+        
+        print_banner()
+        print(f"🛰️  Starting Complete Backscatter Processing")
+        print(f"📁 Input: {input_path}")
+        print("=" * 70)
+        
+        # Build command for the backscatter processor
+        script_path = Path(__file__).parent.parent.parent / "examples" / "backscatter_processor.py"
+        
+        cmd = [sys.executable, str(script_path), str(input_path)]
+        
+        # Add optional arguments
+        if args.output_dir:
+            cmd.extend(["--output-dir", args.output_dir])
+        if args.range_looks:
+            cmd.extend(["--range-looks", str(args.range_looks)])
+        if args.azimuth_looks:
+            cmd.extend(["--azimuth-looks", str(args.azimuth_looks)])
+        if args.polarizations:
+            cmd.extend(["--polarizations"] + args.polarizations)
+        if args.speckle_filter:
+            cmd.extend(["--speckle-filter", args.speckle_filter])
+        if args.speckle_window:
+            cmd.extend(["--speckle-window", str(args.speckle_window)])
+        if args.no_speckle_filter:
+            cmd.append("--no-speckle-filter")
+        if args.output_crs:
+            cmd.extend(["--output-crs", str(args.output_crs)])
+        if args.output_spacing:
+            cmd.extend(["--output-spacing", str(args.output_spacing)])
+        if args.export_cog:
+            cmd.append("--export-cog")
+        if args.no_linear:
+            cmd.append("--no-linear")
+        if args.no_db:
+            cmd.append("--no-db")
+        if args.no_masks:
+            cmd.append("--no-masks")
+        if args.lia_threshold:
+            cmd.extend(["--lia-threshold", str(args.lia_threshold)])
+        if args.gamma0_min:
+            cmd.extend(["--gamma0-min", str(args.gamma0_min)])
+        if args.gamma0_max:
+            cmd.extend(["--gamma0-max", str(args.gamma0_max)])
+        if args.no_masking:
+            cmd.append("--no-masking")
+        
+        # Run the backscatter processor
+        result = subprocess.run(cmd, capture_output=False)
+        return result.returncode
+        
+    except Exception as e:
+        print(f"❌ Error running backscatter processor: {e}")
         return 1
 
 
@@ -1091,6 +1508,94 @@ Examples:
         "--json",
         action="store_true",
         help="Output information as JSON"
+    )
+    
+    # Backscatter command - complete processing pipeline
+    backscatter_parser = subparsers.add_parser(
+        "backscatter",
+        help="Complete backscatter processing pipeline (SLC → analysis-ready products)"
+    )
+    backscatter_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    backscatter_parser.add_argument(
+        "--output-dir",
+        help="Output directory (default: auto-generated)"
+    )
+    
+    # Processing parameters
+    backscatter_parser.add_argument(
+        "--range-looks", type=int, default=4,
+        help="Range looks for multilooking (default: 4)"
+    )
+    backscatter_parser.add_argument(
+        "--azimuth-looks", type=int, default=1,
+        help="Azimuth looks for multilooking (default: 1)"
+    )
+    backscatter_parser.add_argument(
+        "--polarizations", nargs="+", default=["VV", "VH"],
+        choices=["VV", "VH", "HH", "HV"],
+        help="Polarizations to process (default: VV VH)"
+    )
+    
+    # Speckle filtering
+    backscatter_parser.add_argument(
+        "--speckle-filter", default="enhanced_lee",
+        choices=["mean", "lee", "enhanced_lee", "lee_sigma", "frost", "gamma_map"],
+        help="Speckle filter type (default: enhanced_lee)"
+    )
+    backscatter_parser.add_argument(
+        "--speckle-window", type=int, default=7,
+        help="Speckle filter window size (default: 7)"
+    )
+    backscatter_parser.add_argument(
+        "--no-speckle-filter", action="store_true",
+        help="Skip speckle filtering"
+    )
+    
+    # Output options
+    backscatter_parser.add_argument(
+        "--output-crs", type=int, default=4326,
+        help="Output CRS EPSG code (default: 4326 - WGS84)"
+    )
+    backscatter_parser.add_argument(
+        "--output-spacing", type=float, default=10.0,
+        help="Output pixel spacing in meters (default: 10.0)"
+    )
+    backscatter_parser.add_argument(
+        "--export-cog", action="store_true",
+        help="Export as Cloud Optimized GeoTIFF"
+    )
+    backscatter_parser.add_argument(
+        "--no-linear", action="store_true",
+        help="Skip linear scale export"
+    )
+    backscatter_parser.add_argument(
+        "--no-db", action="store_true",
+        help="Skip dB scale export"
+    )
+    backscatter_parser.add_argument(
+        "--no-masks", action="store_true",
+        help="Skip quality mask export"
+    )
+    
+    # Masking parameters
+    backscatter_parser.add_argument(
+        "--lia-threshold", type=float, default=0.1,
+        help="Local incidence angle threshold in cosine (default: 0.1 = ~84°)"
+    )
+    backscatter_parser.add_argument(
+        "--gamma0-min", type=float, default=-35.0,
+        help="Minimum gamma0 threshold in dB (default: -35.0)"
+    )
+    backscatter_parser.add_argument(
+        "--gamma0-max", type=float, default=5.0,
+        help="Maximum gamma0 threshold in dB (default: 5.0)"
+    )
+    backscatter_parser.add_argument(
+        "--no-masking", action="store_true",
+        help="Skip quality masking"
     )
     
     # Process command
@@ -1203,6 +1708,40 @@ Examples:
         "--db-scale",
         action="store_true",
         help="Save output in dB scale (additional .npy file)"
+    )
+    
+    # TOPSAR merge command
+    merge_parser = subparsers.add_parser(
+        "topsar-merge",
+        help="Merge IW sub-swaths after calibration (TOPSAR merge)"
+    )
+    merge_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    merge_parser.add_argument(
+        "--output",
+        help="Output file for merged data (Numpy .npy format)"
+    )
+    merge_parser.add_argument(
+        "--polarization",
+        help="Specify polarization to merge (e.g., VV, VH)"
+    )
+    merge_parser.add_argument(
+        "--calibration-type",
+        default="sigma0",
+        choices=["sigma0", "beta0", "gamma0", "dn"],
+        help="Type of calibration to apply before merging (default: sigma0)"
+    )
+    merge_parser.add_argument(
+        "--overlap-method",
+        default="feather",
+        choices=["feather", "average", "first", "second"],
+        help="Method for handling overlap regions (default: feather)"
+    )
+    merge_parser.add_argument(
+        "--output-grid",
+        help="Output grid specification (auto, fine, coarse, or WKT)"
     )
     
     # Multilook command
@@ -1376,6 +1915,133 @@ Examples:
         help="Window size for estimation (default: 11)"
     )
     
+    # Terrain correction (geocoding) command
+    geocode_parser = subparsers.add_parser(
+        "geocode",
+        help="Perform terrain correction (geocoding) to map coordinates"
+    )
+    geocode_parser.add_argument(
+        "input",
+        help="Input SAR image (numpy .npy file or GeoTIFF)"
+    )
+    geocode_parser.add_argument(
+        "dem",
+        help="Path to DEM file (GeoTIFF)"
+    )
+    geocode_parser.add_argument(
+        "orbit",
+        help="Path to orbit file (.EOF format)"
+    )
+    geocode_parser.add_argument(
+        "output",
+        help="Output geocoded GeoTIFF file"
+    )
+    geocode_parser.add_argument(
+        "--bbox",
+        type=str,
+        required=True,
+        help="Bounding box as 'min_lat,max_lat,min_lon,max_lon'"
+    )
+    geocode_parser.add_argument(
+        "--output-crs",
+        type=int,
+        default=4326,
+        help="Output coordinate reference system (EPSG code, default: 4326)"
+    )
+    geocode_parser.add_argument(
+        "--output-spacing",
+        type=float,
+        default=10.0,
+        help="Output pixel spacing in meters (default: 10.0)"
+    )
+    
+    # Test DEM terrain corrector creation
+    test_dem_parser = subparsers.add_parser(
+        "test-dem",
+        help="Test DEM loading for terrain correction"
+    )
+    test_dem_parser.add_argument(
+        "dem",
+        help="Path to DEM file (GeoTIFF)"
+    )
+    test_dem_parser.add_argument(
+        "--output-crs",
+        type=int,
+        default=4326,
+        help="Output coordinate reference system (EPSG code, default: 4326)"
+    )
+    test_dem_parser.add_argument(
+        "--output-spacing",
+        type=float,
+        default=10.0,
+        help="Output pixel spacing in meters (default: 10.0)"
+    )
+    
+    # Masking workflow subcommands
+    mask_parser = subparsers.add_parser('mask', help='Apply masking workflow to terrain-corrected data')
+    mask_parser.add_argument('gamma0_file', help='Input gamma0 GeoTIFF file')
+    mask_parser.add_argument('dem_file', help='Input DEM file')
+    mask_parser.add_argument('output_file', help='Output masked gamma0 GeoTIFF file')
+    mask_parser.add_argument('--lia-threshold', type=float, default=0.1, 
+                           help='Local incidence angle cosine threshold (default: 0.1)')
+    mask_parser.add_argument('--dem-threshold', type=float, default=-100.0,
+                           help='DEM validity threshold in meters (default: -100.0)')
+    mask_parser.add_argument('--gamma0-min', type=float, default=-50.0,
+                           help='Minimum gamma0 value in dB (default: -50.0)')
+    mask_parser.add_argument('--gamma0-max', type=float, default=10.0,
+                           help='Maximum gamma0 value in dB (default: 10.0)')
+    mask_parser.add_argument('--fill-value', type=float, default=float('nan'),
+                           help='Fill value for masked pixels (default: NaN)')
+    mask_parser.add_argument('--save-masks', action='store_true',
+                           help='Save individual mask components')
+    mask_parser.add_argument('--save-lia', action='store_true',
+                           help='Save local incidence angle cosine values')
+    mask_parser.set_defaults(func=handle_masking)
+    
+    # Enhanced terrain correction pipeline subcommands
+    enhanced_tc_parser = subparsers.add_parser('enhanced-terrain-correction', 
+                                               help='Enhanced terrain correction with integrated masking')
+    enhanced_tc_parser.add_argument('sar_file', help='Input SAR image file (numpy array or GeoTIFF)')
+    enhanced_tc_parser.add_argument('dem_file', help='Input DEM file')
+    enhanced_tc_parser.add_argument('orbit_file', help='Input orbit file')
+    enhanced_tc_parser.add_argument('output_file', help='Output terrain-corrected GeoTIFF file')
+    enhanced_tc_parser.add_argument('--bbox', nargs=4, type=float, metavar=('MIN_LON', 'MIN_LAT', 'MAX_LON', 'MAX_LAT'),
+                                   help='Bounding box coordinates')
+    enhanced_tc_parser.add_argument('--output-crs', type=int, default=4326,
+                                   help='Output coordinate reference system EPSG code (default: 4326)')
+    enhanced_tc_parser.add_argument('--output-spacing', type=float, default=10.0,
+                                   help='Output pixel spacing in meters (default: 10.0)')
+    enhanced_tc_parser.add_argument('--enable-masking', action='store_true',
+                                   help='Enable masking workflow')
+    enhanced_tc_parser.add_argument('--lia-threshold', type=float, default=0.1,
+                                   help='Local incidence angle cosine threshold (default: 0.1)')
+    enhanced_tc_parser.add_argument('--dem-threshold', type=float, default=-100.0,
+                                   help='DEM validity threshold in meters (default: -100.0)')
+    enhanced_tc_parser.add_argument('--gamma0-min', type=float, default=-50.0,
+                                   help='Minimum gamma0 value in dB (default: -50.0)')
+    enhanced_tc_parser.add_argument('--gamma0-max', type=float, default=10.0,
+                                   help='Maximum gamma0 value in dB (default: 10.0)')
+    enhanced_tc_parser.add_argument('--save-intermediate', action='store_true',
+                                   help='Save intermediate masking products')
+    enhanced_tc_parser.set_defaults(func=handle_enhanced_terrain_correction)
+    
+    # Adaptive terrain correction subcommands
+    adaptive_tc_parser = subparsers.add_parser('adaptive-terrain-correction',
+                                              help='Adaptive terrain correction with quality assessment')
+    adaptive_tc_parser.add_argument('sar_file', help='Input SAR image file')
+    adaptive_tc_parser.add_argument('dem_file', help='Input DEM file')
+    adaptive_tc_parser.add_argument('orbit_file', help='Input orbit file')
+    adaptive_tc_parser.add_argument('output_file', help='Output terrain-corrected GeoTIFF file')
+    adaptive_tc_parser.add_argument('--bbox', nargs=4, type=float, metavar=('MIN_LON', 'MIN_LAT', 'MAX_LON', 'MAX_LAT'),
+                                   help='Bounding box coordinates')
+    adaptive_tc_parser.add_argument('--output-crs', type=int, default=4326,
+                                   help='Output coordinate reference system EPSG code (default: 4326)')
+    adaptive_tc_parser.add_argument('--output-spacing', type=float, default=10.0,
+                                   help='Output pixel spacing in meters (default: 10.0)')
+    adaptive_tc_parser.add_argument('--disable-adaptive', action='store_true',
+                                   help='Disable adaptive thresholding')
+    adaptive_tc_parser.set_defaults(func=handle_adaptive_terrain_correction)
+
     args = parser.parse_args()
     
     if not args.command:
@@ -1386,6 +2052,8 @@ Examples:
     # Route to appropriate command handler
     if args.command == "info":
         return cmd_info(args)
+    elif args.command == "backscatter":
+        return cmd_backscatter(args)
     elif args.command == "process":
         return cmd_process(args)
     elif args.command == "test":
@@ -1398,6 +2066,8 @@ Examples:
         return cmd_deburst(args)
     elif args.command == "calibrate":
         return cmd_calibrate(args)
+    elif args.command == "topsar-merge":
+        return cmd_topsar_merge(args)
     elif args.command == "multilook":
         return cmd_multilook(args)
     elif args.command == "terrain":
@@ -1408,10 +2078,291 @@ Examples:
         return cmd_speckle_filter(args)
     elif args.command == "estimate-nlooks":
         return cmd_estimate_nlooks(args)
-    else:
-        parser.print_help()
+    elif args.command == "geocode":
+        return cmd_geocode(args)
+    elif args.command == "test-dem":
+        return cmd_test_dem(args)
+    elif args.command == "latlon-to-ecef":
+        return cmd_latlon_to_ecef(args)
+    elif args.command == "mask":
+        return cmd_mask(args)
+    elif args.command == "backscatter":
+        return cmd_backscatter(args)
+    
+    return 1
+
+# Handler function for masking workflow
+def handle_masking(args):
+    """Handle masking workflow command."""
+    try:
+        import numpy as np
+        import rasterio
+        from rasterio.transform import Affine
+        import sardine
+        
+        print(f"Applying masking workflow to {args.gamma0_file}")
+        
+        # Read gamma0 data
+        with rasterio.open(args.gamma0_file) as src:
+            gamma0_data = src.read(1).astype(np.float32)
+            gamma0_profile = src.profile
+            gamma0_transform = src.transform
+        
+        # Read DEM data
+        with rasterio.open(args.dem_file) as src:
+            dem_data = src.read(1).astype(np.float32)
+            dem_profile = src.profile
+        
+        # Check dimensions match
+        if gamma0_data.shape != dem_data.shape:
+            print(f"Error: Gamma0 shape {gamma0_data.shape} doesn't match DEM shape {dem_data.shape}")
+            return
+        
+        # Create terrain corrector for masking workflow
+        # Use gamma0 geotransform for output grid
+        geotransform = [
+            gamma0_transform.c,  # x_origin
+            gamma0_transform.a,  # pixel_width
+            gamma0_transform.b,  # rotation_x
+            gamma0_transform.f,  # y_origin
+            gamma0_transform.d,  # rotation_y
+            gamma0_transform.e   # pixel_height
+        ]
+        
+        corrector = sardine.create_terrain_corrector(
+            output_width=gamma0_data.shape[1],
+            output_height=gamma0_data.shape[0],
+            output_geotransform=geotransform,
+            output_projection="EPSG:4326",  # Will be overridden by actual CRS
+            output_pixel_spacing=abs(gamma0_transform.a)
+        )
+        
+        # Create masking workflow
+        workflow = sardine.create_masking_workflow(
+            lia_threshold=args.lia_threshold,
+            dem_threshold=args.dem_threshold,
+            gamma0_min=args.gamma0_min,
+            gamma0_max=args.gamma0_max
+        )
+        
+        print(f"Masking parameters:")
+        print(f"  LIA threshold (cos): {args.lia_threshold}")
+        print(f"  DEM threshold (m): {args.dem_threshold}")
+        print(f"  Gamma0 range (dB): [{args.gamma0_min}, {args.gamma0_max}]")
+        print(f"  Fill value: {args.fill_value}")
+        
+        # Apply masking workflow
+        mask_result = sardine.apply_masking_workflow(
+            corrector, gamma0_data, dem_data, workflow
+        )
+        
+        print(f"Masking results:")
+        print(f"  Total pixels: {mask_result.total_pixels}")
+        print(f"  Valid pixels: {mask_result.valid_pixels}")
+        print(f"  Coverage: {mask_result.coverage_percent:.1f}%")
+        
+        # Apply mask to gamma0 data
+        masked_gamma0 = sardine.apply_mask_to_gamma0(
+            gamma0_data, 
+            mask_result.get_combined_mask(),
+            args.fill_value
+        )
+        
+        # Save masked gamma0
+        output_profile = gamma0_profile.copy()
+        output_profile.update({
+            'dtype': 'float32',
+            'nodata': args.fill_value if not np.isnan(args.fill_value) else None
+        })
+        
+        with rasterio.open(args.output_file, 'w', **output_profile) as dst:
+            dst.write(masked_gamma0, 1)
+        
+        print(f"Saved masked gamma0 to: {args.output_file}")
+        
+        # Save additional outputs if requested
+        if args.save_masks:
+            base_name = args.output_file.rsplit('.', 1)[0]
+            
+            # Individual masks
+            mask_profile = gamma0_profile.copy()
+            mask_profile.update({'dtype': 'uint8', 'nodata': 255})
+            
+            masks = {
+                'combined': mask_result.get_combined_mask(),
+                'gamma0': mask_result.get_gamma0_mask(),
+                'dem': mask_result.get_dem_mask(),
+                'lia': mask_result.get_lia_mask()
+            }
+            
+            for mask_name, mask_data in masks.items():
+                mask_file = f"{base_name}_{mask_name}_mask.tif"
+                with rasterio.open(mask_file, 'w', **mask_profile) as dst:
+                    dst.write((mask_data * 255).astype(np.uint8), 1)
+                print(f"Saved {mask_name} mask to: {mask_file}")
+        
+        if args.save_lia:
+            base_name = args.output_file.rsplit('.', 1)[0]
+            lia_file = f"{base_name}_lia_cosine.tif"
+            
+            lia_profile = gamma0_profile.copy()
+            lia_profile.update({'dtype': 'float32', 'nodata': np.nan})
+            
+            with rasterio.open(lia_file, 'w', **lia_profile) as dst:
+                dst.write(mask_result.get_lia_cosine(), 1)
+            print(f"Saved LIA cosine to: {lia_file}")
+        
+        print("Masking workflow completed successfully!")
+        
+    except Exception as e:
+        print(f"Error in masking workflow: {e}")
+        raise
+
+# Handler function for enhanced terrain correction
+def handle_enhanced_terrain_correction(args):
+    """Handle enhanced terrain correction command."""
+    import numpy as np
+    
+    try:
+        start_time = time.time()
+        
+        print(f"🌍 Starting enhanced terrain correction with masking")
+        print(f"Input SAR file: {args.sar_file}")
+        print(f"DEM file: {args.dem_file}")
+        print(f"Orbit file: {args.orbit_file}")
+        print(f"Output file: {args.output_file}")
+        
+        # Load SAR data (simplified - in practice you'd load from various formats)
+        if args.sar_file.endswith('.npy'):
+            sar_data = np.load(args.sar_file)
+        else:
+            print(f"❌ Unsupported SAR file format. Currently only .npy files are supported.")
+            return 1
+        
+        # Load orbit data (simplified)
+        orbit_data = sardine.OrbitData()  # Would need proper orbit file loading
+        
+        # Set up bounding box
+        if args.bbox:
+            bbox = tuple(args.bbox)
+        else:
+            # Default bounding box (you'd derive this from the SAR data)
+            bbox = (-180.0, -90.0, 180.0, 90.0)
+        
+        # Create masking workflow if enabled
+        masking_config = None
+        if args.enable_masking:
+            masking_config = sardine.create_masking_workflow(
+                lia_threshold=args.lia_threshold,
+                dem_threshold=args.dem_threshold,
+                gamma0_min=args.gamma0_min,
+                gamma0_max=args.gamma0_max
+            )
+            print(f"🎭 Masking enabled with thresholds:")
+            print(f"  - LIA threshold: {args.lia_threshold}")
+            print(f"  - DEM threshold: {args.dem_threshold}m")
+            print(f"  - Gamma0 range: [{args.gamma0_min}, {args.gamma0_max}] dB")
+        
+        # Perform enhanced terrain correction
+        sardine.enhanced_terrain_correction_pipeline(
+            sar_image=sar_data,
+            dem_path=args.dem_file,
+            orbit_data=orbit_data,
+            sar_bbox=bbox,
+            output_path=args.output_file,
+            output_crs=args.output_crs,
+            output_spacing=args.output_spacing,
+            masking_config=masking_config,
+            save_intermediate=args.save_intermediate
+        )
+        
+        processing_time = time.time() - start_time
+        print(f"✅ Enhanced terrain correction completed in {processing_time:.2f}s")
+        
+        if args.save_intermediate:
+            print(f"💾 Intermediate products saved alongside main output")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Error during enhanced terrain correction: {e}")
+        import traceback
+        if args.verbose:
+            traceback.print_exc()
         return 1
 
+# Handler function for adaptive terrain correction
+def handle_adaptive_terrain_correction(args):
+    """Handle adaptive terrain correction command."""
+    import numpy as np
+    
+    try:
+        start_time = time.time()
+        
+        print(f"🧠 Starting adaptive terrain correction with quality assessment")
+        print(f"Input SAR file: {args.sar_file}")
+        print(f"DEM file: {args.dem_file}")
+        print(f"Orbit file: {args.orbit_file}")
+        print(f"Output file: {args.output_file}")
+        
+        # Load SAR data
+        if args.sar_file.endswith('.npy'):
+            sar_data = np.load(args.sar_file)
+        else:
+            print(f"❌ Unsupported SAR file format. Currently only .npy files are supported.")
+            return 1
+        
+        # Load orbit data (simplified)
+        orbit_data = sardine.OrbitData()
+        
+        # Set up bounding box
+        if args.bbox:
+            bbox = tuple(args.bbox)
+        else:
+            bbox = (-180.0, -90.0, 180.0, 90.0)
+        
+        adaptive_thresholds = not args.disable_adaptive
+        print(f"🔧 Adaptive thresholding: {'enabled' if adaptive_thresholds else 'disabled'}")
+        
+        # Perform adaptive terrain correction
+        corrected_image, mask_result = sardine.adaptive_terrain_correction(
+            sar_image=sar_data,
+            dem_path=args.dem_file,
+            orbit_data=orbit_data,
+            sar_bbox=bbox,
+            output_path=args.output_file,
+            output_crs=args.output_crs,
+            output_spacing=args.output_spacing,
+            adaptive_thresholds=adaptive_thresholds
+        )
+        
+        processing_time = time.time() - start_time
+        print(f"✅ Adaptive terrain correction completed in {processing_time:.2f}s")
+        
+        # Display quality assessment results
+        print(f"📊 Quality Assessment Results:")
+        print(f"  - Valid pixels: {mask_result.valid_pixels:,}/{mask_result.total_pixels:,}")
+        print(f"  - Coverage: {mask_result.coverage_percent:.1f}%")
+        
+        # Save corrected image and mask results
+        corrected_output = args.output_file.replace('.tif', '_corrected.npy')
+        np.save(corrected_output, corrected_image)
+        print(f"💾 Corrected image saved to: {corrected_output}")
+        
+        # Save quality mask
+        quality_mask = mask_result.get_combined_mask()
+        mask_output = args.output_file.replace('.tif', '_quality_mask.npy')
+        np.save(mask_output, quality_mask)
+        print(f"💾 Quality mask saved to: {mask_output}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Error during adaptive terrain correction: {e}")
+        import traceback
+        if args.verbose:
+            traceback.print_exc()
+        return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit(main())

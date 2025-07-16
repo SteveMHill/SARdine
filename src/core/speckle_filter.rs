@@ -107,6 +107,53 @@ impl SpeckleFilter {
         Ok(filtered)
     }
 
+    /// Apply speckle filtering with optimized algorithm selection
+    pub fn apply_filter_optimized(
+        &self,
+        image: &Array2<f32>,
+        filter_type: SpeckleFilterType,
+    ) -> SarResult<Array2<f32>> {
+        log::info!("Applying OPTIMIZED {:?} speckle filter", filter_type);
+        log::debug!("Filter parameters: {:?}", self.params);
+
+        let (height, width) = image.dim();
+        let total_pixels = height * width;
+
+        // Choose optimization strategy based on image size
+        let filtered = match filter_type {
+            SpeckleFilterType::EnhancedLee => {
+                if total_pixels > 10_000_000 {  // > 10M pixels
+                    self.apply_enhanced_lee_filter_parallel(image)?
+                } else if total_pixels > 1_000_000 {  // 1-10M pixels
+                    self.apply_enhanced_lee_filter_chunked(image)?
+                } else {
+                    self.apply_enhanced_lee_filter(image)?  // Use standard for small images
+                }
+            },
+            SpeckleFilterType::Mean => {
+                if total_pixels > 5_000_000 {
+                    self.apply_mean_filter_optimized(image)?
+                } else {
+                    self.apply_mean_filter(image)?
+                }
+            },
+            SpeckleFilterType::Median => {
+                if total_pixels > 5_000_000 {
+                    self.apply_median_filter_optimized(image)?
+                } else {
+                    self.apply_median_filter(image)?
+                }
+            },
+            _ => {
+                // For other filters, use standard implementation
+                self.apply_filter(image, filter_type)?
+            }
+        };
+
+        log::info!("Optimized speckle filtering completed successfully");
+        Ok(filtered)
+    }
+
     /// Apply mean filter (simple averaging)
     fn apply_mean_filter(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
         log::debug!("Applying mean filter");
@@ -143,6 +190,126 @@ impl SpeckleFilter {
         Ok(filtered)
     }
 
+    /// Enhanced Lee filter with chunked processing for better cache performance
+    fn apply_enhanced_lee_filter_chunked(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
+        log::debug!("Applying Enhanced Lee filter with chunked processing");
+        
+        let (height, width) = image.dim();
+        let mut filtered = Array2::zeros((height, width));
+        let half_window = self.params.window_size / 2;
+
+        let cu = 1.0 / self.params.num_looks.sqrt();
+        let cmax = 1.73;
+
+        // Process in chunks for better cache performance
+        let chunk_size = 512;
+        
+        for i_chunk in (0..height).step_by(chunk_size) {
+            let i_end = (i_chunk + chunk_size).min(height);
+            
+            for j_chunk in (0..width).step_by(chunk_size) {
+                let j_end = (j_chunk + chunk_size).min(width);
+                
+                // Process chunk
+                for i in i_chunk..i_end {
+                    for j in j_chunk..j_end {
+                        let center_value = image[[i, j]];
+                        
+                        if !center_value.is_finite() || center_value <= 0.0 {
+                            filtered[[i, j]] = center_value;
+                            continue;
+                        }
+
+                        let (local_mean, local_variance) = self.calculate_local_statistics_fast(image, i, j, half_window);
+                        
+                        if local_mean <= 0.0 {
+                            filtered[[i, j]] = center_value;
+                            continue;
+                        }
+
+                        let cv = local_variance.sqrt() / local_mean;
+
+                        let result = if cv <= cu {
+                            local_mean
+                        } else if cv < cmax {
+                            let weight = (cv * cv - cu * cu) / (cv * cv * (1.0 + cu * cu));
+                            local_mean + weight * (center_value - local_mean)
+                        } else {
+                            center_value
+                        };
+
+                        filtered[[i, j]] = result;
+                    }
+                }
+            }
+        }
+
+        Ok(filtered)
+    }
+
+    /// Parallel Enhanced Lee filter using Rayon (if available)
+    #[cfg(feature = "parallel")]
+    fn apply_enhanced_lee_filter_parallel(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
+        use rayon::prelude::*;
+        
+        log::debug!("Applying Enhanced Lee filter with parallel processing");
+        
+        let (height, width) = image.dim();
+        let mut filtered = Array2::zeros((height, width));
+        let half_window = self.params.window_size / 2;
+
+        let cu = 1.0 / self.params.num_looks.sqrt();
+        let cmax = 1.73;
+
+        // Create index pairs for parallel processing
+        let indices: Vec<(usize, usize)> = (0..height)
+            .flat_map(|i| (0..width).map(move |j| (i, j)))
+            .collect();
+
+        let results: Vec<(usize, usize, f32)> = indices
+            .into_par_iter()
+            .map(|(i, j)| {
+                let center_value = image[[i, j]];
+                
+                let result = if !center_value.is_finite() || center_value <= 0.0 {
+                    center_value
+                } else {
+                    let (local_mean, local_variance) = self.calculate_local_statistics_fast(image, i, j, half_window);
+                    
+                    if local_mean <= 0.0 {
+                        center_value
+                    } else {
+                        let cv = local_variance.sqrt() / local_mean;
+
+                        if cv <= cu {
+                            local_mean
+                        } else if cv < cmax {
+                            let weight = (cv * cv - cu * cu) / (cv * cv * (1.0 + cu * cu));
+                            local_mean + weight * (center_value - local_mean)
+                        } else {
+                            center_value
+                        }
+                    }
+                };
+                
+                (i, j, result)
+            })
+            .collect();
+
+        // Assign results back to filtered array
+        for (i, j, value) in results {
+            filtered[[i, j]] = value;
+        }
+
+        Ok(filtered)
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn apply_enhanced_lee_filter_parallel(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
+        // Fallback to chunked processing if parallel feature is not available
+        self.apply_enhanced_lee_filter_chunked(image)
+    }
+
     /// Apply median filter
     fn apply_median_filter(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
         log::debug!("Applying median filter");
@@ -173,6 +340,75 @@ impl SpeckleFilter {
                 if !window_values.is_empty() {
                     window_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     filtered[[i, j]] = window_values[window_values.len() / 2];
+                } else {
+                    filtered[[i, j]] = image[[i, j]];
+                }
+            }
+        }
+
+        Ok(filtered)
+    }
+
+    /// Optimized mean filter with better memory access patterns
+    fn apply_mean_filter_optimized(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
+        log::debug!("Applying optimized mean filter");
+        
+        let (height, width) = image.dim();
+        let mut filtered = Array2::zeros((height, width));
+        let half_window = self.params.window_size / 2;
+
+        // Process in cache-friendly chunks
+        let chunk_size = 256;
+        
+        for i_chunk in (0..height).step_by(chunk_size) {
+            let i_end = (i_chunk + chunk_size).min(height);
+            
+            for j_chunk in (0..width).step_by(chunk_size) {
+                let j_end = (j_chunk + chunk_size).min(width);
+                
+                for i in i_chunk..i_end {
+                    for j in j_chunk..j_end {
+                        let (mean, _) = self.calculate_local_statistics_fast(image, i, j, half_window);
+                        filtered[[i, j]] = if mean > 0.0 { mean } else { image[[i, j]] };
+                    }
+                }
+            }
+        }
+
+        Ok(filtered)
+    }
+
+    /// Optimized median filter with efficient sorting
+    fn apply_median_filter_optimized(&self, image: &Array2<f32>) -> SarResult<Array2<f32>> {
+        log::debug!("Applying optimized median filter");
+        
+        let (height, width) = image.dim();
+        let mut filtered = Array2::zeros((height, width));
+        let half_window = self.params.window_size / 2;
+
+        for i in 0..height {
+            for j in 0..width {
+                let mut window_values = Vec::with_capacity(self.params.window_size * self.params.window_size);
+
+                let i_start = i.saturating_sub(half_window);
+                let i_end = (i + half_window + 1).min(height);
+                let j_start = j.saturating_sub(half_window);
+                let j_end = (j + half_window + 1).min(width);
+
+                for wi in i_start..i_end {
+                    for wj in j_start..j_end {
+                        let pixel_val = image[[wi, wj]];
+                        if pixel_val.is_finite() && pixel_val > 0.0 {
+                            window_values.push(pixel_val);
+                        }
+                    }
+                }
+
+                if !window_values.is_empty() {
+                    // Sort and find median
+                    window_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let mid = window_values.len() / 2;
+                    filtered[[i, j]] = window_values[mid];
                 } else {
                     filtered[[i, j]] = image[[i, j]];
                 }
@@ -526,6 +762,38 @@ impl SpeckleFilter {
         (mean, variance)
     }
 
+    /// Fast local statistics calculation with optimized loop
+    fn calculate_local_statistics_fast(&self, image: &Array2<f32>, center_i: usize, center_j: usize, half_window: usize) -> (f32, f32) {
+        let (height, width) = image.dim();
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        let mut count = 0;
+
+        let i_start = center_i.saturating_sub(half_window);
+        let i_end = (center_i + half_window + 1).min(height);
+        let j_start = center_j.saturating_sub(half_window);
+        let j_end = (center_j + half_window + 1).min(width);
+
+        for i in i_start..i_end {
+            for j in j_start..j_end {
+                let pixel_val = image[[i, j]];
+                if pixel_val.is_finite() && pixel_val > 0.0 {
+                    sum += pixel_val;
+                    sum_sq += pixel_val * pixel_val;
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 1 {
+            let mean = sum / count as f32;
+            let variance = (sum_sq / count as f32) - (mean * mean);
+            (mean, variance.max(0.0))
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
     /// Multi-scale speckle filtering
     pub fn apply_multiscale_filter(
         &self,
@@ -585,6 +853,55 @@ impl SpeckleFilter {
         
         log::info!("Estimated number of looks: {:.2}", num_looks);
         Ok(num_looks.max(1.0))
+    }
+
+    /// Performance benchmark for speckle filters
+    pub fn benchmark_speckle_filters(&self, image: &Array2<f32>) -> SarResult<()> {
+        use std::time::Instant;
+        
+        log::info!("=== Speckle Filter Performance Benchmark ===");
+        let (height, width) = image.dim();
+        let total_pixels = height * width;
+        log::info!("Image size: {}x{} = {} pixels", height, width, total_pixels);
+        
+        // Test Enhanced Lee filter
+        log::info!("Testing Enhanced Lee filter variants...");
+        
+        // Standard implementation
+        let start = Instant::now();
+        let _result1 = self.apply_enhanced_lee_filter(image)?;
+        let standard_time = start.elapsed();
+        log::info!("Standard Enhanced Lee: {:.2} seconds ({:.0} pixels/sec)", 
+                  standard_time.as_secs_f64(), 
+                  total_pixels as f64 / standard_time.as_secs_f64());
+        
+        // Chunked implementation
+        let start = Instant::now();
+        let _result2 = self.apply_enhanced_lee_filter_chunked(image)?;
+        let chunked_time = start.elapsed();
+        log::info!("Chunked Enhanced Lee: {:.2} seconds ({:.0} pixels/sec)", 
+                  chunked_time.as_secs_f64(),
+                  total_pixels as f64 / chunked_time.as_secs_f64());
+        
+        // Parallel implementation (if available)
+        #[cfg(feature = "parallel")]
+        {
+            let start = Instant::now();
+            let _result3 = self.apply_enhanced_lee_filter_parallel(image)?;
+            let parallel_time = start.elapsed();
+            log::info!("Parallel Enhanced Lee: {:.2} seconds ({:.0} pixels/sec)", 
+                      parallel_time.as_secs_f64(),
+                      total_pixels as f64 / parallel_time.as_secs_f64());
+            
+            let parallel_speedup = standard_time.as_secs_f64() / parallel_time.as_secs_f64();
+            log::info!("Parallel speedup: {:.2}x", parallel_speedup);
+        }
+        
+        let chunked_speedup = standard_time.as_secs_f64() / chunked_time.as_secs_f64();
+        log::info!("Chunked speedup: {:.2}x", chunked_speedup);
+        log::info!("=== Benchmark Complete ===");
+        
+        Ok(())
     }
 }
 

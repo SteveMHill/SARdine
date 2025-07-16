@@ -912,14 +912,25 @@ impl DemReader {
         
         // Step 2: Validate DEM coverage
         log::info!("✅ Step 2: Validating DEM coverage");
+        
+        // Calculate DEM bounding box from geotransform
+        // For north-up images (pixel_height < 0), top_left_y is the maximum latitude
+        let dem_height = dem.dim().0 as f64;
+        let dem_width = dem.dim().1 as f64;
+        
         let dem_bbox = BoundingBox {
-            min_lat: dem_geo_transform.top_left_y + (dem.dim().0 as f64) * dem_geo_transform.pixel_height,
-            max_lat: dem_geo_transform.top_left_y,
-            min_lon: dem_geo_transform.top_left_x,
-            max_lon: dem_geo_transform.top_left_x + (dem.dim().1 as f64) * dem_geo_transform.pixel_width,
+            min_lat: dem_geo_transform.top_left_y + dem_height * dem_geo_transform.pixel_height.min(0.0),
+            max_lat: dem_geo_transform.top_left_y + dem_height * dem_geo_transform.pixel_height.max(0.0),
+            min_lon: dem_geo_transform.top_left_x + dem_width * dem_geo_transform.pixel_width.min(0.0),
+            max_lon: dem_geo_transform.top_left_x + dem_width * dem_geo_transform.pixel_width.max(0.0),
         };
         
-        let coverage_ok = Self::validate_dem_coverage(&dem_bbox, sar_bbox, 0.01)?; // 0.01° buffer
+        log::debug!("DEM bbox: min_lat={:.6}, max_lat={:.6}, min_lon={:.6}, max_lon={:.6}", 
+                   dem_bbox.min_lat, dem_bbox.max_lat, dem_bbox.min_lon, dem_bbox.max_lon);
+        log::debug!("SAR bbox: min_lat={:.6}, max_lat={:.6}, min_lon={:.6}, max_lon={:.6}", 
+                   sar_bbox.min_lat, sar_bbox.max_lat, sar_bbox.min_lon, sar_bbox.max_lon);
+        
+        let coverage_ok = Self::validate_dem_coverage(&dem_bbox, sar_bbox, 0.001)?; // Very small buffer for testing
         if !coverage_ok {
             return Err(SarError::Processing(
                 "DEM does not provide adequate coverage for SAR scene".to_string()

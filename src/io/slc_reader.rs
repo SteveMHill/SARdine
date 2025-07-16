@@ -445,6 +445,7 @@ impl SlcReader {
     pub fn read_slc_data_parallel(&mut self, pol: Polarization) -> SarResult<SarImage> {
         
         use tempfile::NamedTempFile;
+        #[cfg(feature = "parallel")]
         use rayon::prelude::*;
         
         let measurements = self.find_measurement_files()?;
@@ -558,15 +559,17 @@ impl SlcReader {
         let conversion_start = std::time::Instant::now();
         let mut slc_data = Array2::zeros((height, width));
         
-        // Process in parallel chunks by dividing into row chunks
-        let chunk_size = std::cmp::max(1, height / rayon::current_num_threads());
-        
-        slc_data.axis_chunks_iter_mut(ndarray::Axis(0), chunk_size)
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(chunk_idx, mut chunk)| {
-                let start_row = chunk_idx * chunk_size;
-                for (local_row, mut row) in chunk.axis_iter_mut(ndarray::Axis(0)).enumerate() {
+        #[cfg(feature = "parallel")]
+        {
+            // Process in parallel chunks by dividing into row chunks
+            let chunk_size = std::cmp::max(1, height / rayon::current_num_threads());
+            
+            slc_data.axis_chunks_iter_mut(ndarray::Axis(0), chunk_size)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(chunk_idx, mut chunk)| {
+                    let start_row = chunk_idx * chunk_size;
+                    for (local_row, mut row) in chunk.axis_iter_mut(ndarray::Axis(0)).enumerate() {
                     let global_row = start_row + local_row;
                     for col in 0..width {
                         let idx = global_row * width + col;
@@ -578,6 +581,22 @@ impl SlcReader {
                     }
                 }
             });
+        }
+        
+        #[cfg(not(feature = "parallel"))]
+        {
+            // Sequential processing fallback
+            for row in 0..height {
+                for col in 0..width {
+                    let idx = row * width + col;
+                    if idx < i_data.data.len() {
+                        let i_val = i_data.data[idx];
+                        let q_val = q_data.data[idx];
+                        slc_data[[row, col]] = SarComplex::new(i_val, q_val);
+                    }
+                }
+            }
+        }
 
         let conversion_time = conversion_start.elapsed();
         let total_time = start_time.elapsed();

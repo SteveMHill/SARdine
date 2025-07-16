@@ -1,5 +1,5 @@
 use crate::types::{SarError, SarImage, SarRealImage, SarResult, Polarization};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Zip};
 use regex::Regex;
 
 /// Calibration vector from Sentinel-1 XML
@@ -125,6 +125,136 @@ impl CalibrationCoefficients {
             Ok(values[before_idx] * (1.0 - weight) + values[after_idx] * weight)
         }
     }
+
+    /// Pre-compute calibration coefficients for faster access (OPTIMIZATION)
+    pub fn precompute_coefficients(&mut self, image_dims: (usize, usize)) -> SarResult<()> {
+        log::info!("Pre-computing calibration coefficients for {}x{} image", image_dims.0, image_dims.1);
+        
+        // Sort vectors by line for faster binary search
+        self.vectors.sort_by_key(|v| v.line);
+        
+        // Pre-validate all vectors
+        for (i, vector) in self.vectors.iter().enumerate() {
+            if vector.pixels.is_empty() || vector.sigma_nought.is_empty() {
+                return Err(SarError::Processing(
+                    format!("Empty calibration vector at index {}", i)
+                ));
+            }
+        }
+        
+        log::debug!("Calibration coefficients pre-computation completed");
+        Ok(())
+    }
+
+    /// Get calibration value with optimized lookup (FAST VERSION)
+    pub fn get_calibration_value_fast(
+        &self,
+        line: usize,
+        pixel: usize,
+        cal_type: CalibrationType,
+    ) -> SarResult<f32> {
+        if self.vectors.is_empty() {
+            return Err(SarError::Processing(
+                "No calibration vectors available".to_string(),
+            ));
+        }
+
+        // Binary search for surrounding vectors (O(log n) instead of O(n))
+        let (before_idx, after_idx) = self.find_surrounding_vectors_fast(line)?;
+
+        if before_idx == after_idx {
+            // Exact line match or single vector
+            return self.interpolate_pixel_value_fast(&self.vectors[before_idx], pixel, cal_type);
+        }
+
+        // Fast bilinear interpolation between two vectors
+        let before_vector = &self.vectors[before_idx];
+        let after_vector = &self.vectors[after_idx];
+        
+        let before_value = self.interpolate_pixel_value_fast(before_vector, pixel, cal_type)?;
+        let after_value = self.interpolate_pixel_value_fast(after_vector, pixel, cal_type)?;
+        
+        // Linear interpolation between lines
+        if after_vector.line == before_vector.line {
+            Ok(before_value)
+        } else {
+            let weight = (line - before_vector.line) as f32 / 
+                        (after_vector.line - before_vector.line) as f32;
+            Ok(before_value * (1.0 - weight) + after_value * weight)
+        }
+    }
+
+    /// Binary search for surrounding vectors (much faster than linear search)
+    fn find_surrounding_vectors_fast(&self, line: usize) -> SarResult<(usize, usize)> {
+        // Binary search for the vector just before or at the line
+        let mut left = 0;
+        let mut right = self.vectors.len();
+        
+        while left < right {
+            let mid = (left + right) / 2;
+            if self.vectors[mid].line <= line {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        
+        let before_idx = if left > 0 { left - 1 } else { 0 };
+        let after_idx = if left < self.vectors.len() { left } else { self.vectors.len() - 1 };
+        
+        Ok((before_idx, after_idx))
+    }
+
+    /// Fast pixel interpolation with binary search for pixels
+    fn interpolate_pixel_value_fast(
+        &self,
+        vector: &CalibrationVector,
+        pixel: usize,
+        cal_type: CalibrationType,
+    ) -> SarResult<f32> {
+        let values = match cal_type {
+            CalibrationType::Sigma0 => &vector.sigma_nought,
+            CalibrationType::Beta0 => &vector.beta_nought,
+            CalibrationType::Gamma0 => &vector.gamma,
+            CalibrationType::Dn => &vector.dn,
+        };
+        
+        if values.is_empty() || vector.pixels.is_empty() {
+            return Err(SarError::Processing("Empty calibration vector".to_string()));
+        }
+        
+        // Binary search for surrounding pixels
+        let mut left = 0;
+        let mut right = vector.pixels.len();
+        
+        while left < right {
+            let mid = (left + right) / 2;
+            if vector.pixels[mid] <= pixel {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        
+        let before_idx = if left > 0 { left - 1 } else { 0 };
+        let after_idx = if left < vector.pixels.len() { left } else { vector.pixels.len() - 1 };
+        
+        if before_idx == after_idx {
+            return Ok(values[before_idx]);
+        }
+        
+        // Linear interpolation between pixels
+        let before_pixel = vector.pixels[before_idx];
+        let after_pixel = vector.pixels[after_idx];
+        
+        if after_pixel == before_pixel {
+            Ok(values[before_idx])
+        } else {
+            let weight = (pixel - before_pixel) as f32 / 
+                        (after_pixel - before_pixel) as f32;
+            Ok(values[before_idx] * (1.0 - weight) + values[after_idx] * weight)
+        }
+    }
 }
 
 /// Radiometric calibration processor
@@ -167,9 +297,9 @@ impl CalibrationProcessor {
 
         // Apply calibration lookup table
         let calibrated = match self.calibration_type {
-            CalibrationType::Sigma0 => self.apply_sigma0_calibration(&intensity)?,
-            CalibrationType::Beta0 => self.apply_beta0_calibration(&intensity)?,
-            CalibrationType::Gamma0 => self.apply_gamma0_calibration(&intensity)?,
+            CalibrationType::Sigma0 => self.apply_sigma0_calibration_optimized(&intensity)?,
+            CalibrationType::Beta0 => self.apply_beta0_calibration_optimized(&intensity)?,
+            CalibrationType::Gamma0 => self.apply_gamma0_calibration_optimized(&intensity)?,
             CalibrationType::Dn => intensity, // No calibration for DN
         };
 
@@ -180,101 +310,252 @@ impl CalibrationProcessor {
         Ok(calibrated)
     }
 
-    /// Apply Sigma-0 calibration
-    fn apply_sigma0_calibration(&self, intensity: &SarRealImage) -> SarResult<SarRealImage> {
-        log::debug!("Applying Sigma-0 calibration");
+    /// Apply radiometric calibration to SLC data (OPTIMIZED VERSION)
+    pub fn calibrate_optimized(&self, slc_data: &SarImage) -> SarResult<SarRealImage> {
+        log::info!("Applying optimized radiometric calibration: {:?}", self.calibration_type);
         
-        let (azimuth_lines, range_samples) = intensity.dim();
-        let mut calibrated = Array2::zeros((azimuth_lines, range_samples));
+        let (azimuth_lines, range_samples) = slc_data.dim();
+        log::debug!("Input dimensions: {} x {}", azimuth_lines, range_samples);
 
-        for i in 0..azimuth_lines {
-            for j in 0..range_samples {
-                // Get calibration coefficient for this pixel
-                let cal_coeff = self.coefficients.get_calibration_value(
-                    i, j, CalibrationType::Sigma0
-                )?;
-                
-                // Apply calibration: sigma0 = intensity / cal_coeff^2
-                if cal_coeff > 0.0 {
-                    calibrated[[i, j]] = intensity[[i, j]] / (cal_coeff * cal_coeff);
-                } else {
-                    calibrated[[i, j]] = 0.0;
-                }
-            }
-        }
+        // Pre-calculate intensity from complex SLC data (|SLC|^2)
+        let intensity = slc_data.mapv(|slc_pixel| slc_pixel.norm_sqr());
+
+        // Apply optimized calibration based on type
+        let calibrated = match self.calibration_type {
+            CalibrationType::Sigma0 => self.apply_sigma0_calibration_optimized(&intensity)?,
+            CalibrationType::Beta0 => self.apply_beta0_calibration_optimized(&intensity)?,
+            CalibrationType::Gamma0 => self.apply_gamma0_calibration_optimized(&intensity)?,
+            CalibrationType::Dn => intensity, // No calibration for DN
+        };
+
+        log::info!("Optimized calibration completed. Output range: {:.2e} to {:.2e}",
+                  calibrated.iter().cloned().fold(f32::INFINITY, f32::min),
+                  calibrated.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
 
         Ok(calibrated)
     }
 
-    /// Apply Beta-0 calibration
-    fn apply_beta0_calibration(&self, intensity: &SarRealImage) -> SarResult<SarRealImage> {
-        log::debug!("Applying Beta-0 calibration");
+    /// Apply Sigma-0 calibration with pre-computed lookup table (FAST)
+    fn apply_sigma0_calibration_optimized(&self, intensity: &SarRealImage) -> SarResult<SarRealImage> {
+        log::debug!("Applying optimized Sigma-0 calibration");
         
         let (azimuth_lines, range_samples) = intensity.dim();
-        let mut calibrated = Array2::zeros((azimuth_lines, range_samples));
-
-        for i in 0..azimuth_lines {
-            for j in 0..range_samples {
-                let cal_coeff = self.coefficients.get_calibration_value(
-                    i, j, CalibrationType::Beta0
-                )?;
-                
-                if cal_coeff > 0.0 {
-                    calibrated[[i, j]] = intensity[[i, j]] / (cal_coeff * cal_coeff);
-                } else {
-                    calibrated[[i, j]] = 0.0;
-                }
+        
+        // Pre-compute calibration lookup table for entire image
+        log::debug!("Pre-computing calibration lookup table...");
+        let cal_lut = self.build_calibration_lut(azimuth_lines, range_samples, CalibrationType::Sigma0)?;
+        
+        // Vectorized calibration: intensity / cal_coeff^2
+        log::debug!("Applying vectorized calibration...");
+        let calibrated = Zip::from(intensity).and(&cal_lut).map_collect(|intensity_val, &cal_coeff| {
+            if cal_coeff > 0.0 {
+                intensity_val / (cal_coeff * cal_coeff)
+            } else {
+                0.0
             }
-        }
+        });
 
         Ok(calibrated)
     }
 
-    /// Apply Gamma-0 calibration (includes terrain correction factor)
-    fn apply_gamma0_calibration(&self, intensity: &SarRealImage) -> SarResult<SarRealImage> {
-        log::debug!("Applying Gamma-0 calibration");
+    /// Apply Beta-0 calibration (optimized)
+    fn apply_beta0_calibration_optimized(&self, intensity: &SarRealImage) -> SarResult<SarRealImage> {
+        log::debug!("Applying optimized Beta-0 calibration");
         
         let (azimuth_lines, range_samples) = intensity.dim();
-        let mut calibrated = Array2::zeros((azimuth_lines, range_samples));
-
-        for i in 0..azimuth_lines {
-            for j in 0..range_samples {
-                let cal_coeff = self.coefficients.get_calibration_value(
-                    i, j, CalibrationType::Gamma0
-                )?;
-                
-                if cal_coeff > 0.0 {
-                    calibrated[[i, j]] = intensity[[i, j]] / (cal_coeff * cal_coeff);
-                } else {
-                    calibrated[[i, j]] = 0.0;
-                }
+        let cal_lut = self.build_calibration_lut(azimuth_lines, range_samples, CalibrationType::Beta0)?;
+        
+        let calibrated = Zip::from(intensity).and(&cal_lut).map_collect(|intensity_val, &cal_coeff| {
+            if cal_coeff > 0.0 {
+                intensity_val / (cal_coeff * cal_coeff)
+            } else {
+                0.0
             }
-        }
+        });
 
         Ok(calibrated)
     }
 
-    /// Interpolate calibration coefficient for a given pixel
-    fn interpolate_calibration_coefficient(
+    /// Apply Gamma-0 calibration (optimized)
+    fn apply_gamma0_calibration_optimized(&self, intensity: &SarRealImage) -> SarResult<SarRealImage> {
+        log::debug!("Applying optimized Gamma-0 calibration");
+        
+        let (azimuth_lines, range_samples) = intensity.dim();
+        let cal_lut = self.build_calibration_lut(azimuth_lines, range_samples, CalibrationType::Gamma0)?;
+        
+        let calibrated = Zip::from(intensity).and(&cal_lut).map_collect(|intensity_val, &cal_coeff| {
+            if cal_coeff > 0.0 {
+                intensity_val / (cal_coeff * cal_coeff)
+            } else {
+                0.0
+            }
+        });
+
+        Ok(calibrated)
+    }
+
+    /// Build calibration lookup table for entire image (KEY OPTIMIZATION)
+    fn build_calibration_lut(
         &self,
-        lut: &Array2<f32>,
-        azimuth_idx: usize,
-        range_idx: usize,
-    ) -> SarResult<f32> {
-        let (lut_az, lut_rg) = lut.dim();
+        azimuth_lines: usize,
+        range_samples: usize,
+        cal_type: CalibrationType,
+    ) -> SarResult<Array2<f32>> {
+        log::debug!("Building {}x{} calibration LUT", azimuth_lines, range_samples);
         
-        if lut_az == 0 || lut_rg == 0 {
-            return Err(SarError::Processing(
-                "Empty calibration lookup table".to_string(),
-            ));
+        // Strategy 1: Sparse interpolation (for large images)
+        if azimuth_lines * range_samples > 50_000_000 {  // > 50M pixels
+            return self.build_sparse_calibration_lut(azimuth_lines, range_samples, cal_type);
         }
-
-        // Simple nearest neighbor interpolation for now
-        // In practice, you'd use bilinear interpolation
-        let az_idx = (azimuth_idx * lut_az / azimuth_idx.max(1)).min(lut_az - 1);
-        let rg_idx = (range_idx * lut_rg / range_idx.max(1)).min(lut_rg - 1);
         
-        Ok(lut[[az_idx, rg_idx]])
+        // Strategy 2: Full LUT for smaller images
+        let mut cal_lut = Array2::zeros((azimuth_lines, range_samples));
+        
+        // Process in chunks for better cache performance
+        let chunk_size = 1000;
+        
+        for azimuth_chunk in (0..azimuth_lines).step_by(chunk_size) {
+            let azimuth_end = (azimuth_chunk + chunk_size).min(azimuth_lines);
+            
+            for range_chunk in (0..range_samples).step_by(chunk_size) {
+                let range_end = (range_chunk + chunk_size).min(range_samples);
+                
+                // Process chunk
+                for i in azimuth_chunk..azimuth_end {
+                    for j in range_chunk..range_end {
+                        cal_lut[[i, j]] = self.coefficients.get_calibration_value(i, j, cal_type)?;
+                    }
+                }
+            }
+        }
+        
+        Ok(cal_lut)
+    }
+
+    /// Build sparse calibration lookup table for very large images
+    fn build_sparse_calibration_lut(
+        &self,
+        azimuth_lines: usize,
+        range_samples: usize,
+        cal_type: CalibrationType,
+    ) -> SarResult<Array2<f32>> {
+        log::debug!("Building sparse calibration LUT (large image optimization)");
+        
+        // Use lower resolution grid and interpolate
+        let sparse_factor = 10; // Sample every 10th pixel
+        let sparse_az = (azimuth_lines + sparse_factor - 1) / sparse_factor;
+        let sparse_rg = (range_samples + sparse_factor - 1) / sparse_factor;
+        
+        // Build sparse LUT
+        let mut sparse_lut = Array2::zeros((sparse_az, sparse_rg));
+        for i in 0..sparse_az {
+            for j in 0..sparse_rg {
+                let orig_i = (i * sparse_factor).min(azimuth_lines - 1);
+                let orig_j = (j * sparse_factor).min(range_samples - 1);
+                sparse_lut[[i, j]] = self.coefficients.get_calibration_value(orig_i, orig_j, cal_type)?;
+            }
+        }
+        
+        // Interpolate to full resolution
+        self.interpolate_sparse_lut(&sparse_lut, azimuth_lines, range_samples, sparse_factor)
+    }
+
+    /// Interpolate sparse LUT to full resolution
+    fn interpolate_sparse_lut(
+        &self,
+        sparse_lut: &Array2<f32>,
+        target_azimuth: usize,
+        target_range: usize,
+        sparse_factor: usize,
+    ) -> SarResult<Array2<f32>> {
+        log::debug!("Interpolating sparse LUT to full resolution");
+        
+        let mut full_lut = Array2::zeros((target_azimuth, target_range));
+        
+        for i in 0..target_azimuth {
+            for j in 0..target_range {
+                // Map to sparse coordinates
+                let sparse_i = (i as f32) / (sparse_factor as f32);
+                let sparse_j = (j as f32) / (sparse_factor as f32);
+                
+                // Bilinear interpolation
+                let i0 = sparse_i.floor() as usize;
+                let i1 = (i0 + 1).min(sparse_lut.nrows() - 1);
+                let j0 = sparse_j.floor() as usize;
+                let j1 = (j0 + 1).min(sparse_lut.ncols() - 1);
+                
+                let fi = sparse_i - i0 as f32;
+                let fj = sparse_j - j0 as f32;
+                
+                // Bilinear interpolation formula
+                let val = sparse_lut[[i0, j0]] * (1.0 - fi) * (1.0 - fj) +
+                         sparse_lut[[i1, j0]] * fi * (1.0 - fj) +
+                         sparse_lut[[i0, j1]] * (1.0 - fi) * fj +
+                         sparse_lut[[i1, j1]] * fi * fj;
+                
+                full_lut[[i, j]] = val;
+            }
+        }
+        
+        Ok(full_lut)
+    }
+
+    /// Parallel calibration using Rayon (if available)
+    #[cfg(feature = "parallel")]
+    pub fn calibrate_parallel(&self, slc_data: &SarImage) -> SarResult<SarRealImage> {
+        use rayon::prelude::*;
+        
+        log::info!("Applying parallel radiometric calibration: {:?}", self.calibration_type);
+        
+        let (azimuth_lines, range_samples) = slc_data.dim();
+        let intensity = slc_data.mapv(|slc_pixel| slc_pixel.norm_sqr());
+        
+        // Build calibration LUT in parallel
+        let cal_lut = self.build_calibration_lut_parallel(azimuth_lines, range_samples, self.calibration_type)?;
+        
+        // Apply calibration in parallel
+        let calibrated = intensity.zip(&cal_lut)
+            .into_par_iter()
+            .map(|(intensity_val, cal_coeff)| {
+                if *cal_coeff > 0.0 {
+                    intensity_val / (cal_coeff * cal_coeff)
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<f32>>();
+        
+        // Reshape back to 2D
+        let calibrated_2d = Array2::from_shape_vec((azimuth_lines, range_samples), calibrated)
+            .map_err(|e| SarError::Processing(format!("Shape error: {}", e)))?;
+        
+        Ok(calibrated_2d)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn build_calibration_lut_parallel(
+        &self,
+        azimuth_lines: usize,
+        range_samples: usize,
+        cal_type: CalibrationType,
+    ) -> SarResult<Array2<f32>> {
+        use rayon::prelude::*;
+        
+        log::debug!("Building calibration LUT in parallel");
+        
+        let coords: Vec<(usize, usize)> = (0..azimuth_lines)
+            .flat_map(|i| (0..range_samples).map(move |j| (i, j)))
+            .collect();
+        
+        let values: Result<Vec<f32>, SarError> = coords
+            .into_par_iter()
+            .map(|(i, j)| self.coefficients.get_calibration_value(i, j, cal_type))
+            .collect();
+        
+        let cal_values = values?;
+        
+        Array2::from_shape_vec((azimuth_lines, range_samples), cal_values)
+            .map_err(|e| SarError::Processing(format!("Shape error: {}", e)))
     }
 
     /// Convert calibrated data to dB scale
@@ -313,6 +594,90 @@ impl CalibrationProcessor {
         }
 
         Ok(corrected)
+    }
+
+    /// Interpolate calibration coefficient for a given pixel
+    fn interpolate_calibration_coefficient(
+        &self,
+        lut: &Array2<f32>,
+        azimuth_idx: usize,
+        range_idx: usize,
+    ) -> SarResult<f32> {
+        let (lut_az, lut_rg) = lut.dim();
+        
+        if lut_az == 0 || lut_rg == 0 {
+            return Err(SarError::Processing(
+                "Empty calibration lookup table".to_string(),
+            ));
+        }
+
+        // Simple nearest neighbor interpolation for now
+        // In practice, you'd use bilinear interpolation
+        let az_idx = (azimuth_idx * lut_az / azimuth_idx.max(1)).min(lut_az - 1);
+        let rg_idx = (range_idx * lut_rg / range_idx.max(1)).min(lut_rg - 1);
+        
+        Ok(lut[[az_idx, rg_idx]])
+    }
+
+    /// Benchmark calibration performance
+    pub fn benchmark_calibration(&self, slc_data: &SarImage) -> SarResult<()> {
+        use std::time::Instant;
+        
+        log::info!("=== Calibration Performance Benchmark ===");
+        let (azimuth_lines, range_samples) = slc_data.dim();
+        let total_pixels = azimuth_lines * range_samples;
+        log::info!("Image size: {}x{} = {} pixels", azimuth_lines, range_samples, total_pixels);
+        
+        // Test 1: Original method
+        log::info!("Testing original calibration method...");
+        let start = Instant::now();
+        let _result1 = self.calibrate(slc_data)?;
+        let original_time = start.elapsed();
+        log::info!("Original method: {:.2} seconds ({:.0} pixels/sec)", 
+                  original_time.as_secs_f64(), 
+                  total_pixels as f64 / original_time.as_secs_f64());
+        
+        // Test 2: Optimized method
+        log::info!("Testing optimized calibration method...");
+        let start = Instant::now();
+        let _result2 = self.calibrate_optimized(slc_data)?;
+        let optimized_time = start.elapsed();
+        log::info!("Optimized method: {:.2} seconds ({:.0} pixels/sec)", 
+                  optimized_time.as_secs_f64(),
+                  total_pixels as f64 / optimized_time.as_secs_f64());
+        
+        // Test 3: Parallel method (if available)
+        #[cfg(feature = "parallel")]
+        {
+            log::info!("Testing parallel calibration method...");
+            let start = Instant::now();
+            let _result3 = self.calibrate_parallel(slc_data)?;
+            let parallel_time = start.elapsed();
+            log::info!("Parallel method: {:.2} seconds ({:.0} pixels/sec)", 
+                      parallel_time.as_secs_f64(),
+                      total_pixels as f64 / parallel_time.as_secs_f64());
+            
+            let parallel_speedup = original_time.as_secs_f64() / parallel_time.as_secs_f64();
+            log::info!("Parallel speedup: {:.2}x", parallel_speedup);
+        }
+        
+        let speedup = original_time.as_secs_f64() / optimized_time.as_secs_f64();
+        log::info!("Optimized speedup: {:.2}x", speedup);
+        log::info!("=== Benchmark Complete ===");
+        
+        Ok(())
+    }
+
+    /// Get recommended calibration method based on image size
+    pub fn get_recommended_method(&self, image_dims: (usize, usize)) -> &'static str {
+        let total_pixels = image_dims.0 * image_dims.1;
+        
+        match total_pixels {
+            0..=1_000_000 => "standard",        // < 1M pixels: standard is fine
+            1_000_001..=10_000_000 => "optimized",  // 1-10M pixels: use optimized
+            10_000_001..=100_000_000 => "sparse",   // 10-100M pixels: use sparse LUT
+            _ => "parallel"                          // > 100M pixels: use parallel
+        }
     }
 }
 
