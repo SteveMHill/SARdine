@@ -1,9 +1,13 @@
-# Rust
+# =============================================================================
+# SARdine - SAR Data Processing Pipeline
+# =============================================================================
+
+# Rust Build Artifacts
 /target/
 Cargo.lock
 *.pdb
 
-# Python
+# Python Build & Cache
 __pycache__/
 *.py[cod]
 *$py.class
@@ -26,12 +30,11 @@ wheels/
 *.egg
 MANIFEST
 
-# PyO3/maturin
+# PyO3/Maturin Bindings
 *.dylib
 *.dll
-*.so
 
-# Virtual environments
+# Virtual Environments
 .env
 .venv
 env/
@@ -40,14 +43,14 @@ ENV/
 env.bak/
 venv.bak/
 
-# IDE
+# IDEs & Editors
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# Operating System Files
 .DS_Store
 .DS_Store?
 ._*
@@ -56,33 +59,51 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
-# Large test files and data
-*.npy
+# =============================================================================
+# SAR Data & Processing Files
+# =============================================================================
+
+# Large SAR Data Files
+*.SAFE/
+data/*.zip
+data/*.SAFE/
+
+# DEM & Terrain Data
 *.hgt
 *.tif
 *.tiff
+
+# Processing Cache Directories
 *_cache/
 pipeline_cache/
 test_workflow_cache/
+dem_cache/
+orbit_cache/
 
-# Test data (large files)
-data/*.zip
-data/*.SAFE/
-*.SAFE/
+# Processed Data Products
+*.npy
+*.npz
+processed_data/
+output/
 
-# Logs
+# =============================================================================
+# Development & Testing Files
+# =============================================================================
+
+# Debug & Test Scripts (not for production)
+debug_*.py
+test_*.py
+check_*.py
+*_debug.py
+*_test.py
+
+# Logs & Temporary Files
 *.log
-
-# Temporary files
 *.tmp
 *.temp
 /tmp/
 
-# Build artifacts
-*.whl
-*.tar.gz
-
-# Coverage reports
+# Coverage & Testing
 htmlcov/
 .coverage
 .coverage.*
@@ -91,28 +112,30 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
-# Documentation
+# Documentation Build
 docs/_build/
 
-# Jupyter Notebook
+# Jupyter Notebooks
 .ipynb_checkpoints
 
-# pyenv
+# Environment & Build Files
 .python-version
-
-# pipenv
 Pipfile.lock
+*.whl
+*.tar.gz
 
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+# =============================================================================
+# Project Specific Ignores
+# =============================================================================
 
-# Debug and test scripts (should not be committed)
-debug_*.py
-test_*.py
-check_*.py
-*_debug.py
-*_test.py
+# Large orbit files (downloaded automatically)
+*.EOF
+
+# Calibration vectors (extracted from products)
+calibration_*.xml
+
+# DEM tiles (downloaded automatically)  
+N*E*.hgt
+S*E*.hgt
+N*W*.hgt
+S*W*.hgt
