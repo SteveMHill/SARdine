@@ -6,7 +6,14 @@ Sentinel-1 SLC data into calibrated, terrain-corrected backscatter products.
 """
 
 from . import _core
-from ._core import SlcReader, Polarization, Metadata
+from ._core import (
+    SlcReader, 
+    Polarization, 
+    Metadata, 
+    test_srtm_download, 
+    apply_speckle_filter, 
+    estimate_num_looks
+)
 
 __version__ = "0.1.0"
 __author__ = "Steven Hill and contributors"
@@ -16,6 +23,9 @@ __all__ = [
     "SlcReader",
     "Polarization", 
     "Metadata",
+    "test_srtm_download",
+    "apply_speckle_filter",
+    "estimate_num_looks",
     "process_slc",
     "get_product_info",
 ]

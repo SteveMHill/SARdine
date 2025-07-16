@@ -359,6 +359,10 @@ fn parse_calibration_vectors_regex(xml_content: &str) -> SarResult<Vec<Calibrati
     
     log::debug!("XML content length: {} chars", xml_content.len());
     
+    // Count calibrationVector tags first
+    let tag_count = xml_content.matches("<calibrationVector>").count();
+    log::debug!("Found {} <calibrationVector> tags", tag_count);
+    
     // First, try using simple string search for calibrationVector tags
     let mut start_pos = 0;
     
@@ -491,12 +495,22 @@ where
 
 /// Extract XML value using regex (fallback for robust parsing)
 fn extract_xml_value(xml_content: &str, tag: &str) -> Option<String> {
-    let pattern = format!(r"<{}>\s*([^<]*)\s*</{}>", tag, tag);
+    // Handle tags with or without attributes
+    let pattern = format!(r"<{}\s*[^>]*>\s*([^<]*)\s*</{}>", tag, tag);
     if let Ok(re) = Regex::new(&pattern) {
         if let Some(cap) = re.captures(xml_content) {
             return Some(cap[1].trim().to_string());
         }
     }
+    
+    // Fallback: simple tag without attributes
+    let simple_pattern = format!(r"<{}>\s*([^<]*)\s*</{}>", tag, tag);
+    if let Ok(re) = Regex::new(&simple_pattern) {
+        if let Some(cap) = re.captures(xml_content) {
+            return Some(cap[1].trim().to_string());
+        }
+    }
+    
     None
 }
 

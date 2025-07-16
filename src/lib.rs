@@ -27,6 +27,9 @@ fn _core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyOrbitData>()?;
     m.add_class::<PyStateVector>()?;
     m.add_class::<PySubSwath>()?;
+    m.add_function(wrap_pyfunction!(test_srtm_download, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_speckle_filter, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate_num_looks, m)?)?;
     Ok(())
 }
 
@@ -306,8 +309,135 @@ impl PySlcReader {
         
         Ok(info)
     }
+}
 
-    // ...existing code...
+/// Test SRTM download capability for a specific tile
+#[pyfunction]
+fn test_srtm_download(tile: String, output_dir: String) -> PyResult<String> {
+    use crate::io::dem::DemReader;
+    
+    // Call the Rust implementation
+    match DemReader::test_srtm_download(&tile, &output_dir) {
+        Ok(path) => Ok(path),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("SRTM download failed: {}", e)
+        )),
+    }
+}
+
+/// Apply speckle filter to SAR intensity image
+#[pyfunction]
+fn apply_speckle_filter(
+    image: Vec<Vec<f64>>,
+    filter_type: String,
+    window_size: Option<usize>,
+    num_looks: Option<f64>,
+    edge_threshold: Option<f64>,
+    damping_factor: Option<f64>,
+    cv_threshold: Option<f64>
+) -> PyResult<Vec<Vec<f64>>> {
+    use crate::core::speckle_filter::{SpeckleFilter, SpeckleFilterParams, SpeckleFilterType};
+    use ndarray::Array2;
+    
+    // Convert Python image to ndarray
+    let rows = image.len();
+    if rows == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Input image is empty"
+        ));
+    }
+    let cols = image[0].len();
+    
+    let mut array = Array2::<f32>::zeros((rows, cols));
+    for (i, row) in image.iter().enumerate() {
+        if row.len() != cols {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Input image rows have inconsistent lengths"
+            ));
+        }
+        for (j, &val) in row.iter().enumerate() {
+            array[[i, j]] = val as f32;
+        }
+    }
+    
+    // Parse filter type
+    let filter_type = match filter_type.to_lowercase().as_str() {
+        "mean" => SpeckleFilterType::Mean,
+        "median" => SpeckleFilterType::Median,
+        "lee" => SpeckleFilterType::Lee,
+        "enhanced_lee" => SpeckleFilterType::EnhancedLee,
+        "lee_sigma" => SpeckleFilterType::LeeSigma,
+        "frost" => SpeckleFilterType::Frost,
+        "gamma_map" => SpeckleFilterType::GammaMAP,
+        "refined_lee" => SpeckleFilterType::RefinedLee,
+        _ => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Invalid filter type: {}", filter_type)
+        )),
+    };
+    
+    // Create filter parameters
+    let params = SpeckleFilterParams {
+        window_size: window_size.unwrap_or(7),
+        num_looks: num_looks.unwrap_or(1.0) as f32,
+        edge_threshold: edge_threshold.unwrap_or(0.5) as f32,
+        damping_factor: damping_factor.unwrap_or(1.0) as f32,
+        cv_threshold: cv_threshold.unwrap_or(0.5) as f32,
+    };
+    
+    // Apply speckle filter
+    let filter = SpeckleFilter::with_params(params);
+    let filtered = filter.apply_filter(&array, filter_type)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Speckle filtering failed: {}", e)
+        ))?;
+    
+    // Convert back to Python format
+    let mut result = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let mut row = Vec::with_capacity(cols);
+        for j in 0..cols {
+            row.push(filtered[[i, j]] as f64);
+        }
+        result.push(row);
+    }
+    
+    Ok(result)
+}
+
+/// Estimate number of looks from SAR intensity image
+#[pyfunction]
+fn estimate_num_looks(image: Vec<Vec<f64>>, window_size: Option<usize>) -> PyResult<f64> {
+    use crate::core::speckle_filter::SpeckleFilter;
+    use ndarray::Array2;
+    
+    // Convert Python image to ndarray
+    let rows = image.len();
+    if rows == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Input image is empty"
+        ));
+    }
+    let cols = image[0].len();
+    
+    let mut array = Array2::<f32>::zeros((rows, cols));
+    for (i, row) in image.iter().enumerate() {
+        if row.len() != cols {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Input image rows have inconsistent lengths"
+            ));
+        }
+        for (j, &val) in row.iter().enumerate() {
+            array[[i, j]] = val as f32;
+        }
+    }
+    
+    // Estimate number of looks
+    let num_looks = SpeckleFilter::estimate_number_of_looks(&array)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Number of looks estimation failed: {}", e)
+        ))?;
+    
+    Ok(num_looks as f64)
 }
 
 /// Python wrapper for Polarization enum

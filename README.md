@@ -11,6 +11,8 @@ SARdine is a modern, high-performance SAR data processing library for Sentinel-1
 - 📡 **IW Split**: Extract individual sub-swaths from IW SLC products
 - 🔗 **Deburst**: Seamless burst concatenation with precise timing
 - 📊 **Radiometric Calibration**: Sigma0/Beta0/Gamma0 calibration with bilinear interpolation
+- 📈 **Multilooking**: Spatial averaging for noise reduction and smaller data volumes
+- 🏔️ **Terrain Flattening**: Convert σ⁰ to γ⁰ using local incidence angle correction
 - 🧪 **Comprehensive Testing**: Rust unit tests and Python integration tests
 
 ## Current Implementation Status
@@ -21,13 +23,16 @@ SARdine is a modern, high-performance SAR data processing library for Sentinel-1
 - **IW Split**: Sub-swath extraction from SLC products
 - **Deburst**: Burst concatenation with precise geolocation
 - **Calibration Vector Parsing**: Robust XML parsing and bilinear interpolation
+- **Multilooking**: Spatial averaging with configurable look parameters and ENL estimation
+- **Terrain Flattening**: Local incidence angle correction using DEM and radar geometry
 - **Python API**: Complete exposure of Rust functionality
 - **CLI Interface**: Command-line access to all processing steps
 
-### 🔄 In Progress
-- End-to-end workflow integration
-- Performance optimization
-- Error handling improvements
+### 🔄 Next Steps
+- DEM data integration and download utilities
+- Speckle filtering implementation
+- Terrain correction and geocoding
+- Final output generation (GeoTIFF products)
 
 ## Installation
 
@@ -64,6 +69,12 @@ sardine deburst path/to/S1A_IW_SLC__1SDV_*.zip --subswath IW1 --output ./deburst
 
 # Radiometric calibration
 sardine calibrate path/to/S1A_IW_SLC__1SDV_*.zip --subswath IW1 --calibration-type sigma0 --output ./calibrated_data/
+
+# Multilooking (calibration + spatial averaging)
+sardine multilook path/to/S1A_IW_SLC__1SDV_*.zip --polarization VV --range-looks 3 --azimuth-looks 3 --calibration-type sigma0 --output ./multilooked_data.npy
+
+# Terrain flattening with automatic DEM download
+sardine terrain path/to/S1A_IW_SLC__1SDV_*.zip --polarization VV --range-looks 4 --azimuth-looks 1 --orbit orbit.EOF --dem-cache ./dem
 ```
 
 ### Python API
@@ -87,6 +98,41 @@ deburst_data = sardine.deburst_subswath("path/to/S1A_IW_SLC__1SDV_*.zip", "IW1")
 
 # Calibration
 calibrated_data = sardine.calibrate_data("path/to/S1A_IW_SLC__1SDV_*.zip", "IW1", "sigma0")
+
+# Complete workflow: Calibration + Multilooking
+reader = sardine.SlcReader("path/to/S1A_IW_SLC__1SDV_*.zip")
+result, (range_spacing, azimuth_spacing) = reader.calibrate_and_multilook(
+    "VV", "sigma0", range_looks=3, azimuth_looks=3
+)
+print(f"Output shape: {len(result)} x {len(result[0])}")
+print(f"New pixel spacing: {range_spacing:.1f}m x {azimuth_spacing:.1f}m")
+```
+
+### Terrain Flattening (Gamma0)
+
+Automatic DEM-based terrain flattening with per-pixel local incidence angles:
+
+```python
+# Automatic DEM download and terrain flattening in one step
+reader = sardine.SlcReader("path/to/S1A_IW_SLC__1SDV_*.zip")
+orbit_data = sardine.load_orbit_file("path/to/orbit.EOF")
+reader.set_orbit_data(orbit_data)
+
+gamma0_data, incidence_angles, range_spacing, azimuth_spacing = reader.calibrate_multilook_and_flatten_auto_dem(
+    "VV", "Sigma0", range_looks=4, azimuth_looks=1, dem_cache_dir="./dem_cache"
+)
+print(f"Gamma0 shape: {gamma0_data.shape}")
+print(f"Incidence angle range: {float(incidence_angles.min()):.1f}° - {float(incidence_angles.max()):.1f}°")
+```
+
+### Command Line Interface
+
+```bash
+# Basic terrain flattening with automatic DEM
+sardine terrain input.zip --polarization VV --range-looks 4 --azimuth-looks 1
+
+# With custom DEM cache and orbit file  
+sardine terrain input.zip --orbit orbit.EOF --dem-cache ./dem --db-scale
 ```
 
 ## Examples
@@ -97,6 +143,7 @@ See the `examples/` directory for complete workflow demonstrations:
 - `complete_iw_split_workflow.py` - Sub-swath extraction
 - `complete_deburst_workflow.py` - Deburst processing
 - `complete_calibration_workflow.py` - Radiometric calibration
+- `complete_terrain_flattening_workflow.py` - **Terrain flattening with automatic DEM**
 - `python_orbit_api.py` - Python API usage
 
 ## Architecture

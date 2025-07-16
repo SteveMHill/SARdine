@@ -1,6 +1,6 @@
 use crate::types::{
     AcquisitionMode, BoundingBox, CoordinateSystem, Polarization, SarComplex, SarError, 
-    SarImage, SarMetadata, SarResult, OrbitStatus, OrbitData, BurstOrbitData, SubSwath
+    SarImage, SarMetadata, SarResult, OrbitStatus, OrbitData, BurstOrbitData, SubSwath, GeoTransform
 };
 use crate::io::orbit::OrbitManager;
 use chrono::{DateTime, Utc};
@@ -73,6 +73,7 @@ struct ImageInformation {
 pub struct SlcReader {
     zip_path: PathBuf,
     archive: Option<ZipArchive<File>>,
+    orbit_data: Option<OrbitData>,
 }
 
 impl SlcReader {
@@ -90,6 +91,7 @@ impl SlcReader {
         Ok(Self {
             zip_path,
             archive: None,
+            orbit_data: None,
         })
     }
 
@@ -119,6 +121,11 @@ impl SlcReader {
         }
         
         Ok(files)
+    }
+
+    /// Set orbit data for the reader
+    pub fn set_orbit_data(&mut self, orbit_data: OrbitData) {
+        self.orbit_data = Some(orbit_data);
     }
 
     /// Find annotation files for each polarization
@@ -1160,6 +1167,257 @@ impl SlcReader {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
         Ok(content)
+    }
+
+    /// Apply multilooking to calibrated intensity data
+    /// 
+    /// This method takes calibrated intensity data and applies multilooking
+    /// to reduce speckle noise.
+    pub fn multilook_intensity(
+        &mut self,
+        intensity_data: &Array2<f32>,
+        pol: Polarization,
+        range_looks: usize,
+        azimuth_looks: usize,
+    ) -> SarResult<(Array2<f32>, f64, f64)> {
+        log::info!("Applying multilook: {}x{} looks to intensity data", azimuth_looks, range_looks);
+        
+        // Get metadata for pixel spacing
+        let metadata = self.read_annotation(pol)?;
+        
+        // Extract pixel spacings from metadata
+        let (range_spacing, azimuth_spacing) = metadata.pixel_spacing;
+        
+        log::info!("Input pixel spacing: range={}m, azimuth={}m", range_spacing, azimuth_spacing);
+        
+        // Create multilook processor
+        let params = crate::core::multilook::MultilookParams {
+            range_looks,
+            azimuth_looks,
+            output_pixel_spacing: None,
+        };
+        
+        let processor = crate::core::multilook::MultilookProcessor::new(params);
+        
+        // Apply multilooking
+        let (multilooked_data, new_range_spacing, new_azimuth_spacing) = 
+            processor.apply_multilook_filtered(intensity_data, range_spacing, azimuth_spacing)?;
+        
+        log::info!("Multilooking complete: {}x{} -> {}x{}", 
+                   intensity_data.nrows(), intensity_data.ncols(),
+                   multilooked_data.nrows(), multilooked_data.ncols());
+        log::info!("Output pixel spacing: range={}m, azimuth={}m", new_range_spacing, new_azimuth_spacing);
+        
+        Ok((multilooked_data, new_range_spacing, new_azimuth_spacing))
+    }
+
+    /// Complete workflow: calibrate and multilook SLC data
+    /// 
+    /// This is a convenience method that combines calibration and multilooking
+    pub fn calibrate_and_multilook(
+        &mut self,
+        pol: Polarization,
+        cal_type: crate::core::calibrate::CalibrationType,
+        range_looks: usize,
+        azimuth_looks: usize,
+    ) -> SarResult<(Array2<f32>, f64, f64)> {
+        log::info!("Starting calibrate and multilook workflow for {:?}", pol);
+        
+        // First, get deburst data
+        let deburst_data = self.deburst_slc(pol)?;
+        log::info!("Deburst data: {} x {}", deburst_data.nrows(), deburst_data.ncols());
+        
+        // Get calibration coefficients
+        let cal_data = self.read_calibration_data(pol)?;
+        
+        // Create calibration processor
+        let processor = crate::core::calibrate::CalibrationProcessor::new(
+            cal_data, 
+            crate::core::calibrate::CalibrationType::Sigma0
+        );
+        
+        // Apply calibration to get intensity data
+        let intensity_data = processor.calibrate(&deburst_data)?;
+        log::info!("Calibrated data: {} x {}", intensity_data.nrows(), intensity_data.ncols());
+        
+        // Apply multilooking
+        let (multilooked_data, new_range_spacing, new_azimuth_spacing) = 
+            self.multilook_intensity(&intensity_data, pol, range_looks, azimuth_looks)?;
+        
+        log::info!("Complete workflow finished: final dimensions {}x{}", 
+                   multilooked_data.nrows(), multilooked_data.ncols());
+        
+        Ok((multilooked_data, new_range_spacing, new_azimuth_spacing))
+    }
+
+    /// Complete workflow with automatic DEM preparation: calibration, multilooking, and terrain flattening
+    pub fn calibrate_multilook_and_flatten_auto_dem(
+        &mut self,
+        pol: Polarization,
+        cal_type: crate::core::calibrate::CalibrationType,
+        range_looks: usize,
+        azimuth_looks: usize,
+        dem_cache_dir: Option<&str>,
+    ) -> SarResult<(Array2<f32>, Array2<f32>, f64, f64)> {
+        log::info!("Starting complete SAR processing workflow with automatic DEM preparation");
+        
+        // Step 1: Calibration and multilooking
+        let (sigma0_multilooked, new_range_spacing, new_azimuth_spacing) = 
+            self.calibrate_and_multilook(pol, cal_type, range_looks, azimuth_looks)?;
+        
+        log::info!("Calibration and multilooking completed: {} x {}", 
+                   sigma0_multilooked.nrows(), sigma0_multilooked.ncols());
+
+        // Step 2: Automatically prepare DEM data
+        log::info!("Automatically preparing DEM data");
+        
+        // Get SAR scene bounding box from metadata
+        let metadata = self.read_annotation(pol)?;
+        let bbox = &metadata.bounding_box;
+        
+        // Use provided cache directory or create default
+        let cache_dir = dem_cache_dir.unwrap_or("./dem_cache");
+        
+        let (dem_data, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+            bbox, 
+            30.0, // 30m target resolution
+            cache_dir
+        )?;
+        
+        log::info!("DEM data prepared: {} x {}", dem_data.nrows(), dem_data.ncols());
+
+        // Step 3: Resample DEM to match SAR geometry
+        let sar_transform = self.create_sar_geotransform(&metadata, new_range_spacing, new_azimuth_spacing)?;
+        let resampled_dem = crate::io::dem::DemReader::resample_dem(
+            &dem_data,
+            &dem_transform,
+            &sar_transform,
+            sigma0_multilooked.dim(),
+        )?;
+
+        log::info!("DEM resampled to SAR geometry");
+
+        // Step 4: Get orbit data for terrain flattening
+        let orbit_data = self.orbit_data.as_ref()
+            .ok_or_else(|| SarError::Processing("Orbit data not available".to_string()))?;
+
+        // Step 5: Apply terrain flattening
+        let terrain_params = crate::core::terrain_flatten::TerrainFlatteningParams {
+            sar_pixel_spacing: (new_range_spacing, new_azimuth_spacing),
+            ..Default::default()
+        };
+        
+        let flattener = crate::core::terrain_flatten::TerrainFlattener::new(
+            terrain_params,
+            orbit_data.clone(),
+        );
+
+        let (gamma0, incidence_angles) = flattener.process_terrain_flattening(
+            &sigma0_multilooked,
+            &resampled_dem,
+            0.0, // range_time (simplified)
+            0.0, // azimuth_time_start (simplified)
+            1.0, // azimuth_time_spacing (simplified)
+        )?;
+
+        log::info!("Terrain flattening completed: {} x {}", 
+                   gamma0.nrows(), gamma0.ncols());
+
+        Ok((gamma0, incidence_angles, new_range_spacing, new_azimuth_spacing))
+    }
+
+    /// Complete workflow with terrain flattening: calibration, multilooking, and terrain flattening
+    pub fn calibrate_multilook_and_flatten(
+        &mut self,
+        pol: Polarization,
+        cal_type: crate::core::calibrate::CalibrationType,
+        range_looks: usize,
+        azimuth_looks: usize,
+        dem_path: &str,
+    ) -> SarResult<(Array2<f32>, Array2<f32>, f64, f64)> {
+        log::info!("Starting complete SAR processing workflow with terrain flattening");
+        
+        // Step 1: Calibration and multilooking
+        let (sigma0_multilooked, new_range_spacing, new_azimuth_spacing) = 
+            self.calibrate_and_multilook(pol, cal_type, range_looks, azimuth_looks)?;
+        
+        log::info!("Calibration and multilooking completed: {} x {}", 
+                   sigma0_multilooked.nrows(), sigma0_multilooked.ncols());
+
+        // Step 2: Read DEM data
+        log::info!("Reading DEM data from: {}", dem_path);
+        
+        // Get SAR scene bounding box from metadata
+        let metadata = self.read_annotation(pol)?;
+        let bbox = &metadata.bounding_box;
+        
+        let (dem_data, dem_transform) = crate::io::dem::DemReader::read_dem(
+            dem_path, 
+            bbox, 
+            30.0 // 30m target resolution
+        )?;
+        
+        log::info!("DEM data loaded: {} x {}", dem_data.nrows(), dem_data.ncols());
+
+        // Step 3: Resample DEM to match SAR geometry
+        let sar_transform = self.create_sar_geotransform(&metadata, new_range_spacing, new_azimuth_spacing)?;
+        let resampled_dem = crate::io::dem::DemReader::resample_dem(
+            &dem_data,
+            &dem_transform,
+            &sar_transform,
+            sigma0_multilooked.dim(),
+        )?;
+
+        log::info!("DEM resampled to SAR geometry");
+
+        // Step 4: Get orbit data for terrain flattening
+        let orbit_data = self.orbit_data.as_ref()
+            .ok_or_else(|| SarError::Processing("Orbit data not available".to_string()))?;
+
+        // Step 5: Apply terrain flattening
+        let terrain_params = crate::core::terrain_flatten::TerrainFlatteningParams {
+            sar_pixel_spacing: (new_range_spacing, new_azimuth_spacing),
+            ..Default::default()
+        };
+        
+        let flattener = crate::core::terrain_flatten::TerrainFlattener::new(
+            terrain_params,
+            orbit_data.clone(),
+        );
+
+        let (gamma0, incidence_angles) = flattener.process_terrain_flattening(
+            &sigma0_multilooked,
+            &resampled_dem,
+            0.0, // range_time (simplified)
+            0.0, // azimuth_time_start (simplified)
+            1.0, // azimuth_time_spacing (simplified)
+        )?;
+
+        log::info!("Terrain flattening completed: {} x {}", 
+                   gamma0.nrows(), gamma0.ncols());
+
+        Ok((gamma0, incidence_angles, new_range_spacing, new_azimuth_spacing))
+    }
+
+    /// Create a GeoTransform for SAR data based on metadata
+    fn create_sar_geotransform(
+        &self,
+        metadata: &SarMetadata,
+        range_spacing: f64,
+        azimuth_spacing: f64,
+    ) -> SarResult<GeoTransform> {
+        // Simplified geotransform creation
+        // In practice, this would use precise geo-location from metadata
+        let bbox = &metadata.bounding_box;
+        
+        Ok(GeoTransform {
+            top_left_x: bbox.min_lon,
+            pixel_width: range_spacing / 111320.0, // Approximate meters to degrees
+            rotation_x: 0.0,
+            top_left_y: bbox.max_lat,
+            rotation_y: 0.0,
+            pixel_height: -azimuth_spacing / 111320.0, // Negative for north-up
+        })
     }
 
     // ...existing code...

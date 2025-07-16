@@ -56,6 +56,15 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
+# Large test files and data
+*.npy
+*.hgt
+*.tif
+*.tiff
+*_cache/
+pipeline_cache/
+test_workflow_cache/
+
 # Test data (large files)
 data/*.zip
 data/*.SAFE/

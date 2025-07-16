@@ -159,6 +159,212 @@ def cmd_test(args):
     return 0
 
 
+def cmd_test_srtm(args):
+    """Test SRTM download functionality."""
+    try:
+        print(f"🌍 Testing SRTM download for tile: {args.tile}")
+        print(f"📁 Output directory: {args.output}")
+        
+        start_time = time.time()
+        
+        # Test SRTM download
+        result_path = sardine.test_srtm_download(args.tile, args.output)
+        
+        download_time = time.time() - start_time
+        
+        print(f"✅ SRTM download completed in {download_time:.2f}s")
+        print(f"📁 File saved to: {result_path}")
+        
+        # Check file size
+        file_path = Path(result_path)
+        if file_path.exists():
+            file_size = file_path.stat().st_size
+            print(f"📊 File size: {format_file_size(file_size)}")
+            
+            if file_size > 1024 * 1024:  # > 1MB
+                print(f"✅ File size looks reasonable for SRTM data")
+            else:
+                print(f"⚠️  File size seems small, might be an error page")
+        
+        print(f"\n🎉 SRTM download test successful!")
+        print(f"📊 This confirms automatic DEM preparation will work")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ SRTM download test failed: {e}")
+        print(f"\n📝 This is expected if:")
+        print(f"   • No internet connection")
+        print(f"   • SRTM servers are temporarily unavailable") 
+        print(f"   • Authentication is required for some sources")
+        print(f"\n💡 Alternative options:")
+        print(f"   • Download SRTM tiles manually from https://earthexplorer.usgs.gov/")
+        print(f"   • Use existing DEM files with the read_dem() method")
+        print(f"   • Try again later when servers are available")
+        return 1
+
+
+def cmd_speckle_filter(args):
+    """Apply speckle filtering to SAR intensity images."""
+    try:
+        # Check if input file exists
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"❌ Error: Input file not found: {input_path}")
+            return 1
+        
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        print(f"🔧 Applying {args.filter_type} speckle filter")
+        print(f"📁 Input: {input_path}")
+        print(f"📁 Output: {output_path}")
+        print(f"🪟 Window size: {args.window_size}x{args.window_size}")
+        
+        start_time = time.time()
+        
+        # Read input image using rasterio
+        try:
+            import rasterio
+            import numpy as np
+        except ImportError:
+            print("❌ Error: rasterio package required for GeoTIFF support")
+            print("Install with: pip install rasterio")
+            return 1
+        
+        # Read image
+        with rasterio.open(input_path) as src:
+            image_data = src.read(1).astype(np.float64)
+            profile = src.profile
+            
+        print(f"📊 Image dimensions: {image_data.shape[1]}x{image_data.shape[0]}")
+        
+        # Convert to list format for Python API
+        image_list = image_data.tolist()
+        
+        # Estimate number of looks if not provided
+        num_looks = args.num_looks
+        if num_looks is None:
+            print("🔍 Estimating number of looks...")
+            num_looks = sardine.estimate_num_looks(image_list, args.window_size)
+            print(f"📊 Estimated number of looks: {num_looks:.2f}")
+        
+        # Apply speckle filter
+        print(f"🔧 Applying {args.filter_type} filter...")
+        filtered_list = sardine.apply_speckle_filter(
+            image_list,
+            args.filter_type,
+            window_size=args.window_size,
+            num_looks=num_looks,
+            edge_threshold=args.edge_threshold,
+            damping_factor=args.damping_factor,
+            cv_threshold=args.cv_threshold
+        )
+        
+        # Convert back to numpy array
+        filtered_data = np.array(filtered_list, dtype=np.float32)
+        
+        # Update profile for output
+        profile.update(dtype='float32', compress='lzw')
+        
+        # Write output
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            dst.write(filtered_data, 1)
+        
+        filter_time = time.time() - start_time
+        
+        print(f"✅ Speckle filtering completed in {filter_time:.2f}s")
+        print(f"📁 Filtered image saved to: {output_path}")
+        
+        # Calculate filtering statistics
+        original_mean = np.mean(image_data[image_data > 0])
+        filtered_mean = np.mean(filtered_data[filtered_data > 0])
+        reduction_ratio = np.std(image_data[image_data > 0]) / np.std(filtered_data[filtered_data > 0])
+        
+        print(f"\n📊 Filtering Statistics:")
+        print(f"   Original mean: {original_mean:.6f}")
+        print(f"   Filtered mean: {filtered_mean:.6f}")
+        print(f"   Noise reduction ratio: {reduction_ratio:.2f}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Speckle filtering failed: {e}")
+        return 1
+
+
+def cmd_estimate_nlooks(args):
+    """Estimate number of looks from SAR intensity image."""
+    try:
+        # Check if input file exists
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"❌ Error: Input file not found: {input_path}")
+            return 1
+        
+        print(f"🔍 Estimating number of looks")
+        print(f"📁 Input: {input_path}")
+        print(f"🪟 Window size: {args.window_size}x{args.window_size}")
+        
+        start_time = time.time()
+        
+        # Read input image using rasterio
+        try:
+            import rasterio
+            import numpy as np
+        except ImportError:
+            print("❌ Error: rasterio package required for GeoTIFF support")
+            print("Install with: pip install rasterio")
+            return 1
+        
+        # Read image
+        with rasterio.open(input_path) as src:
+            image_data = src.read(1).astype(np.float64)
+            
+        print(f"📊 Image dimensions: {image_data.shape[1]}x{image_data.shape[0]}")
+        
+        # Convert to list format for Python API
+        image_list = image_data.tolist()
+        
+        # Estimate number of looks
+        num_looks = sardine.estimate_num_looks(image_list, args.window_size)
+        
+        estimation_time = time.time() - start_time
+        
+        print(f"✅ Number of looks estimation completed in {estimation_time:.2f}s")
+        print(f"📊 Estimated number of looks: {num_looks:.3f}")
+        
+        # Provide interpretation
+        if num_looks < 1.5:
+            interpretation = "Single-look data (high speckle)"
+        elif num_looks < 4:
+            interpretation = "Few-look data (moderate speckle)"
+        elif num_looks < 10:
+            interpretation = "Multi-look data (low speckle)"
+        else:
+            interpretation = "Heavily multi-looked data (very low speckle)"
+        
+        print(f"📝 Interpretation: {interpretation}")
+        
+        # Recommend filter settings
+        print(f"\n💡 Recommended speckle filter settings:")
+        if num_looks < 2:
+            print(f"   • Filter type: enhanced_lee or lee_sigma")
+            print(f"   • Window size: 7x7 or 9x9")
+        elif num_looks < 5:
+            print(f"   • Filter type: lee or refined_lee")
+            print(f"   • Window size: 5x5 or 7x7")
+        else:
+            print(f"   • Filter type: mean or median")
+            print(f"   • Window size: 3x3 or 5x5")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Number of looks estimation failed: {e}")
+        return 1
+
+
 def cmd_orbit(args):
     """Handle the 'orbit' command for orbit file operations."""
     input_path = Path(args.input)
@@ -580,6 +786,266 @@ def cmd_calibrate(args):
         return 1
 
 
+def cmd_multilook(args):
+    """Handle the 'multilook' command."""
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"❌ Error: File not found: {input_path}")
+        return 1
+    
+    print(f"🔄 Starting multilook processing: {input_path.name}")
+    
+    try:
+        # Initialize reader
+        reader = sardine.SlcReader(str(input_path))
+        
+        # Find available polarizations
+        annotation_files = reader.find_annotation_files()
+        available_polarizations = list(annotation_files.keys())
+        
+        print(f"📡 Available polarizations: {', '.join(available_polarizations)}")
+        
+        # Determine which polarizations to process
+        if args.polarization:
+            if args.polarization.upper() not in available_polarizations:
+                print(f"❌ Error: Polarization {args.polarization} not found")
+                print(f"   Available: {', '.join(available_polarizations)}")
+                return 1
+            polarizations_to_process = [args.polarization.upper()]
+        else:
+            polarizations_to_process = available_polarizations
+        
+        print(f"🎯 Processing polarizations: {', '.join(polarizations_to_process)}")
+        print(f"🎯 Calibration type: {args.calibration_type}")
+        print(f"🎯 Multilook parameters: {args.azimuth_looks}x{args.range_looks} (azimuth x range)")
+        
+        # Process each polarization
+        results = {}
+        total_start_time = time.time()
+        
+        for pol in polarizations_to_process:
+            pol_start_time = time.time()
+            print(f"\n🔄 Processing {pol} calibration and multilook...")
+            
+            try:
+                # Get calibration info first
+                cal_info = reader.get_calibration_info(pol)
+                print(f"   • Swath: {cal_info['swath']}")
+                print(f"   • Calibration vectors: {cal_info['num_vectors']}")
+                
+                # Perform calibration and multilook in one step
+                multilooked_data, (new_range_spacing, new_azimuth_spacing) = reader.calibrate_and_multilook(
+                    pol, args.calibration_type, args.range_looks, args.azimuth_looks
+                )
+                pol_end_time = time.time()
+                
+                # Calculate data statistics
+                import numpy as np
+                ml_array = np.array(multilooked_data)
+                rows, cols = ml_array.shape
+                data_min = np.min(ml_array)
+                data_max = np.max(ml_array)
+                data_mean = np.mean(ml_array)
+                
+                print(f"✅ Multilook completed for {pol}")
+                print(f"   • Output dimensions: {rows:,} x {cols:,}")
+                print(f"   • New pixel spacing: {new_range_spacing:.1f}m x {new_azimuth_spacing:.1f}m")
+                print(f"   • Data range: {data_min:.2e} to {data_max:.2e}")
+                print(f"   • Mean value: {data_mean:.2e}")
+                print(f"   • Processing time: {pol_end_time - pol_start_time:.2f} seconds")
+                
+                # Calculate multilook efficiency
+                theoretical_looks = args.range_looks * args.azimuth_looks
+                print(f"   • Theoretical looks: {theoretical_looks}")
+                
+                results[pol] = {
+                    "output_dimensions": (rows, cols),
+                    "pixel_spacing": (new_range_spacing, new_azimuth_spacing),
+                    "multilook_params": (args.azimuth_looks, args.range_looks),
+                    "processing_time": pol_end_time - pol_start_time,
+                    "data_size_mb": (rows * cols * 4) / (1024 * 1024),  # float32 = 4 bytes
+                    "data_stats": {
+                        "min": float(data_min),
+                        "max": float(data_max),
+                        "mean": float(data_mean)
+                    }
+                }
+                
+                # Save to binary file if requested
+                if args.output:
+                    output_path = Path(args.output)
+                    if len(polarizations_to_process) > 1:
+                        # Multiple polarizations: create separate files
+                        pol_output_path = output_path.parent / f"{output_path.stem}_{pol.lower()}_{args.calibration_type}_ml{args.azimuth_looks}x{args.range_looks}{output_path.suffix}"
+                    else:
+                        pol_output_path = output_path.parent / f"{output_path.stem}_{args.calibration_type}_ml{args.azimuth_looks}x{args.range_looks}{output_path.suffix}"
+                    
+                    # Save as numpy array
+                    np.save(pol_output_path.with_suffix('.npy'), ml_array.astype(np.float32))
+                    print(f"💾 Multilooked data saved to: {pol_output_path.with_suffix('.npy')}")
+                    
+                    # Also save in dB if requested
+                    if args.db_scale:
+                        db_array = 10 * np.log10(np.maximum(ml_array, 1e-10))  # Avoid log(0)
+                        db_output_path = pol_output_path.parent / f"{pol_output_path.stem}_db.npy"
+                        np.save(db_output_path, db_array.astype(np.float32))
+                        print(f"💾 dB scale data saved to: {db_output_path}")
+                
+            except Exception as e:
+                print(f"❌ Error processing {pol}: {e}")
+                if hasattr(args, 'verbose') and args.verbose:
+                    import traceback
+                    traceback.print_exc()
+                return 1
+        
+        total_end_time = time.time()
+        
+        # Print summary
+        print(f"\n" + "="*70)
+        print("🎯 MULTILOOK PROCESSING SUMMARY")
+        print("="*70)
+        
+        for pol, result in results.items():
+            print(f"📡 {pol}:")
+            print(f"   • Output dimensions: {result['output_dimensions'][0]:,} x {result['output_dimensions'][1]:,}")
+            print(f"   • Pixel spacing: {result['pixel_spacing'][0]:.1f}m x {result['pixel_spacing'][1]:.1f}m")
+            print(f"   • Multilook: {result['multilook_params'][0]}x{result['multilook_params'][1]} looks")
+            print(f"   • Data size: {result['data_size_mb']:.1f} MB")
+            print(f"   • Data range: {result['data_stats']['min']:.2e} to {result['data_stats']['max']:.2e}")
+            print(f"   • Processing time: {result['processing_time']:.2f} seconds")
+        
+        print(f"\n⏱️  Total processing time: {total_end_time - total_start_time:.2f} seconds")
+        print(f"🚀 Multilook processing complete!")
+        print(f"📊 Next step: Apply terrain flattening and terrain correction")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Error during multilook: {e}")
+        import traceback
+        if hasattr(args, 'verbose') and args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def cmd_terrain_flatten(args):
+    """Process Sentinel-1 data with terrain flattening (gamma0) using automatic DEM preparation."""
+    try:
+        print(f"🏔️  Starting terrain flattening workflow...")
+        print(f"📁 Input: {args.input}")
+        print(f"📊 Polarization: {args.polarization}")
+        print(f"📏 Range looks: {args.range_looks}")
+        print(f"📏 Azimuth looks: {args.azimuth_looks}")
+        print(f"🗺️  DEM cache: {args.dem_cache or './dem_cache'}")
+        
+        start_time = time.time()
+        
+        # Open SLC reader
+        reader = sardine.SlcReader(args.input)
+        
+        # Load orbit data if available
+        orbit_file = None
+        if args.orbit:
+            orbit_file = args.orbit
+        else:
+            # Try to find orbit file automatically
+            product_path = Path(args.input)
+            orbit_dir = product_path.parent / "orbit_files"
+            if orbit_dir.exists():
+                orbit_files = list(orbit_dir.glob("*.EOF"))
+                if orbit_files:
+                    orbit_file = str(orbit_files[0])
+                    print(f"📡 Found orbit file: {orbit_file}")
+        
+        if orbit_file:
+            try:
+                orbit_data = sardine.load_orbit_file(orbit_file)
+                reader.set_orbit_data(orbit_data)
+                print(f"✅ Orbit data loaded successfully")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not load orbit data: {e}")
+                print("   Terrain flattening may be less accurate without precise orbit data")
+        else:
+            print(f"⚠️  Warning: No orbit file found")
+            print("   Please provide orbit file with --orbit for best results")
+        
+        # Parse polarization
+        pol_map = {"VV": "VV", "VH": "VH", "HV": "HV", "HH": "HH"}
+        if args.polarization.upper() not in pol_map:
+            print(f"❌ Error: Invalid polarization '{args.polarization}'. Use VV, VH, HV, or HH")
+            return 1
+        
+        polarization = pol_map[args.polarization.upper()]
+        
+        # Parse calibration type
+        cal_type_map = {
+            "sigma0": "Sigma0",
+            "beta0": "Beta0", 
+            "gamma0": "Gamma0",
+            "dn": "Dn"
+        }
+        cal_type = cal_type_map[args.calibration_type.lower()]
+        
+        print(f"🔄 Processing with calibration type: {cal_type}")
+        
+        # Process with automatic DEM preparation
+        try:
+            gamma0_data, incidence_angles, range_spacing, azimuth_spacing = reader.calibrate_multilook_and_flatten_auto_dem(
+                polarization,
+                cal_type,
+                args.range_looks,
+                args.azimuth_looks,
+                args.dem_cache
+            )
+            
+            processing_time = time.time() - start_time
+            
+            print(f"✅ Terrain flattening completed in {processing_time:.2f}s")
+            print(f"📊 Output shape: {gamma0_data.shape}")
+            print(f"📏 Pixel spacing: {range_spacing:.2f}m (range) x {azimuth_spacing:.2f}m (azimuth)")
+            
+            # Save gamma0 data
+            output_gamma0 = f"gamma0_{polarization}_{args.range_looks}x{args.azimuth_looks}.npy"
+            gamma0_data.save(output_gamma0)
+            print(f"💾 Gamma0 data saved: {output_gamma0}")
+            
+            # Save incidence angles
+            output_angles = f"incidence_angles_{polarization}_{args.range_looks}x{args.azimuth_looks}.npy"
+            incidence_angles.save(output_angles)
+            print(f"💾 Incidence angles saved: {output_angles}")
+            
+            # Save in dB scale if requested
+            if args.db_scale:
+                import numpy as np
+                gamma0_db = 10 * np.log10(np.maximum(gamma0_data, 1e-10))
+                output_db = f"gamma0_db_{polarization}_{args.range_looks}x{args.azimuth_looks}.npy"
+                np.save(output_db, gamma0_db)
+                print(f"💾 Gamma0 (dB) saved: {output_db}")
+            
+            # Summary
+            print("\n" + "="*70)
+            print("✅ TERRAIN FLATTENING COMPLETED")
+            print("="*70)
+            print(f"📁 Input file: {Path(args.input).name}")
+            print(f"📊 Polarization: {polarization}")
+            print(f"📏 Multilooking: {args.range_looks} x {args.azimuth_looks}")
+            print(f"🏔️  Gamma0 range: {float(gamma0_data.min()):.6f} - {float(gamma0_data.max()):.6f}")
+            print(f"📐 Incidence angle range: {float(incidence_angles.min()):.2f}° - {float(incidence_angles.max()):.2f}°")
+            print(f"⏱️  Processing time: {processing_time:.2f} seconds")
+            print(f"📊 Next step: Convert to GeoTIFF or apply further processing")
+            
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Error during terrain flattening: {e}")
+            return 1
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return 1
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -739,6 +1205,177 @@ Examples:
         help="Save output in dB scale (additional .npy file)"
     )
     
+    # Multilook command
+    multilook_parser = subparsers.add_parser(
+        "multilook",
+        help="Apply multilooking to calibrated data for speckle reduction"
+    )
+    multilook_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    multilook_parser.add_argument(
+        "--output",
+        help="Output file for multilooked data (Numpy .npy format)"
+    )
+    multilook_parser.add_argument(
+        "--polarization",
+        help="Specify polarization to process (e.g., VV, VH)"
+    )
+    multilook_parser.add_argument(
+        "--calibration-type",
+        default="sigma0",
+        choices=["sigma0", "beta0", "gamma0", "dn"],
+        help="Type of calibration to apply before multilooking (default: sigma0)"
+    )
+    multilook_parser.add_argument(
+        "--range-looks",
+        type=int,
+        default=4,
+        help="Number of looks in range direction (default: 4)"
+    )
+    multilook_parser.add_argument(
+        "--azimuth-looks",
+        type=int,
+        default=1,
+        help="Number of looks in azimuth direction (default: 1)"
+    )
+    multilook_parser.add_argument(
+        "--db-scale",
+        action="store_true",
+        help="Save output in dB scale (additional .npy file)"
+    )
+    
+    # Terrain flatten command
+    terrain_parser = subparsers.add_parser(
+        "terrain",
+        help="Process Sentinel-1 data with terrain flattening (gamma0)"
+    )
+    terrain_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    terrain_parser.add_argument(
+        "--output",
+        help="Output file for gamma0 data (Numpy .npy format)"
+    )
+    terrain_parser.add_argument(
+        "--polarization",
+        default="VV",
+        help="Specify polarization to process (default: VV)"
+    )
+    terrain_parser.add_argument(
+        "--calibration-type",
+        default="sigma0",
+        choices=["sigma0", "beta0", "gamma0", "dn"],
+        help="Type of calibration to apply (default: sigma0)"
+    )
+    terrain_parser.add_argument(
+        "--range-looks",
+        type=int,
+        default=4,
+        help="Number of looks in range direction (default: 4)"
+    )
+    terrain_parser.add_argument(
+        "--azimuth-looks",
+        type=int,
+        default=1,
+        help="Number of looks in azimuth direction (default: 1)"
+    )
+    terrain_parser.add_argument(
+        "--db-scale",
+        action="store_true",
+        help="Save output in dB scale (additional .npy file)"
+    )
+    terrain_parser.add_argument(
+        "--dem-cache",
+        help="Directory for DEM cache (default: ./dem_cache)"
+    )
+    terrain_parser.add_argument(
+        "--orbit",
+        help="Path to orbit file (EOF format)"
+    )
+    
+    # Test SRTM download command
+    test_srtm_parser = subparsers.add_parser(
+        "test-srtm",
+        help="Test SRTM download functionality"
+    )
+    test_srtm_parser.add_argument(
+        "tile",
+        help="SRTM tile name to test (e.g., N37W122)"
+    )
+    test_srtm_parser.add_argument(
+        "--output",
+        default="./srtm_test",
+        help="Output directory for test download (default: ./srtm_test)"
+    )
+    
+    # Speckle filter command
+    speckle_parser = subparsers.add_parser(
+        "speckle-filter",
+        help="Apply speckle filtering to SAR intensity images"
+    )
+    speckle_parser.add_argument(
+        "input",
+        help="Input GeoTIFF intensity image"
+    )
+    speckle_parser.add_argument(
+        "output",
+        help="Output filtered GeoTIFF image"
+    )
+    speckle_parser.add_argument(
+        "--filter-type",
+        choices=["mean", "median", "lee", "enhanced_lee", "lee_sigma", "frost", "gamma_map", "refined_lee"],
+        default="lee",
+        help="Type of speckle filter to apply (default: lee)"
+    )
+    speckle_parser.add_argument(
+        "--window-size",
+        type=int,
+        default=7,
+        help="Filter window size (must be odd, default: 7)"
+    )
+    speckle_parser.add_argument(
+        "--num-looks",
+        type=float,
+        help="Number of looks (auto-estimated if not provided)"
+    )
+    speckle_parser.add_argument(
+        "--edge-threshold",
+        type=float,
+        default=0.5,
+        help="Edge detection threshold for Lee Sigma filter (default: 0.5)"
+    )
+    speckle_parser.add_argument(
+        "--damping-factor",
+        type=float,
+        default=1.0,
+        help="Damping factor for Gamma MAP filter (default: 1.0)"
+    )
+    speckle_parser.add_argument(
+        "--cv-threshold",
+        type=float,
+        default=0.5,
+        help="Coefficient of variation threshold (default: 0.5)"
+    )
+    
+    # Estimate number of looks command
+    nlooks_parser = subparsers.add_parser(
+        "estimate-nlooks",
+        help="Estimate number of looks from SAR intensity image"
+    )
+    nlooks_parser.add_argument(
+        "input",
+        help="Input GeoTIFF intensity image"
+    )
+    nlooks_parser.add_argument(
+        "--window-size",
+        type=int,
+        default=11,
+        help="Window size for estimation (default: 11)"
+    )
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -761,6 +1398,16 @@ Examples:
         return cmd_deburst(args)
     elif args.command == "calibrate":
         return cmd_calibrate(args)
+    elif args.command == "multilook":
+        return cmd_multilook(args)
+    elif args.command == "terrain":
+        return cmd_terrain_flatten(args)
+    elif args.command == "test-srtm":
+        return cmd_test_srtm(args)
+    elif args.command == "speckle-filter":
+        return cmd_speckle_filter(args)
+    elif args.command == "estimate-nlooks":
+        return cmd_estimate_nlooks(args)
     else:
         parser.print_help()
         return 1
