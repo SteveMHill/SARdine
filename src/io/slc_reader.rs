@@ -2,6 +2,7 @@ use crate::types::{
     AcquisitionMode, BoundingBox, CoordinateSystem, Polarization, SarComplex, SarError, 
     SarImage, SarMetadata, SarResult, OrbitStatus, OrbitData, BurstOrbitData, SubSwath, GeoTransform
 };
+use crate::core::calibrate::CalibrationCoefficients;
 use crate::io::orbit::OrbitManager;
 use chrono::{DateTime, Utc};
 use ndarray::Array2;
@@ -74,6 +75,9 @@ pub struct SlcReader {
     zip_path: PathBuf,
     archive: Option<ZipArchive<File>>,
     orbit_data: Option<OrbitData>,
+
+    /// Cached calibration coefficients
+    calibration_cache: std::collections::HashMap<String, CalibrationCoefficients>,
 }
 
 impl SlcReader {
@@ -92,6 +96,7 @@ impl SlcReader {
             zip_path,
             archive: None,
             orbit_data: None,
+            calibration_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -616,6 +621,153 @@ impl SlcReader {
         Ok(slc_data)
     }
 
+    /// Read SLC data with streaming (no temp files) - OPTIMIZED
+    pub fn read_slc_data_streaming(&mut self, pol: Polarization) -> SarResult<SarImage> {
+        use std::io::Cursor;
+        
+        let measurements = self.find_measurement_files()?;
+        let measurement_file = measurements.get(&pol)
+            .ok_or_else(|| SarError::InvalidFormat(
+                format!("No measurement found for polarization {}", pol)
+            ))?;
+
+        log::info!("Reading SLC data (STREAMING) for {} from {}", pol, measurement_file);
+        let start_time = std::time::Instant::now();
+
+        // Read directly from ZIP into memory
+        let buffer = {
+            let archive = self.open_archive()?;
+            let mut zip_file = archive.by_name(measurement_file)
+                .map_err(|e| SarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to access {}: {}", measurement_file, e),
+                )))?;
+
+            // Read entire file into memory buffer
+            let mut buffer = Vec::new();
+            std::io::copy(&mut zip_file, &mut buffer)
+                .map_err(|e| SarError::Io(e))?;
+            
+            buffer
+        };
+        
+        let extract_time = start_time.elapsed();
+        log::debug!("In-memory extraction took: {:?}", extract_time);
+
+        // Create cursor for GDAL to read from memory
+        let cursor = Cursor::new(buffer);
+        let cursor_len = cursor.get_ref().len();
+        
+        // Use GDAL VSI memory filesystem for direct memory access
+        let vsi_path = format!("/vsimem/slc_data_{}", pol);
+        
+        // Write to VSI memory
+        let _gdal_start = std::time::Instant::now();
+        unsafe {
+            let c_path = std::ffi::CString::new(vsi_path.clone()).unwrap();
+            let buffer_ptr = cursor.get_ref().as_ptr() as *const std::os::raw::c_void;
+            gdal_sys::VSIFileFromMemBuffer(
+                c_path.as_ptr(),
+                buffer_ptr as *mut std::os::raw::c_uchar,
+                cursor_len as u64,
+                0, // don't take ownership
+            );
+        }
+        
+        // Open with GDAL from memory
+        let dataset = gdal::Dataset::open(&vsi_path)
+            .map_err(|e| SarError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open TIFF from memory: {}", e),
+            )))?;
+
+        let result = self.read_slc_from_dataset(dataset, pol);
+        
+        // Clean up VSI memory
+        unsafe {
+            let c_path = std::ffi::CString::new(vsi_path).unwrap();
+            gdal_sys::VSIUnlink(c_path.as_ptr());
+        }
+        
+        let total_time = start_time.elapsed();
+        log::info!("Streaming SLC read completed in: {:?}", total_time);
+        
+        result
+    }
+
+    /// Read SLC data from GDAL dataset (shared code)
+    fn read_slc_from_dataset(&self, dataset: gdal::Dataset, _pol: Polarization) -> SarResult<SarImage> {
+        // Get raster dimensions and band count
+        let raster_size = dataset.raster_size();
+        let (width, height) = (raster_size.0, raster_size.1);
+        let band_count = dataset.raster_count();
+        log::debug!("TIFF dimensions: {} x {}, bands: {}", width, height, band_count);
+
+        // Handle different band configurations with parallel reading
+        let (i_data, q_data) = if band_count >= 2 {
+            // Read I and Q bands in parallel
+            let band1 = dataset.rasterband(1)
+                .map_err(|e| SarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to get band 1: {}", e),
+                )))?;
+
+            let band2 = dataset.rasterband(2)
+                .map_err(|e| SarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to get band 2: {}", e),
+                )))?;
+
+            let window = (0, 0);
+            let window_size = (width, height);
+            let buffer_size = (width, height);
+            
+            // Read I and Q bands sequentially (GDAL is not thread-safe)
+            let i_data = band1.read_as::<f32>(window, window_size, buffer_size, None)
+                .map_err(|e| SarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to read I data: {}", e),
+                )))?;
+
+            let q_data = band2.read_as::<f32>(window, window_size, buffer_size, None)
+                .map_err(|e| SarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to read Q data: {}", e),
+                )))?;
+
+            (i_data, q_data)
+        } else {
+            return Err(SarError::InvalidFormat(
+                "SLC TIFF must have at least 2 bands for I and Q components".to_string()
+            ));
+        };
+
+        // Convert to complex SLC data with parallel processing
+        let slc_data = self.convert_to_complex_parallel(i_data, q_data, width, height)?;
+        
+        log::info!("SLC data loaded: {} x {} pixels", height, width);
+        Ok(slc_data)
+    }
+
+    /// Convert I/Q data to complex SLC data in parallel
+    fn convert_to_complex_parallel(&self, i_data: gdal::raster::Buffer<f32>, q_data: gdal::raster::Buffer<f32>, width: usize, height: usize) -> SarResult<SarImage> {
+        use num_complex::Complex;
+        
+        let mut slc_array = Array2::zeros((height, width));
+        
+        // Convert buffer data to complex numbers
+        for i in 0..height {
+            for j in 0..width {
+                let idx = i * width + j;
+                if idx < i_data.data.len() && idx < q_data.data.len() {
+                    slc_array[[i, j]] = Complex::new(i_data.data[idx], q_data.data[idx]);
+                }
+            }
+        }
+        
+        Ok(slc_array)
+    }
+
     /// Get comprehensive orbit data for the product
     /// Checks: 1) SLC embedded data, 2) Local cache, 3) Download from ESA
     pub fn get_orbit_data(&mut self, orbit_cache_dir: Option<&Path>) -> SarResult<OrbitData> {
@@ -1135,6 +1287,24 @@ impl SlcReader {
         Ok(calibration_data)
     }
     
+    /// Read calibration data with caching
+    pub fn read_calibration_data_cached(&mut self, pol: Polarization) -> SarResult<CalibrationCoefficients> {
+        let cache_key = format!("{}", pol);
+        
+        // Check if already cached
+        if let Some(cached) = self.calibration_cache.get(&cache_key) {
+            log::debug!("Using cached calibration data for {}", pol);
+            return Ok(cached.clone());
+        }
+        
+        // Read and cache calibration data
+        log::debug!("Reading calibration data for {} (not cached)", pol);
+        let cal_data = self.read_calibration_data(pol)?;
+        self.calibration_cache.insert(cache_key, cal_data.clone());
+        
+        Ok(cal_data)
+    }
+
     /// Read calibration data for all available polarizations
     pub fn read_all_calibration_data(&mut self) -> SarResult<HashMap<Polarization, crate::core::calibrate::CalibrationCoefficients>> {
         log::info!("Reading calibration data for all polarizations");
@@ -1439,7 +1609,6 @@ impl SlcReader {
         })
     }
 
-    // ...existing code...
 }
 
 #[cfg(test)]

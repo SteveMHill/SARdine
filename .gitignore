@@ -92,6 +92,9 @@ data/output_*/
 # Development & Testing Files
 # =============================================================================
 
+# Development Scripts Directory
+dev_scripts/
+
 # Debug & Test Scripts (not for production)
 debug_*.py
 test_*.py

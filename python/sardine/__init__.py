@@ -32,7 +32,8 @@ from ._core import (
     apply_terrain_flattening_with_mask,
     create_terrain_flattening_params,
     apply_complete_terrain_flattening,
-    prepare_dem_for_scene
+    prepare_dem_for_scene,
+    optimized_terrain_correction,
 )
 
 # Create alias for backward compatibility

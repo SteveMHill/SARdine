@@ -6,6 +6,11 @@ This directory contains practical examples demonstrating SARdine's capabilities 
 
 These examples show end-to-end processing pipelines:
 
+### Backscatter Processing
+- **[complete_backscatter_pipeline.py](complete_backscatter_pipeline.py)** - **Complete backscatter processing pipeline with terrain correction and calibration**
+- **[backscatter_processor.py](backscatter_processor.py)** - Radiometric calibration and backscatter coefficient extraction
+- **[production_backscatter_processor.py](production_backscatter_processor.py)** - Production-ready backscatter processing
+
 ### Basic Processing
 - **[complete_calibration_workflow.py](complete_calibration_workflow.py)** - Radiometric calibration from raw SLC to sigma0
 - **[complete_deburst_workflow.py](complete_deburst_workflow.py)** - Remove burst boundaries and create seamless images

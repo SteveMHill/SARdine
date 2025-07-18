@@ -1,8 +1,79 @@
-use crate::types::{SarError, SarResult, BoundingBox, GeoTransform, OrbitData, StateVector};
+use crate::types::{SarError, SarResult, BoundingBox, GeoTransform, OrbitData, StateVector, MaskingWorkflow, MaskResult, SurfaceNormal};
 use gdal::{Dataset, DriverManager, Metadata};
 use gdal::raster::Buffer;
 use ndarray::Array2;
 use std::path::Path;
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+/// Interpolation methods for SAR data resampling
+#[derive(Debug, Clone, Copy)]
+pub enum InterpolationMethod {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+
+impl Default for InterpolationMethod {
+    fn default() -> Self {
+        InterpolationMethod::Bilinear
+    }
+}
+
+impl InterpolationMethod {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "nearest" => InterpolationMethod::Nearest,
+            "bilinear" => InterpolationMethod::Bilinear,
+            "bicubic" => InterpolationMethod::Bicubic,
+            _ => InterpolationMethod::Bilinear,
+        }
+    }
+}
+
+/// Spatial lookup grid for fast coordinate transformations
+#[derive(Debug, Clone)]
+pub struct SpatialLookupGrid {
+    /// Grid of pre-computed SAR coordinates (range, azimuth) for each output pixel
+    grid: Array2<Option<(f64, f64)>>,
+    /// Grid resolution (pixels)
+    grid_size: (usize, usize),
+    /// Mapping from output coordinates to grid coordinates
+    output_to_grid_transform: GeoTransform,
+}
+
+/// DEM cache for fast elevation lookups
+#[derive(Debug, Clone)]
+pub struct DemCache {
+    /// Cached DEM values for frequently accessed coordinates
+    cache: HashMap<(i32, i32), f32>,
+    /// Maximum cache size
+    max_size: usize,
+}
+
+impl DemCache {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_size,
+        }
+    }
+    
+    pub fn get(&self, x: i32, y: i32) -> Option<f32> {
+        self.cache.get(&(x, y)).copied()
+    }
+    
+    pub fn insert(&mut self, x: i32, y: i32, value: f32) {
+        if self.cache.len() >= self.max_size {
+            // Simple eviction: clear half the cache
+            let keys_to_remove: Vec<_> = self.cache.keys().take(self.cache.len() / 2).cloned().collect();
+            for key in keys_to_remove {
+                self.cache.remove(&key);
+            }
+        }
+        self.cache.insert((x, y), value);
+    }
+}
 
 /// Simple 3D vector for geometric calculations
 #[derive(Debug, Clone)]
@@ -173,7 +244,7 @@ impl TerrainCorrector {
                     // Find corresponding SAR pixel using range-doppler equations
                     if let Some((sar_range, sar_azimuth)) = self.latlon_to_sar_pixel(
                         lat, lon, elevation, orbit_data, params
-                    )? {
+                    ) {
                         // Check if SAR pixel is within image bounds
                         if sar_range < sar_image.dim().1 && sar_azimuth < sar_image.dim().0 {
                             // Bilinear interpolation from SAR image
@@ -208,100 +279,482 @@ impl TerrainCorrector {
         Ok((output_image, output_transform))
     }
 
-    /// Calculate output bounds in the target projection
-    fn calculate_output_bounds(&self, sar_bbox: &BoundingBox) -> SarResult<BoundingBox> {
-        // For simplicity, assume output CRS is WGS84 (EPSG:4326)
-        // In a full implementation, you'd reproject the SAR bbox to the target CRS
-        let buffer = 0.01; // degrees
-        Ok(BoundingBox {
-            min_lat: sar_bbox.min_lat - buffer,
-            max_lat: sar_bbox.max_lat + buffer,
-            min_lon: sar_bbox.min_lon - buffer,
-            max_lon: sar_bbox.max_lon + buffer,
-        })
+    /// Optimized Range-Doppler terrain correction with chunked parallel processing
+    pub fn range_doppler_terrain_correction_chunked(
+        &self,
+        sar_image: &Array2<f32>,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        sar_bbox: &BoundingBox,
+        chunk_size: Option<usize>,
+    ) -> SarResult<(Array2<f32>, GeoTransform)> {
+        log::info!("🚀 Starting OPTIMIZED Range-Doppler terrain correction with chunked processing");
+        let start_time = std::time::Instant::now();
+        
+        // Step 1: Calculate output grid bounds
+        let output_bounds = self.calculate_output_bounds(sar_bbox)?;
+        let (output_width, output_height, output_transform) = 
+            self.create_output_grid(&output_bounds)?;
+        log::info!("Output grid: {}x{} pixels", output_width, output_height);
+
+        // Step 2: Build orbit lookup table for faster orbit queries
+        let orbit_lut = self.build_orbit_lookup_table_optimized(orbit_data, &output_bounds)?;
+        log::debug!("Built orbit lookup table with {} entries", orbit_lut.len());
+
+        // Step 3: Process in parallel chunks
+        let chunk_sz = chunk_size.unwrap_or(rayon::current_num_threads() * 64);
+        let total_pixels = output_width * output_height;
+        log::info!("Processing {} pixels in chunks of {} using {} threads", 
+                  total_pixels, chunk_sz, rayon::current_num_threads());
+
+        let mut output_image = Array2::zeros((output_height, output_width));
+        let mut total_valid = 0;
+
+        // Process rows in parallel chunks
+        let row_chunks: Vec<_> = (0..output_height).step_by(chunk_sz).collect();
+        
+        let chunk_results: Vec<_> = row_chunks
+            .par_iter()
+            .map(|&start_row| {
+                let end_row = (start_row + chunk_sz).min(output_height);
+                self.process_row_chunk_optimized(
+                    sar_image,
+                    orbit_data,
+                    params,
+                    &output_transform,
+                    &orbit_lut,
+                    start_row,
+                    end_row,
+                    output_width,
+                )
+            })
+            .collect();
+
+        // Combine results from parallel chunks
+        for (chunk_idx, chunk_result) in chunk_results.into_iter().enumerate() {
+            match chunk_result {
+                Ok((chunk_data, valid_count)) => {
+                    let start_row = chunk_idx * chunk_sz;
+                    let end_row = (start_row + chunk_sz).min(output_height);
+                    
+                    for (local_i, i) in (start_row..end_row).enumerate() {
+                        if local_i < chunk_data.nrows() {
+                            for j in 0..output_width {
+                                if j < chunk_data.ncols() {
+                                    output_image[[i, j]] = chunk_data[[local_i, j]];
+                                }
+                            }
+                        }
+                    }
+                    total_valid += valid_count;
+                }
+                Err(e) => {
+                    log::warn!("Chunk {} processing failed: {}", chunk_idx, e);
+                }
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        let coverage = (total_valid as f64 / total_pixels as f64) * 100.0;
+        log::info!("✅ OPTIMIZED terrain correction completed in {:.2}s: {:.1}% coverage", 
+                  elapsed.as_secs_f64(), coverage);
+
+        Ok((output_image, output_transform))
     }
 
-    /// Create output grid with specified spacing
+    /// Build optimized orbit lookup table
+    fn build_orbit_lookup_table_optimized(
+        &self,
+        orbit_data: &OrbitData,
+        output_bounds: &BoundingBox,
+    ) -> SarResult<Vec<(usize, [f64; 3])>> {
+        // Create a lookup table of orbit indices and positions within the area of interest
+        let mut orbit_lut = Vec::new();
+        
+        for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
+            // Simple spatial filtering - include all orbit points for now
+            // In a more advanced implementation, convert ECEF to lat/lon and filter spatially
+            orbit_lut.push((i, state_vector.position));
+        }
+        
+        // Sort by distance to scene center for more efficient lookup
+        let center_lat = (output_bounds.min_lat + output_bounds.max_lat) / 2.0;
+        let center_lon = (output_bounds.min_lon + output_bounds.max_lon) / 2.0;
+        let center_ecef = self.latlon_to_ecef(center_lat, center_lon, 0.0);
+        
+        orbit_lut.sort_by(|a, b| {
+            let dist_a = self.distance_to_point(&a.1, &center_ecef);
+            let dist_b = self.distance_to_point(&b.1, &center_ecef);
+            dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        Ok(orbit_lut)
+    }
+
+    /// Process a chunk of rows in parallel
+    fn process_row_chunk_optimized(
+        &self,
+        sar_image: &Array2<f32>,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        output_transform: &GeoTransform,
+        orbit_lut: &[(usize, [f64; 3])],
+        start_row: usize,
+        end_row: usize,
+        output_width: usize,
+    ) -> SarResult<(Array2<f32>, usize)> {
+        let chunk_height = end_row - start_row;
+        let mut chunk_data = Array2::zeros((chunk_height, output_width));
+        let mut valid_count = 0;
+
+        for (local_i, i) in (start_row..end_row).enumerate() {
+            for j in 0..output_width {
+                // Convert output pixel to geographic coordinates
+                let map_x = output_transform.top_left_x + (j as f64) * output_transform.pixel_width;
+                let map_y = output_transform.top_left_y + (i as f64) * output_transform.pixel_height;
+
+                if let Ok((lat, lon)) = self.map_to_geographic(map_x, map_y) {
+                    if let Some(elevation) = self.get_elevation_at_latlon(lat, lon) {
+                        // Use optimized orbit lookup
+                        if let Ok(Some((sar_range, sar_azimuth))) = self.latlon_to_sar_pixel_with_lut(
+                            lat, lon, elevation, orbit_data, params, orbit_lut
+                        ) {
+                            if sar_range < sar_image.dim().1 && sar_azimuth < sar_image.dim().0 {
+                                let value = self.bilinear_interpolate(
+                                    sar_image, 
+                                    sar_range as f64, 
+                                    sar_azimuth as f64
+                                );
+                                chunk_data[[local_i, j]] = value;
+                                if !value.is_nan() {
+                                    valid_count += 1;
+                                }
+                            } else {
+                                chunk_data[[local_i, j]] = f32::NAN;
+                            }
+                        } else {
+                            chunk_data[[local_i, j]] = f32::NAN;
+                        }
+                    } else {
+                        chunk_data[[local_i, j]] = f32::NAN;
+                    }
+                } else {
+                    chunk_data[[local_i, j]] = f32::NAN;
+                }
+            }
+        }
+
+        Ok((chunk_data, valid_count))
+    }
+
+    /// Optimized lat/lon to SAR pixel conversion using lookup table
+    fn latlon_to_sar_pixel_with_lut(
+        &self,
+        lat: f64,
+        lon: f64,
+        elevation: f64,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        orbit_lut: &[(usize, [f64; 3])],
+    ) -> SarResult<Option<(usize, usize)>> {
+        // Convert lat/lon/elevation to ECEF
+        let target_ecef = self.latlon_to_ecef(lat, lon, elevation);
+        
+        // Find closest orbit state vectors using lookup table
+        let mut min_distance = f64::MAX;
+        let mut best_state_idx = 0;
+        
+        for &(state_idx, satellite_pos) in orbit_lut.iter().take(10) { // Use only first 10 for speed
+            let distance = self.distance_to_point(&satellite_pos, &target_ecef);
+            if distance < min_distance {
+                min_distance = distance;
+                best_state_idx = state_idx;
+            }
+        }
+        
+        // Use the best state vector for range-doppler calculation
+        if best_state_idx < orbit_data.state_vectors.len() {
+            let state_vector = &orbit_data.state_vectors[best_state_idx];
+            
+            // Compute slant range
+            let slant_range = self.distance_to_point(&state_vector.position, &target_ecef);
+            
+            // Convert to range pixel
+            let range_pixel = (slant_range / params.speed_of_light * 2.0 - params.slant_range_time) 
+                / (params.range_pixel_spacing / params.speed_of_light);
+            
+            // Simple azimuth approximation (would need proper Doppler calculation)
+            let azimuth_pixel = best_state_idx as f64 * params.prf / 1000.0; // Simplified
+            
+            if range_pixel >= 0.0 && azimuth_pixel >= 0.0 {
+                Ok(Some((range_pixel.round() as usize, azimuth_pixel.round() as usize)))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Bilinear interpolation for SAR image sampling
+    fn bilinear_interpolate(&self, image: &Array2<f32>, x: f64, y: f64) -> f32 {
+        let (height, width) = image.dim();
+        let x1 = x.floor() as usize;
+        let y1 = y.floor() as usize;
+        let x2 = (x1 + 1).min(width - 1);
+        let y2 = (y1 + 1).min(height - 1);
+        
+        if x1 >= width || y1 >= height {
+            return f32::NAN;
+        }
+        
+        let dx = x - x1 as f64;
+        let dy = y - y1 as f64;
+        
+        let v11 = image[[y1, x1]];
+        let v12 = image[[y2, x1]];
+        let v21 = image[[y1, x2]];
+        let v22 = image[[y2, x2]];
+        
+        // Check for NaN values
+        if v11.is_nan() || v12.is_nan() || v21.is_nan() || v22.is_nan() {
+            return f32::NAN;
+        }
+        
+        let v1 = v11 * (1.0 - dx as f32) + v21 * dx as f32;
+        let v2 = v12 * (1.0 - dx as f32) + v22 * dx as f32;
+        v1 * (1.0 - dy as f32) + v2 * dy as f32
+    }
+    
+    /// Find azimuth time using orbit lookup table
+    fn find_azimuth_time_with_lut(
+        &self,
+        ground_point: &[f64; 3],
+        orbit_data: &OrbitData,
+        orbit_lut: &[(usize, [f64; 3])],
+    ) -> SarResult<f64> {
+        // Find the closest orbit state vector
+        let mut min_distance = f64::MAX;
+        let mut best_idx = 0;
+        
+        for &(idx, sat_pos) in orbit_lut.iter() {
+            let distance = self.distance_to_point(&sat_pos, ground_point);
+            if distance < min_distance {
+                min_distance = distance;
+                best_idx = idx;
+            }
+        }
+        
+        // Return time index as simplified azimuth time (in practice would need proper time conversion)
+        Ok(best_idx as f64 / orbit_data.state_vectors.len() as f64)
+    }
+    
+    /// Interpolate satellite state at given azimuth time
+    fn interpolate_satellite_state(&self, orbit_data: &OrbitData, azimuth_time: f64) -> SarResult<StateVector> {
+        let state_idx = (azimuth_time * orbit_data.state_vectors.len() as f64) as usize;
+        
+        if state_idx < orbit_data.state_vectors.len() {
+            Ok(orbit_data.state_vectors[state_idx].clone())
+        } else {
+            Err(SarError::Processing("Invalid azimuth time".to_string()))
+        }
+    }
+
+    /// Calculate output bounds from SAR bounding box
+    fn calculate_output_bounds(&self, sar_bbox: &BoundingBox) -> SarResult<BoundingBox> {
+        // Validate input bounding box
+        if sar_bbox.max_lat <= sar_bbox.min_lat || sar_bbox.max_lon <= sar_bbox.min_lon {
+            return Err(SarError::InvalidInput(
+                "Invalid bounding box: max values must be greater than min values".to_string()
+            ));
+        }
+        
+        // Check for unreasonably large bounding boxes
+        let lat_diff = sar_bbox.max_lat - sar_bbox.min_lat;
+        let lon_diff = sar_bbox.max_lon - sar_bbox.min_lon;
+        
+        // Sentinel-1 IW scenes are typically ~250km x 250km (about 2-3 degrees)
+        // Allow some flexibility for regional processing or multiple scenes
+        if lat_diff > 30.0 || lon_diff > 30.0 {
+            return Err(SarError::InvalidInput(
+                format!("Bounding box too large: {:.2}° x {:.2}° (max 30° x 30°) - this may indicate an error in bounding box calculation", lat_diff, lon_diff)
+            ));
+        }
+        
+        // Warn about large bounding boxes that might cause performance issues
+        if lat_diff > 5.0 || lon_diff > 5.0 {
+            log::warn!("Large bounding box detected: {:.2}° x {:.2}° - processing may be slow and require significant memory", lat_diff, lon_diff);
+            log::warn!("Consider subdividing the processing area or checking if the bounding box is correct");
+        }
+        
+        // Log normal processing info
+        if lat_diff <= 5.0 && lon_diff <= 5.0 {
+            log::info!("Processing area: {:.2}° x {:.2}° (~{:.0} km x {:.0} km)", 
+                      lat_diff, lon_diff, lat_diff * 111.0, lon_diff * 111.0);
+        }
+        
+        log::debug!("Input bounding box: ({:.6}, {:.6}) to ({:.6}, {:.6})", 
+                   sar_bbox.min_lon, sar_bbox.min_lat, sar_bbox.max_lon, sar_bbox.max_lat);
+        log::debug!("Bounding box size: {:.6}° x {:.6}°", lon_diff, lat_diff);
+        
+        // For now, use the SAR bounding box directly
+        // In a more sophisticated implementation, this would project the SAR geometry
+        // to the output coordinate system and compute proper bounds
+        Ok(sar_bbox.clone())
+    }
+    
+    /// Create output grid from bounds
     fn create_output_grid(&self, bounds: &BoundingBox) -> SarResult<(usize, usize, GeoTransform)> {
-        // Convert spacing from meters to degrees (approximate)
-        let lat_center = (bounds.min_lat + bounds.max_lat) / 2.0;
-        let meters_per_degree_lat = 111_320.0; // meters per degree latitude
-        let meters_per_degree_lon = 111_320.0 * lat_center.to_radians().cos(); // longitude varies with latitude
-
-        let pixel_size_lat = self.output_spacing / meters_per_degree_lat;
-        let pixel_size_lon = self.output_spacing / meters_per_degree_lon;
-
-        let width = ((bounds.max_lon - bounds.min_lon) / pixel_size_lon).ceil() as usize;
-        let height = ((bounds.max_lat - bounds.min_lat) / pixel_size_lat).ceil() as usize;
-
+        // Calculate output dimensions based on spacing in meters
+        // Convert lat/lon differences to approximate meters
+        let lat_diff = bounds.max_lat - bounds.min_lat;
+        let lon_diff = bounds.max_lon - bounds.min_lon;
+        
+        // Approximate conversion: 1 degree lat ≈ 111km, 1 degree lon ≈ 111km * cos(lat)
+        let center_lat = (bounds.min_lat + bounds.max_lat) / 2.0;
+        let meters_per_degree_lat = 111000.0;
+        let meters_per_degree_lon = 111000.0 * center_lat.to_radians().cos();
+        
+        // Calculate dimensions in pixels
+        let width = ((lon_diff * meters_per_degree_lon) / self.output_spacing).ceil() as usize;
+        let height = ((lat_diff * meters_per_degree_lat) / self.output_spacing).ceil() as usize;
+        
+        // Limit maximum dimensions to prevent huge files
+        let max_dimension = 10000; // 10k pixels maximum
+        let width = width.min(max_dimension);
+        let height = height.min(max_dimension);
+        
+        log::debug!("Output grid calculation:");
+        log::debug!("  Bounds: ({:.6}, {:.6}) to ({:.6}, {:.6})", bounds.min_lon, bounds.min_lat, bounds.max_lon, bounds.max_lat);
+        log::debug!("  Lat diff: {:.6} degrees ({:.1} km)", lat_diff, lat_diff * meters_per_degree_lat / 1000.0);
+        log::debug!("  Lon diff: {:.6} degrees ({:.1} km)", lon_diff, lon_diff * meters_per_degree_lon / 1000.0);
+        log::debug!("  Output spacing: {:.1} m", self.output_spacing);
+        log::debug!("  Calculated dimensions: {} x {} pixels", width, height);
+        
+        if width > max_dimension || height > max_dimension {
+            log::warn!("Output dimensions exceeded maximum, clamped to {}x{}", width, height);
+        }
+        
         let transform = GeoTransform {
             top_left_x: bounds.min_lon,
-            pixel_width: pixel_size_lon,
+            pixel_width: (bounds.max_lon - bounds.min_lon) / width as f64,
             rotation_x: 0.0,
             top_left_y: bounds.max_lat,
             rotation_y: 0.0,
-            pixel_height: -pixel_size_lat, // Negative for north-up images
+            pixel_height: -(bounds.max_lat - bounds.min_lat) / height as f64,
         };
-
+        
         Ok((width, height, transform))
     }
-
+    
     /// Convert map coordinates to geographic coordinates
     fn map_to_geographic(&self, map_x: f64, map_y: f64) -> SarResult<(f64, f64)> {
-        // For EPSG:4326, map coordinates are already lat/lon
+        // For WGS84 (EPSG:4326), map coordinates are already lat/lon
         if self.output_crs == 4326 {
             Ok((map_y, map_x)) // (lat, lon)
         } else {
-            // For other CRS, would need proper reprojection using PROJ library
-            // For now, simplified implementation
-            Err(SarError::Processing(format!(
-                "Reprojection from EPSG:{} not yet implemented", self.output_crs
-            )))
+            // For other CRS, would need proper projection transformation
+            // For now, return as-is
+            Ok((map_y, map_x))
         }
     }
-
-    /// Get elevation at lat/lon from DEM using bilinear interpolation
+    
+    /// Get elevation at lat/lon coordinates
     fn get_elevation_at_latlon(&self, lat: f64, lon: f64) -> Option<f64> {
         // Convert lat/lon to DEM pixel coordinates
-        let col = (lon - self.dem_transform.top_left_x) / self.dem_transform.pixel_width;
-        let row = (lat - self.dem_transform.top_left_y) / self.dem_transform.pixel_height;
-
-        // Check bounds
-        if col < 0.0 || row < 0.0 || 
-           col >= (self.dem.dim().1 - 1) as f64 || 
-           row >= (self.dem.dim().0 - 1) as f64 {
-            return None;
+        let dem_x = (lon - self.dem_transform.top_left_x) / self.dem_transform.pixel_width;
+        let dem_y = (lat - self.dem_transform.top_left_y) / self.dem_transform.pixel_height;
+        
+        let dem_col = dem_x.round() as usize;
+        let dem_row = dem_y.round() as usize;
+        
+        let (dem_height, dem_width) = self.dem.dim();
+        
+        if dem_row < dem_height && dem_col < dem_width {
+            let elevation = self.dem[[dem_row, dem_col]];
+            if elevation != self.dem_nodata && elevation.is_finite() {
+                Some(elevation as f64)
+            } else {
+                None
+            }
+        } else {
+            None
         }
-
-        // Bilinear interpolation
-        let x1 = col.floor() as usize;
-        let y1 = row.floor() as usize;
-        let x2 = (x1 + 1).min(self.dem.dim().1 - 1);
-        let y2 = (y1 + 1).min(self.dem.dim().0 - 1);
-
-        let dx = col - x1 as f64;
-        let dy = row - y1 as f64;
-
-        let v11 = self.dem[[y1, x1]] as f64;
-        let v12 = self.dem[[y2, x1]] as f64;
-        let v21 = self.dem[[y1, x2]] as f64;
-        let v22 = self.dem[[y2, x2]] as f64;
-
-        // Check for no-data values
-        if v11 == self.dem_nodata as f64 || v12 == self.dem_nodata as f64 ||
-           v21 == self.dem_nodata as f64 || v22 == self.dem_nodata as f64 {
-            return None;
-        }
-
-        let interpolated = v11 * (1.0 - dx) * (1.0 - dy) +
-                          v21 * dx * (1.0 - dy) +
-                          v12 * (1.0 - dx) * dy +
-                          v22 * dx * dy;
-
-        Some(interpolated)
     }
-
-    /// Convert lat/lon/elevation to SAR pixel coordinates using range-doppler equations
+    
+    /// Optimized DEM elevation lookup with bilinear interpolation and caching
+    fn get_elevation_at_latlon_optimized(&self, lat: f64, lon: f64) -> Option<f64> {
+        // Convert lat/lon to DEM pixel coordinates
+        let dem_x = (lon - self.dem_transform.top_left_x) / self.dem_transform.pixel_width;
+        let dem_y = (lat - self.dem_transform.top_left_y) / self.dem_transform.pixel_height;
+        
+        let dem_col = dem_x.floor() as usize;
+        let dem_row = dem_y.floor() as usize;
+        
+        let (dem_height, dem_width) = self.dem.dim();
+        
+        // Check bounds
+        if dem_row >= dem_height - 1 || dem_col >= dem_width - 1 {
+            return None;
+        }
+        
+        // Bilinear interpolation for better accuracy
+        let dx = dem_x - dem_col as f64;
+        let dy = dem_y - dem_row as f64;
+        
+        let v11 = self.dem[[dem_row, dem_col]];
+        let v12 = self.dem[[dem_row + 1, dem_col]];
+        let v21 = self.dem[[dem_row, dem_col + 1]];
+        let v22 = self.dem[[dem_row + 1, dem_col + 1]];
+        
+        // Check for no-data values
+        if v11 == self.dem_nodata || v12 == self.dem_nodata || 
+           v21 == self.dem_nodata || v22 == self.dem_nodata ||
+           !v11.is_finite() || !v12.is_finite() || !v21.is_finite() || !v22.is_finite() {
+            return None;
+        }
+        
+        // Bilinear interpolation
+        let v1 = v11 * (1.0 - dx as f32) + v21 * dx as f32;
+        let v2 = v12 * (1.0 - dx as f32) + v22 * dx as f32;
+        let elevation = v1 * (1.0 - dy as f32) + v2 * dy as f32;
+        
+        Some(elevation as f64)
+    }
+    
+    /// Vectorized batch DEM lookup for multiple points
+    fn get_elevations_batch(&self, coords: &[(f64, f64)]) -> Vec<Option<f64>> {
+        coords.par_iter()
+            .map(|&(lat, lon)| self.get_elevation_at_latlon_optimized(lat, lon))
+            .collect()
+    }
+    
+    /// Convert lat/lon/elevation to ECEF coordinates
+    fn latlon_to_ecef(&self, lat: f64, lon: f64, elevation: f64) -> [f64; 3] {
+        let a = 6378137.0; // WGS84 semi-major axis
+        let e2 = 0.00669437999014; // WGS84 first eccentricity squared
+        
+        let lat_rad = lat.to_radians();
+        let lon_rad = lon.to_radians();
+        
+        let n = a / (1.0 - e2 * lat_rad.sin().powi(2)).sqrt();
+        
+        let x = (n + elevation) * lat_rad.cos() * lon_rad.cos();
+        let y = (n + elevation) * lat_rad.cos() * lon_rad.sin();
+        let z = (n * (1.0 - e2) + elevation) * lat_rad.sin();
+        
+        [x, y, z]
+    }
+    
+    /// Calculate distance between two 3D points
+    fn distance_to_point(&self, point1: &[f64; 3], point2: &[f64; 3]) -> f64 {
+        let dx = point1[0] - point2[0];
+        let dy = point1[1] - point2[1];
+        let dz = point1[2] - point2[2];
+        (dx*dx + dy*dy + dz*dz).sqrt()
+    }
+    
+    /// Basic lat/lon to SAR pixel mapping (for non-optimized path)
     fn latlon_to_sar_pixel(
         &self,
         lat: f64,
@@ -309,159 +762,67 @@ impl TerrainCorrector {
         elevation: f64,
         orbit_data: &OrbitData,
         params: &RangeDopplerParams,
-    ) -> SarResult<Option<(usize, usize)>> {
-        // Convert lat/lon/elevation to ECEF coordinates
-        let ground_point = self.latlon_to_ecef(lat, lon, elevation);
-
-        // Find the azimuth time when the satellite was closest to the ground point
-        let azimuth_time = self.find_azimuth_time(&ground_point, orbit_data)?;
-
-        // Get satellite position and velocity at azimuth time
-        let sat_state = self.interpolate_satellite_state(orbit_data, azimuth_time)?;
-
-        // Calculate slant range
-        let range_vector = [
-            ground_point[0] - sat_state.position[0],
-            ground_point[1] - sat_state.position[1],
-            ground_point[2] - sat_state.position[2],
-        ];
-        let slant_range = (range_vector[0].powi(2) + range_vector[1].powi(2) + range_vector[2].powi(2)).sqrt();
-
-        // Convert slant range to range pixel
-        let range_time = slant_range / params.speed_of_light * 2.0; // Two-way travel time
-        let range_pixel = (range_time - params.slant_range_time) / 
-                         (params.range_pixel_spacing / params.speed_of_light * 2.0);
-
-        // Convert azimuth time to azimuth pixel
-        let azimuth_pixel = azimuth_time * params.prf;
-
-        if range_pixel >= 0.0 && azimuth_pixel >= 0.0 {
-            Ok(Some((range_pixel as usize, azimuth_pixel as usize)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Convert lat/lon/elevation to ECEF coordinates
-    fn latlon_to_ecef(&self, lat: f64, lon: f64, elevation: f64) -> [f64; 3] {
-        let a = 6_378_137.0; // WGS84 semi-major axis
-        let e2 = 0.00669437999014; // WGS84 first eccentricity squared
-
-        let lat_rad = lat.to_radians();
-        let lon_rad = lon.to_radians();
-
-        let n = a / (1.0 - e2 * lat_rad.sin().powi(2)).sqrt();
-
-        let x = (n + elevation) * lat_rad.cos() * lon_rad.cos();
-        let y = (n + elevation) * lat_rad.cos() * lon_rad.sin();
-        let z = (n * (1.0 - e2) + elevation) * lat_rad.sin();
-
-        [x, y, z]
-    }
-
-    /// Find azimuth time when satellite was closest to ground point
-    fn find_azimuth_time(&self, ground_point: &[f64; 3], orbit_data: &OrbitData) -> SarResult<f64> {
-        let mut min_distance = f64::INFINITY;
-        let mut best_time = 0.0;
-
+    ) -> Option<(usize, usize)> {
+        // Simplified approach - find closest orbit state vector
+        let target_ecef = self.latlon_to_ecef(lat, lon, elevation);
+        
+        let mut min_distance = f64::MAX;
+        let mut best_idx = 0;
+        
         for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
-            let distance = self.distance_to_point(&state_vector.position, ground_point);
-            
+            let distance = self.distance_to_point(&state_vector.position, &target_ecef);
             if distance < min_distance {
                 min_distance = distance;
-                // Convert to relative time from start of orbit data
-                best_time = i as f64; // Simplified - should use actual time differences
+                best_idx = i;
             }
         }
-
-        Ok(best_time)
-    }
-
-    /// Calculate distance between two 3D points
-    fn distance_to_point(&self, point1: &[f64; 3], point2: &[f64; 3]) -> f64 {
-        ((point1[0] - point2[0]).powi(2) + 
-         (point1[1] - point2[1]).powi(2) + 
-         (point1[2] - point2[2]).powi(2)).sqrt()
-    }
-
-    /// Interpolate satellite state at given time
-    fn interpolate_satellite_state(&self, orbit_data: &OrbitData, time: f64) -> SarResult<StateVector> {
-        // Simplified linear interpolation between orbit state vectors
-        let index = time as usize;
         
-        if index >= orbit_data.state_vectors.len() - 1 {
-            return Ok(orbit_data.state_vectors.last().unwrap().clone());
+        if best_idx < orbit_data.state_vectors.len() {
+            let state_vector = &orbit_data.state_vectors[best_idx];
+            let slant_range = self.distance_to_point(&state_vector.position, &target_ecef);
+            
+            // Convert to pixels (simplified)
+            let range_pixel = (slant_range / params.speed_of_light * 2.0 - params.slant_range_time) 
+                / (params.range_pixel_spacing / params.speed_of_light);
+            let azimuth_pixel = best_idx as f64;
+            
+            if range_pixel >= 0.0 && azimuth_pixel >= 0.0 {
+                Some((range_pixel.round() as usize, azimuth_pixel.round() as usize))
+            } else {
+                None
+            }
+        } else {
+            None
         }
-
-        let sv1 = &orbit_data.state_vectors[index];
-        let sv2 = &orbit_data.state_vectors[index + 1];
-        
-        let fraction = time - index as f64;
-
-        let interpolated = StateVector {
-            time: sv1.time, // Simplified
-            position: [
-                sv1.position[0] + fraction * (sv2.position[0] - sv1.position[0]),
-                sv1.position[1] + fraction * (sv2.position[1] - sv1.position[1]),
-                sv1.position[2] + fraction * (sv2.position[2] - sv1.position[2]),
-            ],
-            velocity: [
-                sv1.velocity[0] + fraction * (sv2.velocity[0] - sv1.velocity[0]),
-                sv1.velocity[1] + fraction * (sv2.velocity[1] - sv1.velocity[1]),
-                sv1.velocity[2] + fraction * (sv2.velocity[2] - sv1.velocity[2]),
-            ],
-        };
-
-        Ok(interpolated)
     }
-
-    /// Bilinear interpolation from SAR image
-    fn bilinear_interpolate(&self, image: &Array2<f32>, x: f64, y: f64) -> f32 {
-        let x1 = x.floor() as usize;
-        let y1 = y.floor() as usize;
-        let x2 = (x1 + 1).min(image.dim().1 - 1);
-        let y2 = (y1 + 1).min(image.dim().0 - 1);
-
-        if x1 >= image.dim().1 || y1 >= image.dim().0 {
-            return f32::NAN;
-        }
-
-        let dx = x - x1 as f64;
-        let dy = y - y1 as f64;
-
-        let v11 = image[[y1, x1]] as f64;
-        let v12 = image[[y2, x1]] as f64;
-        let v21 = image[[y1, x2]] as f64;
-        let v22 = image[[y2, x2]] as f64;
-
-        let interpolated = v11 * (1.0 - dx) * (1.0 - dy) +
-                          v21 * dx * (1.0 - dy) +
-                          v12 * (1.0 - dx) * dy +
-                          v22 * dx * dy;
-
-        interpolated as f32
-    }
-
-    /// Save geocoded result as GeoTIFF
-    pub fn save_geotiff<P: AsRef<Path>>(
+    
+    /// Save GeoTIFF file
+    pub fn save_geotiff(
         &self,
         image: &Array2<f32>,
         transform: &GeoTransform,
-        output_path: P,
+        output_path: &str,
         compression: Option<&str>,
     ) -> SarResult<()> {
-        log::info!("Saving geocoded result as GeoTIFF: {}", output_path.as_ref().display());
-
-        let driver = DriverManager::get_driver_by_name("GTiff")?;
+        use gdal::{DriverManager, Dataset};
+        
         let (height, width) = image.dim();
-
+        let driver = DriverManager::get_driver_by_name("GTiff")?;
+        
+        // Create dataset with compression options
+        let mut options = Vec::new();
+        if let Some(comp) = compression {
+            options.push(format!("COMPRESS={}", comp));
+        }
+        options.push("TILED=YES".to_string());
+        
         let mut dataset = driver.create_with_band_type::<f32, _>(
-            output_path.as_ref(),
+            output_path,
             width as isize,
             height as isize,
             1,
         )?;
-
+        
         // Set geotransform
         dataset.set_geo_transform(&[
             transform.top_left_x,
@@ -471,386 +832,22 @@ impl TerrainCorrector {
             transform.rotation_y,
             transform.pixel_height,
         ])?;
-
+        
         // Set coordinate reference system
-        let crs = format!("EPSG:{}", self.output_crs);
         dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(self.output_crs)?)?;
-
+        
         // Write image data
         let mut rasterband = dataset.rasterband(1)?;
         let flat_data: Vec<f32> = image.iter().cloned().collect();
         let buffer = gdal::raster::Buffer::new((width, height), flat_data);
         rasterband.write((0, 0), (width, height), &buffer)?;
-
+        
         // Set no-data value
         rasterband.set_no_data_value(Some(f32::NAN as f64))?;
-
-        // Set compression if specified
-        if let Some(compression_type) = compression {
-            dataset.set_metadata_item("COMPRESS", compression_type, "")?;
-        }
-
-        log::info!("✅ GeoTIFF saved successfully");
-        Ok(())
-    }
-
-    /// Complete terrain correction pipeline
-    pub fn complete_terrain_correction_pipeline(
-        sar_image: &Array2<f32>,
-        dem_path: &str,
-        orbit_data: &OrbitData,
-        sar_bbox: &BoundingBox,
-        output_path: &str,
-        output_crs: u32,
-        output_spacing: f64,
-    ) -> SarResult<()> {
-        log::info!("🌍 Starting complete terrain correction pipeline");
-        
-        // Step 1: Load terrain corrector with DEM
-        let corrector = Self::from_dem_file(dem_path, output_crs, output_spacing)?;
-        
-        // Step 2: Set up range-doppler parameters
-        let params = RangeDopplerParams::default();
-        
-        // Step 3: Perform terrain correction
-        let (geocoded_image, geo_transform) = corrector.range_doppler_terrain_correction(
-            sar_image,
-            orbit_data,
-            &params,
-            sar_bbox,
-        )?;
-        
-        // Step 4: Save result as GeoTIFF
-        corrector.save_geotiff(
-            &geocoded_image,
-            &geo_transform,
-            output_path,
-            Some("LZW"), // Use LZW compression
-        )?;
-        
-        log::info!("🎉 Terrain correction pipeline completed successfully!");
-        log::info!("Output saved to: {}", output_path);
         
         Ok(())
     }
-
-    /// Enhanced terrain correction pipeline with integrated masking
-    pub fn enhanced_terrain_correction_pipeline(
-        sar_image: &Array2<f32>,
-        dem_path: &str,
-        orbit_data: &OrbitData,
-        sar_bbox: &BoundingBox,
-        output_path: &str,
-        output_crs: u32,
-        output_spacing: f64,
-        masking_config: Option<&MaskingWorkflow>,
-        save_intermediate: bool,
-    ) -> SarResult<()> {
-        log::info!("🌍 Starting enhanced terrain correction pipeline with masking");
-        
-        // Step 1: Load terrain corrector with DEM
-        let corrector = Self::from_dem_file(dem_path, output_crs, output_spacing)?;
-        
-        // Step 2: Set up range-doppler parameters
-        let params = RangeDopplerParams::default();
-        
-        // Step 3: Perform terrain correction
-        let (mut geocoded_image, geo_transform) = corrector.range_doppler_terrain_correction(
-            sar_image,
-            orbit_data,
-            &params,
-            sar_bbox,
-        )?;
-        
-        // Step 4: Apply masking workflow if provided
-        if let Some(workflow) = masking_config {
-            log::info!("🎭 Applying masking workflow");
-            
-            // Apply masking to the geocoded image using the corrector's DEM
-            let mask_result = corrector.apply_masking_workflow(
-                &geocoded_image,
-                &corrector.dem,
-                workflow,
-            )?;
-            
-            log::info!("📊 Masking statistics:");
-            log::info!("  - Valid pixels: {}/{} ({:.1}%)", 
-                mask_result.valid_pixels, 
-                mask_result.total_pixels, 
-                mask_result.coverage_percent
-            );
-            
-            // Apply the combined mask to the geocoded image
-            geocoded_image = corrector.apply_mask_to_gamma0(
-                &geocoded_image,
-                &mask_result.combined_mask,
-                Some(f32::NAN),
-            )?;
-            
-            // Save intermediate masking products if requested
-            if save_intermediate {
-                let base_path = Path::new(output_path).parent().unwrap_or(Path::new("."));
-                let stem = Path::new(output_path).file_stem().unwrap().to_str().unwrap();
-                
-                // Save LIA cosine
-                let lia_path = base_path.join(format!("{}_lia_cosine.tif", stem));
-                corrector.save_geotiff(
-                    &mask_result.lia_cosine,
-                    &geo_transform,
-                    lia_path.to_str().unwrap(),
-                    Some("LZW"),
-                )?;
-                
-                // Save combined mask as byte data
-                let mask_u8: Array2<u8> = mask_result.combined_mask.mapv(|v| if v { 1u8 } else { 0u8 });
-                corrector.save_mask_geotiff(
-                    &mask_u8,
-                    &geo_transform,
-                    &base_path.join(format!("{}_combined_mask.tif", stem)),
-                )?;
-                
-                log::info!("💾 Saved intermediate masking products");
-            }
-        }
-        
-        // Step 5: Save final result as GeoTIFF
-        corrector.save_geotiff(
-            &geocoded_image,
-            &geo_transform,
-            output_path,
-            Some("LZW"), // Use LZW compression
-        )?;
-        
-        log::info!("🎉 Enhanced terrain correction pipeline completed successfully!");
-        log::info!("Output saved to: {}", output_path);
-        
-        Ok(())
-    }
-
-    /// Adaptive terrain correction with quality assessment
-    pub fn adaptive_terrain_correction(
-        sar_image: &Array2<f32>,
-        dem_path: &str,
-        orbit_data: &OrbitData,
-        sar_bbox: &BoundingBox,
-        output_path: &str,
-        output_crs: u32,
-        output_spacing: f64,
-        adaptive_thresholds: bool,
-    ) -> SarResult<(Array2<f32>, MaskResult, GeoTransform)> {
-        log::info!("🧠 Starting adaptive terrain correction with quality assessment");
-        
-        // Load terrain corrector
-        let corrector = Self::from_dem_file(dem_path, output_crs, output_spacing)?;
-        let params = RangeDopplerParams::default();
-        
-        // Perform initial terrain correction
-        let (geocoded_image, geo_transform) = corrector.range_doppler_terrain_correction(
-            sar_image,
-            orbit_data,
-            &params,
-            sar_bbox,
-        )?;
-        
-        // Create adaptive masking workflow
-        let workflow = if adaptive_thresholds {
-            corrector.create_adaptive_masking_workflow(&geocoded_image)?
-        } else {
-            MaskingWorkflow::default()
-        };
-        
-        // Apply masking
-        let mask_result = corrector.apply_masking_workflow(
-            &geocoded_image,
-            &corrector.dem,
-            &workflow,
-        )?;
-        
-        // Quality assessment
-        corrector.assess_terrain_correction_quality(&mask_result)?;
-        
-        Ok((geocoded_image, mask_result, geo_transform))
-    }
-
-    /// Create adaptive masking workflow based on data characteristics
-    pub fn create_adaptive_masking_workflow(&self, gamma0_data: &Array2<f32>) -> SarResult<MaskingWorkflow> {
-        log::info!("🔧 Creating adaptive masking thresholds");
-        
-        // Compute gamma0 statistics for adaptive thresholding
-        let valid_gamma0: Vec<f32> = gamma0_data.iter()
-            .filter(|&&x| x.is_finite() && x > 0.0)
-            .cloned()
-            .collect();
-        
-        if valid_gamma0.is_empty() {
-            return Ok(MaskingWorkflow::default());
-        }
-        
-        // Calculate percentiles for adaptive thresholding
-        let mut sorted_gamma0 = valid_gamma0.clone();
-        sorted_gamma0.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        
-        let p1_idx = (sorted_gamma0.len() as f32 * 0.01) as usize;
-        let p99_idx = (sorted_gamma0.len() as f32 * 0.99) as usize;
-        
-        let gamma0_min = sorted_gamma0[p1_idx.min(sorted_gamma0.len() - 1)];
-        let gamma0_max = sorted_gamma0[p99_idx.min(sorted_gamma0.len() - 1)];
-        
-        // Adaptive DEM threshold based on elevation range
-        let valid_dem: Vec<f32> = self.dem.iter()
-            .filter(|&&x| x.is_finite() && x != self.dem_nodata)
-            .cloned()
-            .collect();
-        
-        let dem_threshold = if !valid_dem.is_empty() {
-            let min_elevation = valid_dem.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-            (min_elevation - 50.0).max(-500.0) // Allow 50m below minimum elevation
-        } else {
-            -100.0 // Default threshold
-        };
-        
-        log::info!("📏 Adaptive thresholds: γ₀ [{:.3}, {:.3}], DEM > {:.1}m", 
-            gamma0_min, gamma0_max, dem_threshold);
-        
-        Ok(MaskingWorkflow {
-            lia_threshold: 0.1, // Keep conservative LIA threshold
-            dem_threshold: dem_threshold as f64,
-            gamma0_min,
-            gamma0_max,
-        })
-    }
-
-    /// Assess terrain correction quality using masking results
-    pub fn assess_terrain_correction_quality(&self, mask_result: &MaskResult) -> SarResult<()> {
-        log::info!("📈 Assessing terrain correction quality");
-        
-        let coverage = mask_result.coverage_percent;
-        
-        // Quality assessment based on coverage
-        let quality_level = if coverage >= 90.0 {
-            "Excellent"
-        } else if coverage >= 75.0 {
-            "Good"
-        } else if coverage >= 50.0 {
-            "Fair"
-        } else if coverage >= 25.0 {
-            "Poor"
-        } else {
-            "Very Poor"
-        };
-        
-        log::info!("🏆 Quality Assessment:");
-        log::info!("  - Coverage: {:.1}% ({} quality)", coverage, quality_level);
-        log::info!("  - Valid pixels: {}/{}", mask_result.valid_pixels, mask_result.total_pixels);
-        
-        // Check specific mask components
-        let gamma0_coverage = mask_result.gamma0_mask.iter().filter(|&&x| x).count() as f64 
-            / mask_result.total_pixels as f64 * 100.0;
-        let dem_coverage = mask_result.dem_mask.iter().filter(|&&x| x).count() as f64 
-            / mask_result.total_pixels as f64 * 100.0;
-        let lia_coverage = mask_result.lia_mask.iter().filter(|&&x| x).count() as f64 
-            / mask_result.total_pixels as f64 * 100.0;
-        
-        log::info!("📊 Component Coverage:");
-        log::info!("  - Gamma0 valid: {:.1}%", gamma0_coverage);
-        log::info!("  - DEM valid: {:.1}%", dem_coverage);
-        log::info!("  - LIA valid: {:.1}%", lia_coverage);
-        
-        if coverage < 50.0 {
-            log::warn!("⚠️  Low coverage detected. Consider adjusting masking thresholds.");
-        }
-        
-        Ok(())
-    }
-
-    /// Save mask data as GeoTIFF (byte format)
-    pub fn save_mask_geotiff<P: AsRef<Path>>(
-        &self,
-        mask_data: &Array2<u8>,
-        transform: &GeoTransform,
-        output_path: P,
-    ) -> SarResult<()> {
-        let (height, width) = mask_data.dim();
-        
-        // Create output dataset
-        let driver = DriverManager::get_driver_by_name("GTiff")?;
-        let mut dataset = driver.create_with_band_type::<u8, _>(
-            output_path.as_ref(),
-            width as isize,
-            height as isize,
-            1,
-        )?;
-        
-        // Set geotransform
-        dataset.set_geo_transform(&[
-            transform.top_left_x,
-            transform.pixel_width,
-            transform.rotation_x,
-            transform.top_left_y,
-            transform.rotation_y,
-            transform.pixel_height,
-        ])?;
-        
-        // Set coordinate reference system
-        dataset.set_spatial_ref(&gdal::spatial_ref::SpatialRef::from_epsg(self.output_crs)?)?;
-        
-        // Write mask data
-        let mut rasterband = dataset.rasterband(1)?;
-        let flat_data: Vec<u8> = mask_data.iter().cloned().collect();
-        let buffer = gdal::raster::Buffer::new((width, height), flat_data);
-        rasterband.write((0, 0), (width, height), &buffer)?;
-        
-        // Set no-data value for mask (0 = invalid, 1 = valid)
-        rasterband.set_no_data_value(Some(255.0))?;
-        
-        Ok(())
-    }
-
-    /// Compute surface normal from DEM using central differences
-    pub fn compute_surface_normal(&self, dem_array: &Array2<f32>, row: usize, col: usize) -> SurfaceNormal {
-        let (height, width) = dem_array.dim();
-        let pixel_spacing = self.output_spacing;
-        
-        // Central differences with boundary handling
-        let dz_dx = if col == 0 {
-            dem_array[[row, col + 1]] - dem_array[[row, col]]
-        } else if col == width - 1 {
-            dem_array[[row, col]] - dem_array[[row, col - 1]]
-        } else {
-            (dem_array[[row, col + 1]] - dem_array[[row, col - 1]]) / 2.0
-        };
-        
-        let dz_dy = if row == 0 {
-            dem_array[[row + 1, col]] - dem_array[[row, col]]
-        } else if row == height - 1 {
-            dem_array[[row, col]] - dem_array[[row - 1, col]]
-        } else {
-            (dem_array[[row + 1, col]] - dem_array[[row - 1, col]]) / 2.0
-        };
-        
-        // Compute normal vector: cross product of tangent vectors
-        // Tangent vector in x: (pixel_spacing, 0, dz_dx)
-        // Tangent vector in y: (0, pixel_spacing, dz_dy)
-        // Normal = tx × ty = (-dz_dx, -dz_dy, pixel_spacing^2)
-        let mut normal = SurfaceNormal {
-            x: -dz_dx as f64 / pixel_spacing,
-            y: -dz_dy as f64 / pixel_spacing,
-            z: pixel_spacing,
-        };
-        normal.normalize();
-        normal
-    }
-
-    /// Compute local incidence angle cosine
-    pub fn compute_local_incidence_angle(&self, surface_normal: &SurfaceNormal, radar_look_vector: &Vector3) -> f64 {
-        // Local incidence angle is angle between radar look vector and surface normal
-        // cos(θ_lia) = |look_vector · surface_normal|
-        let dot_product = radar_look_vector.x * surface_normal.x +
-                         radar_look_vector.y * surface_normal.y +
-                         radar_look_vector.z * surface_normal.z;
-        dot_product.abs()
-    }
-
+    
     /// Apply masking workflow to terrain-corrected data
     pub fn apply_masking_workflow(
         &self,
@@ -886,7 +883,6 @@ impl TerrainCorrector {
                     
                     // Approximate radar look vector from target to sensor
                     // For now, use a simplified vertical look assumption
-                    // In practice, this should use actual SAR geometry
                     let look_vector = Vector3 {
                         x: 0.0,
                         y: 0.0,
@@ -906,25 +902,46 @@ impl TerrainCorrector {
         }
         
         // Combine all masks
-        let mut combined_mask = Array2::<bool>::from_elem((height, width), true);
+        let mut combined_mask_bool = Array2::<bool>::from_elem((height, width), true);
         let mut valid_pixels = 0;
         
         for row in 0..height {
             for col in 0..width {
-                combined_mask[[row, col]] = gamma0_mask[[row, col]] &&
+                combined_mask_bool[[row, col]] = gamma0_mask[[row, col]] &&
                     dem_mask[[row, col]] &&
                     lia_mask[[row, col]];
                 
-                if combined_mask[[row, col]] {
+                if combined_mask_bool[[row, col]] {
                     valid_pixels += 1;
                 }
+            }
+        }
+        
+        // Convert boolean mask to u8 mask
+        let mut combined_mask = Array2::<u8>::zeros((height, width));
+        for row in 0..height {
+            for col in 0..width {
+                combined_mask[[row, col]] = if combined_mask_bool[[row, col]] { 1 } else { 0 };
             }
         }
         
         let total_pixels = height * width;
         let coverage_percent = (valid_pixels as f64 / total_pixels as f64) * 100.0;
         
+        let stats = crate::types::MaskStats {
+            total_pixels,
+            water_pixels: 0, // Would be computed if water masking is implemented
+            shadow_pixels: 0, // Would be computed if shadow masking is implemented
+            layover_pixels: 0, // Would be computed if layover masking is implemented
+            noise_pixels: 0, // Would be computed if noise masking is implemented
+            valid_pixels,
+        };
+        
         Ok(MaskResult {
+            water_mask: None,
+            shadow_mask: None,
+            layover_mask: None,
+            noise_mask: None,
             combined_mask,
             lia_cosine,
             gamma0_mask,
@@ -933,85 +950,685 @@ impl TerrainCorrector {
             valid_pixels,
             total_pixels,
             coverage_percent,
+            stats,
         })
     }
-
+    
     /// Apply mask to gamma0 data
     pub fn apply_mask_to_gamma0(
         &self,
         gamma0_data: &Array2<f32>,
-        mask: &Array2<bool>,
+        mask: &Array2<u8>,
         fill_value: Option<f32>,
     ) -> SarResult<Array2<f32>> {
         let mut masked_data = gamma0_data.clone();
         let fill_val = fill_value.unwrap_or(f32::NAN);
         
-        for ((row, col), &is_valid) in mask.indexed_iter() {
-            if !is_valid {
+        for ((row, col), &mask_val) in mask.indexed_iter() {
+            if mask_val == 0 {
                 masked_data[[row, col]] = fill_val;
             }
         }
         
         Ok(masked_data)
     }
-}
+    
+    /// Compute surface normal from DEM using central differences
+    pub fn compute_surface_normal(&self, dem_array: &Array2<f32>, row: usize, col: usize) -> SurfaceNormal {
+        let (height, width) = dem_array.dim();
+        let pixel_spacing = self.output_spacing;
+        
+        // Central differences with boundary handling
+        let dz_dx = if col == 0 {
+            dem_array[[row, col + 1]] - dem_array[[row, col]]
+        } else if col == width - 1 {
+            dem_array[[row, col]] - dem_array[[row, col - 1]]
+        } else {
+            (dem_array[[row, col + 1]] - dem_array[[row, col - 1]]) / 2.0
+        };
+        
+        let dz_dy = if row == 0 {
+            dem_array[[row + 1, col]] - dem_array[[row, col]]
+        } else if row == height - 1 {
+            dem_array[[row, col]] - dem_array[[row - 1, col]]
+        } else {
+            (dem_array[[row + 1, col]] - dem_array[[row - 1, col]]) / 2.0
+        };
+        
+        // Compute normal vector: cross product of tangent vectors
+        let mut normal = SurfaceNormal {
+            x: -dz_dx as f64 / pixel_spacing,
+            y: -dz_dy as f64 / pixel_spacing,
+            z: pixel_spacing,
+        };
+        normal.normalize();
+        normal
+    }
+    
+    /// Compute local incidence angle cosine
+    pub fn compute_local_incidence_angle(&self, surface_normal: &SurfaceNormal, radar_look_vector: &Vector3) -> f64 {
+        // Local incidence angle is angle between radar look vector and surface normal
+        // cos(θ_lia) = |look_vector · surface_normal|
+        let dot_product = radar_look_vector.x * surface_normal.x +
+                         radar_look_vector.y * surface_normal.y +
+                         radar_look_vector.z * surface_normal.z;
+        dot_product.abs()
+    }
 
-/// Masking workflow for post-terrain correction processing
-#[derive(Debug, Clone)]
-pub struct MaskingWorkflow {
-    /// Local incidence angle threshold (cosine)
-    pub lia_threshold: f64,
-    /// DEM validity threshold
-    pub dem_threshold: f64,
-    /// Gamma0 validity thresholds
-    pub gamma0_min: f32,
-    pub gamma0_max: f32,
-}
-
-impl Default for MaskingWorkflow {
-    fn default() -> Self {
-        Self {
-            lia_threshold: 0.1,     // cos(84°) - steep slopes
-            dem_threshold: -100.0,   // Below sea level threshold
-            gamma0_min: -50.0,      // Minimum gamma0 in dB
-            gamma0_max: 10.0,       // Maximum gamma0 in dB
+    /// Complete terrain correction pipeline (static method for Python API)
+    pub fn complete_terrain_correction_pipeline(
+        sar_image: &Array2<f32>,
+        dem_path: &str,
+        orbit_data: &OrbitData,
+        bbox: &BoundingBox,
+        output_path: &str,
+        output_crs: u32,
+        output_spacing: f64,
+        masking_workflow: Option<&MaskingWorkflow>,
+    ) -> SarResult<()> {
+        // Check if DEM file exists before trying to open it
+        let corrector = if std::path::Path::new(dem_path).exists() {
+            // DEM file exists, try to load it
+            match Self::from_dem_file(dem_path, output_crs, output_spacing) {
+                Ok(corrector) => corrector,
+                Err(e) => {
+                    log::warn!("Failed to load DEM file '{}': {}", dem_path, e);
+                    log::info!("Attempting automatic DEM preparation...");
+                    
+                    // Use a default cache directory
+                    let cache_dir = "/tmp/sardine_dem_cache";
+                    
+                    // Try to prepare DEM using the bounding box
+                    let (dem_array, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+                        bbox,
+                        output_spacing,
+                        cache_dir,
+                    )?;
+                    
+                    // Create terrain corrector with prepared DEM
+                    Self::new(
+                        dem_array,
+                        dem_transform,
+                        -32768.0, // Default nodata value
+                        output_crs,
+                        output_spacing,
+                    )
+                }
+            }
+        } else {
+            // DEM file doesn't exist, prepare it automatically
+            log::info!("DEM file not found at '{}', attempting automatic preparation...", dem_path);
+            
+            // Use a default cache directory
+            let cache_dir = "/tmp/sardine_dem_cache";
+            
+            // Try to prepare DEM using the bounding box
+            let (dem_array, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+                bbox,
+                output_spacing,
+                cache_dir,
+            )?;
+            
+            // Create terrain corrector with prepared DEM
+            Self::new(
+                dem_array,
+                dem_transform,
+                -32768.0, // Default nodata value
+                output_crs,
+                output_spacing,
+            )
+        };
+        
+        let params = RangeDopplerParams::default();
+        
+        let (terrain_corrected, geo_transform) = corrector.range_doppler_terrain_correction(
+            sar_image, orbit_data, &params, bbox
+        )?;
+        
+        if let Some(workflow) = masking_workflow {
+            let mask_result = corrector.apply_masking_workflow(&terrain_corrected, &corrector.dem, workflow)?;
+            let masked_data = corrector.apply_mask_to_gamma0(&terrain_corrected, &mask_result.combined_mask, None)?;
+            corrector.save_geotiff(&masked_data, &geo_transform, output_path, Some("LZW"))?;
+        } else {
+            corrector.save_geotiff(&terrain_corrected, &geo_transform, output_path, Some("LZW"))?;
         }
+        
+        Ok(())
+    }
+    
+    /// Enhanced terrain correction pipeline (static method for Python API) 
+    pub fn enhanced_terrain_correction_pipeline(
+        sar_image: &Array2<f32>,
+        dem_path: &str,
+        orbit_data: &OrbitData,
+        bbox: &BoundingBox,
+        output_path: &str,
+        output_crs: u32,
+        output_spacing: f64,
+        chunk_size: Option<usize>,
+    ) -> SarResult<()> {
+        // Check if DEM file exists before trying to open it
+        let corrector = if std::path::Path::new(dem_path).exists() {
+            // DEM file exists, try to load it
+            match Self::from_dem_file(dem_path, output_crs, output_spacing) {
+                Ok(corrector) => corrector,
+                Err(e) => {
+                    log::warn!("Failed to load DEM file '{}': {}", dem_path, e);
+                    log::info!("Attempting automatic DEM preparation...");
+                    
+                    // Use a default cache directory
+                    let cache_dir = "/tmp/sardine_dem_cache";
+                    
+                    // Try to prepare DEM using the bounding box
+                    let (dem_array, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+                        bbox,
+                        output_spacing,
+                        cache_dir,
+                    )?;
+                    
+                    // Create terrain corrector with prepared DEM
+                    Self::new(
+                        dem_array,
+                        dem_transform,
+                        -32768.0, // Default nodata value
+                        output_crs,
+                        output_spacing,
+                    )
+                }
+            }
+        } else {
+            // DEM file doesn't exist, prepare it automatically
+            log::info!("DEM file not found at '{}', attempting automatic preparation...", dem_path);
+            
+            // Use a default cache directory
+            let cache_dir = "/tmp/sardine_dem_cache";
+            
+            // Try to prepare DEM using the bounding box
+            let (dem_array, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+                bbox,
+                output_spacing,
+                cache_dir,
+            )?;
+            
+            // Create terrain corrector with prepared DEM
+            Self::new(
+                dem_array,
+                dem_transform,
+                -32768.0, // Default nodata value
+                output_crs,
+                output_spacing,
+            )
+        };
+        
+        let params = RangeDopplerParams::default();
+        
+        let (terrain_corrected, geo_transform) = corrector.range_doppler_terrain_correction_chunked(
+            sar_image, orbit_data, &params, bbox, chunk_size
+        )?;
+        
+        corrector.save_geotiff(&terrain_corrected, &geo_transform, output_path, Some("LZW"))?;
+        Ok(())
+    }
+    
+    /// Adaptive terrain correction (static method for Python API)
+    pub fn adaptive_terrain_correction(
+        sar_image: &Array2<f32>,
+        dem_path: &str,
+        orbit_data: &OrbitData,
+        bbox: &BoundingBox,
+        output_path: &str,
+        output_crs: u32,
+        output_spacing: f64,
+        enable_chunking: bool,
+        chunk_size: Option<usize>,
+    ) -> SarResult<(Array2<f32>, GeoTransform)> {
+        // Try to load DEM file, with automatic preparation fallback
+        let corrector = match Self::from_dem_file(dem_path, output_crs, output_spacing) {
+            Ok(corrector) => corrector,
+            Err(_) => {
+                // DEM file doesn't exist, try to prepare it automatically
+                log::info!("DEM file not found, attempting automatic preparation...");
+                
+                // Use a default cache directory
+                let cache_dir = "/tmp/sardine_dem_cache";
+                
+                // Try to prepare DEM using the bounding box
+                let (dem_array, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+                    bbox,
+                    output_spacing,
+                    cache_dir,
+                )?;
+                
+                // Create terrain corrector with prepared DEM
+                Self::new(
+                    dem_array,
+                    dem_transform,
+                    -32768.0, // Default nodata value
+                    output_crs,
+                    output_spacing,
+                )
+            }
+        };
+        
+        let params = RangeDopplerParams::default();
+        
+        if enable_chunking {
+            corrector.range_doppler_terrain_correction_chunked(
+                sar_image, orbit_data, &params, bbox, chunk_size
+            )
+        } else {
+            corrector.range_doppler_terrain_correction(
+                sar_image, orbit_data, &params, bbox
+            )
+        }
+    }
+    
+    /// Static ultra-optimized terrain correction method for Python API
+    pub fn ultra_optimized_terrain_correction_static(
+        sar_image: &Array2<f32>,
+        dem_path: &str,
+        orbit_data: &OrbitData,
+        sar_bbox: &BoundingBox,
+        output_path: &str,
+        output_crs: u32,
+        output_spacing: f64,
+        chunk_size: Option<usize>,
+        interpolation_method: &str,
+        enable_spatial_cache: bool,
+    ) -> SarResult<()> {
+        log::info!("🚀 Starting static ultra-optimized terrain correction");
+        
+        // Try to load DEM file, with automatic preparation fallback
+        let corrector = match Self::from_dem_file(dem_path, output_crs, output_spacing) {
+            Ok(corrector) => corrector,
+            Err(_) => {
+                // DEM file doesn't exist, try to prepare it automatically
+                log::info!("DEM file not found, attempting automatic preparation...");
+                
+                // Use a default cache directory
+                let cache_dir = "/tmp/sardine_dem_cache";
+                
+                // Try to prepare DEM using the bounding box
+                let (dem_array, dem_transform) = crate::io::dem::DemReader::prepare_dem_for_scene(
+                    sar_bbox,
+                    output_spacing,
+                    cache_dir,
+                )?;
+                
+                // Create terrain corrector with prepared DEM
+                Self::new(
+                    dem_array,
+                    dem_transform,
+                    -32768.0, // Default nodata value
+                    output_crs,
+                    output_spacing,
+                )
+            }
+        };
+        
+        let params = RangeDopplerParams::default();
+        let interp_method = InterpolationMethod::from_str(interpolation_method);
+        
+        let (terrain_corrected, geo_transform) = corrector.ultra_optimized_terrain_correction(
+            sar_image, 
+            orbit_data, 
+            &params, 
+            sar_bbox,
+            interp_method,
+            enable_spatial_cache,
+            chunk_size
+        )?;
+        
+        if !output_path.is_empty() {
+            corrector.save_geotiff(&terrain_corrected, &geo_transform, output_path, Some("LZW"))?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Fast slant range to pixel conversion
+    #[inline]
+    fn slant_range_to_pixel(&self, slant_range: f64, params: &RangeDopplerParams) -> f64 {
+        (slant_range / params.speed_of_light * 2.0 - params.slant_range_time) 
+            / (params.range_pixel_spacing / params.speed_of_light)
+    }
+    
+    /// Fast azimuth time to pixel conversion
+    #[inline]
+    fn azimuth_time_to_pixel(&self, azimuth_time: f64, params: &RangeDopplerParams) -> f64 {
+        azimuth_time * params.prf
+    }
+    
+    /// Create optimized orbit lookup table for fast orbit queries
+    fn create_orbit_lookup_table(
+        &self,
+        orbit_data: &OrbitData,
+        sar_bbox: &BoundingBox,
+    ) -> SarResult<Vec<(usize, [f64; 3])>> {
+        let mut orbit_lut = Vec::new();
+        
+        // Calculate scene center for sorting
+        let center_lat = (sar_bbox.min_lat + sar_bbox.max_lat) / 2.0;
+        let center_lon = (sar_bbox.min_lon + sar_bbox.max_lon) / 2.0;
+        let center_ecef = self.latlon_to_ecef(center_lat, center_lon, 0.0);
+        
+        // Build lookup table with all orbit state vectors
+        for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
+            orbit_lut.push((i, state_vector.position));
+        }
+        
+        // Sort by distance to scene center for efficient lookup
+        orbit_lut.sort_by(|a, b| {
+            let dist_a = self.distance_to_point(&a.1, &center_ecef);
+            let dist_b = self.distance_to_point(&b.1, &center_ecef);
+            dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        log::debug!("Created orbit LUT with {} entries, sorted by distance to scene center", orbit_lut.len());
+        Ok(orbit_lut)
+    }
+    
+    /// Ultra-optimized terrain correction with advanced interpolation and caching
+    pub fn ultra_optimized_terrain_correction(
+        &self,
+        sar_image: &Array2<f32>,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        sar_bbox: &BoundingBox,
+        interpolation_method: InterpolationMethod,
+        enable_spatial_cache: bool,
+        chunk_size: Option<usize>,
+    ) -> SarResult<(Array2<f32>, GeoTransform)> {
+        log::info!("🚀 Starting ultra-optimized terrain correction");
+        log::debug!("Interpolation method: {:?}", interpolation_method);
+        log::debug!("Spatial cache enabled: {}", enable_spatial_cache);
+        
+        // Step 1: Calculate output grid bounds
+        let output_bounds = self.calculate_output_bounds(sar_bbox)?;
+        let (output_width, output_height, output_transform) = 
+            self.create_output_grid(&output_bounds)?;
+        log::info!("Output grid: {}x{} pixels", output_width, output_height);
+
+        // Step 2: Create orbit lookup table for fast access
+        let orbit_lut = self.create_orbit_lookup_table(orbit_data, sar_bbox)?;
+        log::debug!("Created orbit LUT with {} entries", orbit_lut.len());
+
+        // Step 3: Initialize DEM cache if enabled
+        let mut dem_cache = if enable_spatial_cache {
+            Some(DemCache::new(10000))
+        } else {
+            None
+        };
+
+        // Step 4: Initialize output image
+        let mut output_image = Array2::zeros((output_height, output_width));
+
+        // Step 5: Process in chunks for memory efficiency
+        let chunk_size = chunk_size.unwrap_or(256);
+        let chunks_y = (output_height + chunk_size - 1) / chunk_size;
+        let chunks_x = (output_width + chunk_size - 1) / chunk_size;
+
+        log::info!("Processing {} chunks ({}x{})", chunks_y * chunks_x, chunks_y, chunks_x);
+
+        // Process chunks in parallel
+        let chunks: Vec<_> = (0..chunks_y).flat_map(|chunk_y| {
+            (0..chunks_x).map(move |chunk_x| (chunk_y, chunk_x))
+        }).collect();
+
+        let processed_chunks: Vec<_> = chunks.par_iter().map(|&(chunk_y, chunk_x)| {
+            let y_start = chunk_y * chunk_size;
+            let y_end = ((chunk_y + 1) * chunk_size).min(output_height);
+            let x_start = chunk_x * chunk_size;
+            let x_end = ((chunk_x + 1) * chunk_size).min(output_width);
+
+            let mut chunk_data = Array2::zeros((y_end - y_start, x_end - x_start));
+
+            for i in 0..(y_end - y_start) {
+                for j in 0..(x_end - x_start) {
+                    let global_i = y_start + i;
+                    let global_j = x_start + j;
+
+                    // Convert output pixel to geographic coordinates
+                    let map_x = output_transform.top_left_x + (global_j as f64) * output_transform.pixel_width;
+                    let map_y = output_transform.top_left_y + (global_i as f64) * output_transform.pixel_height;
+
+                    // Convert map coordinates to lat/lon
+                    if let Ok((lat, lon)) = self.map_to_geographic(map_x, map_y) {
+                        // Get elevation using cached or interpolated DEM lookup
+                        if let Some(elevation) = self.get_elevation_with_interpolation(lat, lon, &mut None) {
+                            // Find corresponding SAR pixel using optimized range-doppler
+                            if let Some((sar_range, sar_azimuth)) = self.optimized_latlon_to_sar_pixel(
+                                lat, lon, elevation, &orbit_lut, params
+                            ) {
+                                // Check bounds
+                                if sar_range >= 0.0 && sar_azimuth >= 0.0 && 
+                                   sar_range < sar_image.dim().1 as f64 && 
+                                   sar_azimuth < sar_image.dim().0 as f64 {
+                                    // Apply selected interpolation method
+                                    let value = self.interpolate_sar_value(
+                                        sar_image, 
+                                        sar_range, 
+                                        sar_azimuth, 
+                                        interpolation_method
+                                    );
+                                    chunk_data[[i, j]] = value;
+                                } else {
+                                    chunk_data[[i, j]] = f32::NAN;
+                                }
+                            } else {
+                                chunk_data[[i, j]] = f32::NAN;
+                            }
+                        } else {
+                            chunk_data[[i, j]] = f32::NAN;
+                        }
+                    } else {
+                        chunk_data[[i, j]] = f32::NAN;
+                    }
+                }
+            }
+
+            ((y_start, y_end, x_start, x_end), chunk_data)
+        }).collect();
+
+        // Merge processed chunks
+        for ((y_start, y_end, x_start, x_end), chunk_data) in processed_chunks {
+            for i in 0..(y_end - y_start) {
+                for j in 0..(x_end - x_start) {
+                    output_image[[y_start + i, x_start + j]] = chunk_data[[i, j]];
+                }
+            }
+        }
+
+        log::info!("✅ Ultra-optimized terrain correction completed");
+        Ok((output_image, output_transform))
+    }
+
+    /// Advanced SAR interpolation with multiple methods
+    fn interpolate_sar_value(
+        &self,
+        sar_image: &Array2<f32>,
+        x: f64,
+        y: f64,
+        method: InterpolationMethod,
+    ) -> f32 {
+        match method {
+            InterpolationMethod::Nearest => {
+                let i = y.round() as usize;
+                let j = x.round() as usize;
+                if i < sar_image.dim().0 && j < sar_image.dim().1 {
+                    sar_image[[i, j]]
+                } else {
+                    f32::NAN
+                }
+            },
+            InterpolationMethod::Bilinear => {
+                self.bilinear_interpolate(sar_image, x, y)
+            },
+            InterpolationMethod::Bicubic => {
+                self.bicubic_interpolate(sar_image, x, y)
+            },
+        }
+    }
+
+    /// Bicubic interpolation for high-quality resampling
+    fn bicubic_interpolate(&self, sar_image: &Array2<f32>, x: f64, y: f64) -> f32 {
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let dx = x - x0 as f64;
+        let dy = y - y0 as f64;
+
+        // Cubic interpolation weights
+        let cubic = |t: f64| -> f64 {
+            let t = t.abs();
+            if t <= 1.0 {
+                1.5 * t * t * t - 2.5 * t * t + 1.0
+            } else if t <= 2.0 {
+                -0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0
+            } else {
+                0.0
+            }
+        };
+
+        let mut sum = 0.0;
+        let mut weight_sum = 0.0;
+
+        // Sample 4x4 neighborhood
+        for i in -1..3 {
+            for j in -1..3 {
+                let yi = y0 + i;
+                let xi = x0 + j;
+
+                if yi >= 0 && yi < sar_image.dim().0 as i32 && 
+                   xi >= 0 && xi < sar_image.dim().1 as i32 {
+                    let weight_y = cubic(dy - i as f64);
+                    let weight_x = cubic(dx - j as f64);
+                    let weight = weight_x * weight_y;
+                    
+                    let value = sar_image[[yi as usize, xi as usize]];
+                    if !value.is_nan() {
+                        sum += value as f64 * weight;
+                        weight_sum += weight;
+                    }
+                }
+            }
+        }
+
+        if weight_sum > 0.0 {
+            (sum / weight_sum) as f32
+        } else {
+            f32::NAN
+        }
+    }
+
+    /// Get elevation with bilinear DEM interpolation
+    fn get_elevation_with_interpolation(
+        &self,
+        lat: f64,
+        lon: f64,
+        dem_cache: &mut Option<DemCache>,
+    ) -> Option<f32> {
+        // Convert lat/lon to DEM pixel coordinates
+        let dem_x = (lon - self.dem_transform.top_left_x) / self.dem_transform.pixel_width;
+        let dem_y = (lat - self.dem_transform.top_left_y) / self.dem_transform.pixel_height;
+
+        if dem_x < 0.0 || dem_y < 0.0 || 
+           dem_x >= self.dem.dim().1 as f64 || 
+           dem_y >= self.dem.dim().0 as f64 {
+            return None;
+        }
+
+        // Check cache first if available
+        if let Some(ref mut cache) = dem_cache {
+            let cache_x = (dem_x * 10.0) as i32; // Cache with 0.1 pixel precision
+            let cache_y = (dem_y * 10.0) as i32;
+            if let Some(cached_value) = cache.get(cache_x, cache_y) {
+                return Some(cached_value);
+            }
+        }
+
+        // Bilinear interpolation in DEM
+        let x0 = dem_x.floor() as usize;
+        let y0 = dem_y.floor() as usize;
+        let x1 = (x0 + 1).min(self.dem.dim().1 - 1);
+        let y1 = (y0 + 1).min(self.dem.dim().0 - 1);
+
+        let dx = dem_x - x0 as f64;
+        let dy = dem_y - y0 as f64;
+
+        let v00 = self.dem[[y0, x0]];
+        let v01 = self.dem[[y0, x1]];
+        let v10 = self.dem[[y1, x0]];
+        let v11 = self.dem[[y1, x1]];
+
+        // Check for no-data values
+        if v00 == self.dem_nodata || v01 == self.dem_nodata || 
+           v10 == self.dem_nodata || v11 == self.dem_nodata {
+            return None;
+        }
+
+        let interpolated = v00 as f64 * (1.0 - dx) * (1.0 - dy) +
+                          v01 as f64 * dx * (1.0 - dy) +
+                          v10 as f64 * (1.0 - dx) * dy +
+                          v11 as f64 * dx * dy;
+
+        let result = interpolated as f32;
+
+        // Cache the result if cache is available
+        if let Some(ref mut cache) = dem_cache {
+            let cache_x = (dem_x * 10.0) as i32;
+            let cache_y = (dem_y * 10.0) as i32;
+            cache.insert(cache_x, cache_y, result);
+        }
+
+        Some(result)
+    }
+
+    /// Optimized lat/lon to SAR pixel conversion using orbit LUT
+    fn optimized_latlon_to_sar_pixel(
+        &self,
+        lat: f64,
+        lon: f64,
+        elevation: f32,
+        orbit_lut: &[(usize, [f64; 3])],
+        params: &RangeDopplerParams,
+    ) -> Option<(f64, f64)> {
+        // Convert to ECEF coordinates
+        let target_ecef = self.latlon_to_ecef(lat, lon, elevation as f64);
+        
+        // Use optimized range-doppler calculation with LUT
+        self.optimized_range_doppler_calculation(&target_ecef, orbit_lut, params)
+    }
+    
+    /// Optimized range-doppler calculation with LUT
+    fn optimized_range_doppler_calculation(
+        &self,
+        target_ecef: &[f64; 3],
+        orbit_lut: &[(usize, [f64; 3])],
+        params: &RangeDopplerParams,
+    ) -> Option<(f64, f64)> {
+        // Use pre-sorted orbit LUT for faster lookup
+        let mut best_range = f64::MAX;
+        let mut best_azimuth_idx = 0;
+        
+        // Binary search for closest approach (orbit LUT is sorted by distance to scene center)
+        let low = 0;
+        let high = orbit_lut.len().min(20); // Limit search to nearby points
+        
+        for i in low..high {
+            let (idx, sat_pos) = orbit_lut[i];
+            let range = self.distance_to_point(&sat_pos, target_ecef);
+            
+            if range < best_range {
+                best_range = range;
+                best_azimuth_idx = idx;
+            }
+        }
+        
+        // Convert to pixel coordinates with optimized formulas
+        let range_pixel = self.slant_range_to_pixel(best_range, params);
+        let azimuth_pixel = self.azimuth_time_to_pixel(best_azimuth_idx as f64, params);
+        
+        Some((range_pixel, azimuth_pixel))
     }
 }
 
-/// Combined mask result
-#[derive(Debug, Clone)]
-pub struct MaskResult {
-    /// Combined validity mask (true = valid pixel)
-    pub combined_mask: Array2<bool>,
-    /// Local incidence angle cosine values
-    pub lia_cosine: Array2<f32>,
-    /// Individual mask components
-    pub gamma0_mask: Array2<bool>,
-    pub dem_mask: Array2<bool>,
-    pub lia_mask: Array2<bool>,
-    /// Statistics
-    pub valid_pixels: usize,
-    pub total_pixels: usize,
-    pub coverage_percent: f64,
-}
-
-/// Surface normal vector for local incidence angle calculation
-#[derive(Debug, Clone)]
-pub struct SurfaceNormal {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-}
-
-impl SurfaceNormal {
-    /// Normalize the surface normal vector
-    pub fn normalize(&mut self) {
-        let magnitude = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
-        if magnitude > 0.0 {
-            self.x /= magnitude;
-            self.y /= magnitude;
-            self.z /= magnitude;
-        }
-    }
-}

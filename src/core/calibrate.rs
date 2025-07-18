@@ -514,22 +514,15 @@ impl CalibrationProcessor {
         let cal_lut = self.build_calibration_lut_parallel(azimuth_lines, range_samples, self.calibration_type)?;
         
         // Apply calibration in parallel
-        let calibrated = intensity.zip(&cal_lut)
-            .into_par_iter()
-            .map(|(intensity_val, cal_coeff)| {
-                if *cal_coeff > 0.0 {
-                    intensity_val / (cal_coeff * cal_coeff)
-                } else {
-                    0.0
-                }
-            })
-            .collect::<Vec<f32>>();
+        let calibrated = Zip::from(&intensity).and(&cal_lut).par_map_collect(|intensity_val, cal_coeff| {
+            if *cal_coeff > 0.0 {
+                intensity_val / (cal_coeff * cal_coeff)
+            } else {
+                0.0
+            }
+        });
         
-        // Reshape back to 2D
-        let calibrated_2d = Array2::from_shape_vec((azimuth_lines, range_samples), calibrated)
-            .map_err(|e| SarError::Processing(format!("Shape error: {}", e)))?;
-        
-        Ok(calibrated_2d)
+        Ok(calibrated)
     }
 
     #[cfg(feature = "parallel")]

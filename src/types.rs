@@ -155,6 +155,9 @@ pub enum SarError {
     #[error("Invalid data format: {0}")]
     InvalidFormat(String),
     
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    
     #[error("Processing error: {0}")]
     Processing(String),
     
@@ -283,4 +286,94 @@ pub struct EofHeader {
     pub coordinate_system: Option<String>,
     pub time_reference: Option<String>,
     pub file_name: Option<String>,
+}
+
+/// Surface normal vector for terrain analysis
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceNormal {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl SurfaceNormal {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+    
+    /// Normalize the vector to unit length
+    pub fn normalize(&mut self) {
+        let length = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
+        if length > 0.0 {
+            self.x /= length;
+            self.y /= length;
+            self.z /= length;
+        }
+    }
+    
+    /// Calculate dot product with another vector
+    pub fn dot(&self, other: &[f64; 3]) -> f64 {
+        self.x * other[0] + self.y * other[1] + self.z * other[2]
+    }
+}
+
+/// Masking workflow configuration
+#[derive(Debug, Clone)]
+pub struct MaskingWorkflow {
+    pub water_mask: bool,
+    pub shadow_mask: bool,
+    pub layover_mask: bool,
+    pub noise_mask: bool,
+    pub coherence_threshold: Option<f64>,
+    pub intensity_threshold: Option<f64>,
+    pub lia_threshold: f64,
+    pub dem_threshold: f64,
+    pub gamma0_min: f32,
+    pub gamma0_max: f32,
+}
+
+impl Default for MaskingWorkflow {
+    fn default() -> Self {
+        Self {
+            water_mask: true,
+            shadow_mask: true,
+            layover_mask: true,
+            noise_mask: false,
+            coherence_threshold: Some(0.3),
+            intensity_threshold: None,
+            lia_threshold: 0.1,
+            dem_threshold: -100.0,
+            gamma0_min: -50.0,
+            gamma0_max: 10.0,
+        }
+    }
+}
+
+/// Result of masking operations
+#[derive(Debug, Clone)]
+pub struct MaskResult {
+    pub water_mask: Option<Array2<u8>>,
+    pub shadow_mask: Option<Array2<u8>>,
+    pub layover_mask: Option<Array2<u8>>,
+    pub noise_mask: Option<Array2<u8>>,
+    pub combined_mask: Array2<u8>,
+    pub lia_cosine: Array2<f32>,
+    pub gamma0_mask: Array2<bool>,
+    pub dem_mask: Array2<bool>,
+    pub lia_mask: Array2<bool>,
+    pub valid_pixels: usize,
+    pub total_pixels: usize,
+    pub coverage_percent: f64,
+    pub stats: MaskStats,
+}
+
+/// Statistics from masking operations
+#[derive(Debug, Clone, Default)]
+pub struct MaskStats {
+    pub total_pixels: usize,
+    pub water_pixels: usize,
+    pub shadow_pixels: usize,
+    pub layover_pixels: usize,
+    pub noise_pixels: usize,
+    pub valid_pixels: usize,
 }

@@ -180,7 +180,7 @@ sardine.terrain_correction(
     sar_image=[[...]], # 2D list of SAR values
     dem_path="/path/to/dem.tif",
     orbit_data=[(time, position, velocity), ...],
-    sar_bbox=(min_lat, max_lat, min_lon, max_lon),
+    sar_bbox=(min_lon, min_lat, max_lon, max_lat),
     output_path="/path/to/output.tif",
     output_crs=32610,  # UTM Zone 10N
     output_spacing=10.0 # 10m pixels
