@@ -446,18 +446,12 @@ class ProductionBackscatterProcessor:
                     self.logger.info(f"   📊 Valid pixels: {valid_pixels}/{total_pixels} ({100*valid_pixels/total_pixels:.1f}%)")
                     
                 else:
-                    self.logger.warning("⚠️  DEM preparation returned unexpected format, using fallback")
-                    dem_shape = multilooked_data.shape
-                    placeholder_dem = np.zeros(dem_shape, dtype=np.float32)
-                    terrain_flattened_data = sardine.apply_terrain_flattening(
-                        multilooked_data, 
-                        placeholder_dem,
-                        orbit_py,
-                        dem_pixel_spacing=(30.0, 30.0)
-                    )
+                    self.logger.error("❌ DEM preparation returned unexpected format")
+                    raise RuntimeError("Cannot proceed without valid DEM data")
                 
             except Exception as e:
-                self.logger.error(f"❌ Real terrain flattening failed: {e}")
+                self.logger.error(f"❌ Terrain flattening failed: {e}")
+                raise RuntimeError(f"Terrain flattening failed: {e}")
                 import traceback
                 self.logger.error(f"Full traceback: {traceback.format_exc()}")
                 

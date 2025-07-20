@@ -67,6 +67,8 @@ Thumbs.db
 *.SAFE/
 data/*.zip
 data/*.SAFE/
+data/S1A_*
+data/S1B_*
 
 # DEM & Terrain Data
 *.hgt
@@ -101,6 +103,40 @@ test_*.py
 check_*.py
 *_debug.py
 *_test.py
+validate_*.py
+performance_*.py
+*_performance_*.py
+*_analysis.py
+investigate_*.py
+minimal_*.py
+final_*.py
+comprehensive_*.py
+coordinate_*.py
+optimized_*.py
+success_*.py
+simple_*.py
+slc_performance_*.py
+terrain_correction_*.py
+real_data_*.py
+improved_*.py
+build_*.py
+complete_backscatter_pipeline.py
+
+# Development summary files
+*_SUMMARY.md
+RELEASE_SUMMARY.md
+SYNTHETIC_DATA_REMOVAL_SUMMARY.md
+
+# Processing outputs from development
+backscatter_output*/
+development/backscatter_output*/
+
+# Large output files
+*.tif
+*.tiff
+*.txt.large
+*.npy
+*.npz
 
 # Logs & Temporary Files
 *.log
