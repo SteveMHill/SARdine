@@ -1146,18 +1146,101 @@ impl SlcReader {
         None
     }
 
-    /// Get available IW sub-swaths for all polarizations
-    pub fn get_all_iw_subswaths(&mut self) -> SarResult<HashMap<Polarization, HashMap<String, SubSwath>>> {
-        let annotations = self.find_annotation_files()?;
+    /// Find ALL annotation files for all IW subswaths (not just one per polarization)
+    pub fn find_all_iw_annotation_files(&mut self) -> SarResult<HashMap<Polarization, Vec<String>>> {
+        let files = self.list_files()?;
+        let mut annotations: HashMap<Polarization, Vec<String>> = HashMap::new();
+        
+        for file in files {
+            if file.contains("annotation/") && file.ends_with(".xml") && !file.contains("calibration") {
+                // Parse polarization from filename
+                let pol = if file.contains("-vv-") {
+                    Some(Polarization::VV)
+                } else if file.contains("-vh-") {
+                    Some(Polarization::VH)
+                } else if file.contains("-hv-") {
+                    Some(Polarization::HV)
+                } else if file.contains("-hh-") {
+                    Some(Polarization::HH)
+                } else {
+                    None
+                };
+                
+                if let Some(polarization) = pol {
+                    annotations.entry(polarization).or_insert_with(Vec::new).push(file);
+                }
+            }
+        }
+        
+        // Sort the files for each polarization to ensure consistent order (IW1, IW2, IW3)
+        for files in annotations.values_mut() {
+            files.sort();
+        }
+        
+        if annotations.is_empty() {
+            return Err(SarError::InvalidFormat(
+                "No IW annotation files found".to_string(),
+            ));
+        }
+        
+        Ok(annotations)
+    }
+
+    /// Extract ALL IW sub-swaths for a specific polarization (IW1, IW2, IW3)
+    pub fn extract_all_iw_subswaths(&mut self, pol: Polarization) -> SarResult<HashMap<String, SubSwath>> {
+        let all_annotations = self.find_all_iw_annotation_files()?;
+        let annotation_files = all_annotations.get(&pol)
+            .ok_or_else(|| SarError::InvalidFormat(
+                format!("No annotation files found for polarization {}", pol)
+            ))?;
+
         let mut all_subswaths = HashMap::new();
         
-        for (pol, _) in annotations {
-            match self.extract_iw_subswaths(pol) {
+        for annotation_file in annotation_files {
+            log::debug!("Processing annotation file: {}", annotation_file);
+            
+            let archive = self.open_archive()?;
+            let mut file = archive.by_name(annotation_file)
+                .map_err(|e| SarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to read {}: {}", annotation_file, e),
+                )))?;
+
+            let mut xml_content = String::new();
+            file.read_to_string(&mut xml_content)?;
+
+            // Extract the IW subswath from this annotation file
+            let subswaths = if let Ok(annotation) = crate::io::annotation::AnnotationParser::parse_annotation(&xml_content) {
+                // Try the detailed annotation parser first
+                crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
+                    .unwrap_or_else(|_| Self::extract_iw_subswaths_fallback(&xml_content, annotation_file).unwrap_or_default())
+            } else {
+                // Fallback: Parse using simple string extraction
+                Self::extract_iw_subswaths_fallback(&xml_content, annotation_file)?
+            };
+            
+            // Add all extracted subswaths to our collection
+            for (swath_id, subswath) in subswaths {
+                all_subswaths.insert(swath_id, subswath);
+            }
+        }
+        
+        Ok(all_subswaths)
+    }
+
+    /// Get available IW sub-swaths for all polarizations (fixed to extract ALL subswaths)
+    pub fn get_all_iw_subswaths(&mut self) -> SarResult<HashMap<Polarization, HashMap<String, SubSwath>>> {
+        let all_annotations = self.find_all_iw_annotation_files()?;
+        let mut all_subswaths = HashMap::new();
+        
+        for (pol, _) in all_annotations {
+            match self.extract_all_iw_subswaths(pol) {
                 Ok(subswaths) => {
+                    log::info!("Extracted {} subswaths for polarization {}", subswaths.len(), pol);
                     all_subswaths.insert(pol, subswaths);
                 },
                 Err(e) => {
-                    eprintln!("Warning: Failed to extract sub-swaths for {}: {}", pol, e);
+                    log::error!("Failed to extract sub-swaths for {}: {}", pol, e);
                 }
             }
         }

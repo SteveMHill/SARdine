@@ -1,6 +1,6 @@
 [package]
 name = "sardine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Steven Hill <steven@example.com>"]
 description = "A Fast, Modular Sentinel-1 Backscatter Processor"

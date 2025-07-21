@@ -142,7 +142,6 @@ Please include:
 - Polarimetric processing capabilities
 - Time series analysis tools
 - Advanced terrain correction algorithms
-- Cloud processing integration
 
 ## 🤝 Community Guidelines
 

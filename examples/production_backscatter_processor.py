@@ -451,26 +451,9 @@ class ProductionBackscatterProcessor:
                 
             except Exception as e:
                 self.logger.error(f"❌ Terrain flattening failed: {e}")
-                raise RuntimeError(f"Terrain flattening failed: {e}")
                 import traceback
                 self.logger.error(f"Full traceback: {traceback.format_exc()}")
-                
-                # Try a simplified terrain flattening as fallback
-                try:
-                    self.logger.info("� Attempting simplified terrain flattening...")
-                    # Use zero DEM as fallback - this will still apply orbit-based corrections
-                    fallback_dem = np.zeros_like(multilooked_data, dtype=np.float32)
-                    terrain_flattened_data = sardine.apply_terrain_flattening(
-                        multilooked_data, 
-                        fallback_dem,
-                        orbit_py,
-                        dem_pixel_spacing=(30.0, 30.0)
-                    )
-                    self.logger.info("✅ Simplified terrain flattening applied successfully")
-                except Exception as e2:
-                    self.logger.error(f"❌ Simplified terrain flattening also failed: {e2}")
-                    self.logger.warning("⚠️  Using original sigma0 data (no terrain flattening applied)")
-                    terrain_flattened_data = multilooked_data
+                raise RuntimeError(f"Terrain flattening failed: {e}")
             
             self._log_step(f"Terrain Flattening ({pol})", "completed")
             

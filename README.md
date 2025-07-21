@@ -36,12 +36,14 @@ SARdine is a modern, high-performance SAR data processing library for Sentinel-1
 - Sub-swath extraction and debursting
 - Radiometric calibration (σ⁰, β⁰, γ⁰)
 - DEM download and terrain processing
+- Terrain flattening and correction
 - Speckle filtering algorithms
+- Masking and quality assessment
+- Geocoding and product export
 - Python and CLI interfaces
 
 ### 🚧 In Development
-- Advanced terrain correction algorithms
-- Polarimetric processing capabilities
+- Advanced polarimetric processing
 - Time series analysis tools
 - Performance optimizations
 

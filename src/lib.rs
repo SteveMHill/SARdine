@@ -209,6 +209,23 @@ impl PySlcReader {
         Ok(subswaths.into_iter().map(|(k, v)| (k, PySubSwath { inner: v })).collect())
     }
     
+    fn extract_all_iw_subswaths(&mut self, polarization: &str) -> PyResult<std::collections::HashMap<String, PySubSwath>> {
+        let pol = match polarization.to_uppercase().as_str() {
+            "VV" => Polarization::VV,
+            "VH" => Polarization::VH,
+            "HV" => Polarization::HV,
+            "HH" => Polarization::HH,
+            _ => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid polarization: {}", polarization)
+            )),
+        };
+        
+        let subswaths = self.inner.extract_all_iw_subswaths(pol)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+        
+        Ok(subswaths.into_iter().map(|(k, v)| (k, PySubSwath { inner: v })).collect())
+    }
+    
     fn get_all_iw_subswaths(&mut self) -> PyResult<std::collections::HashMap<String, std::collections::HashMap<String, PySubSwath>>> {
         let all_subswaths = self.inner.get_all_iw_subswaths()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;

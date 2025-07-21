@@ -27,22 +27,57 @@ impl DemReader {
         log::debug!("DEM size: {}x{}", width, height);
         log::debug!("DEM geotransform: {:?}", geo_transform);
 
-        // Read elevation data from first band
+        // Calculate pixel coordinates for the requested bounding box
+        let pixel_min_x = ((bbox.min_lon - geo_transform[0]) / geo_transform[1]).max(0.0) as usize;
+        let pixel_max_x = ((bbox.max_lon - geo_transform[0]) / geo_transform[1]).min((width - 1) as f64) as usize;
+        let pixel_min_y = ((bbox.max_lat - geo_transform[3]) / geo_transform[5]).max(0.0) as usize;
+        let pixel_max_y = ((bbox.min_lat - geo_transform[3]) / geo_transform[5]).min((height - 1) as f64) as usize;
+
+        // Ensure valid pixel bounds
+        if pixel_min_x >= pixel_max_x || pixel_min_y >= pixel_max_y {
+            return Err(SarError::Processing(
+                format!("Requested bounding box {:?} does not overlap with DEM coverage", bbox)
+            ));
+        }
+
+        let clip_width = pixel_max_x - pixel_min_x + 1;
+        let clip_height = pixel_max_y - pixel_min_y + 1;
+
+        log::debug!("Clipping DEM to pixel bounds: x={}..{}, y={}..{}", pixel_min_x, pixel_max_x, pixel_min_y, pixel_max_y);
+        log::debug!("Clipped size: {}x{}", clip_width, clip_height);
+
+        // Read elevation data from first band for the clipped region
         let rasterband = dataset.rasterband(1)?;
-        let band_data = rasterband.read_as::<f32>((0, 0), (width, height), (width, height), None)?;
+        let band_data = rasterband.read_as::<f32>(
+            (pixel_min_x as isize, pixel_min_y as isize), 
+            (clip_width, clip_height), 
+            (clip_width, clip_height), 
+            None
+        )?;
         
         // Convert to ndarray
-        let dem_array = Array2::from_shape_vec((height, width), band_data.data)
+        let dem_array = Array2::from_shape_vec((clip_height, clip_width), band_data.data)
             .map_err(|e| SarError::Processing(format!("Failed to reshape DEM data: {}", e)))?;
 
+        // Calculate new geotransform for the clipped region
+        let clipped_top_left_x = geo_transform[0] + (pixel_min_x as f64) * geo_transform[1];
+        let clipped_top_left_y = geo_transform[3] + (pixel_min_y as f64) * geo_transform[5];
+
         let geo_transform_struct = GeoTransform {
-            top_left_x: geo_transform[0],
+            top_left_x: clipped_top_left_x,
             pixel_width: geo_transform[1],
             rotation_x: geo_transform[2],
-            top_left_y: geo_transform[3],
+            top_left_y: clipped_top_left_y,
             rotation_y: geo_transform[4],
             pixel_height: geo_transform[5],
         };
+
+        log::debug!("Clipped DEM geotransform: {:?}", geo_transform_struct);
+        log::debug!("Clipped DEM bounds: X={:.6} to {:.6}, Y={:.6} to {:.6}", 
+                   clipped_top_left_x,
+                   clipped_top_left_x + (clip_width as f64) * geo_transform[1],
+                   clipped_top_left_y + (clip_height as f64) * geo_transform[5],
+                   clipped_top_left_y);
 
         Ok((dem_array, geo_transform_struct))
     }
@@ -958,10 +993,6 @@ impl DemReader {
                    dem_bbox.min_lat, dem_bbox.max_lat, dem_bbox.min_lon, dem_bbox.max_lon);
         log::debug!("SAR bbox: min_lat={:.6}, max_lat={:.6}, min_lon={:.6}, max_lon={:.6}", 
                    sar_bbox.min_lat, sar_bbox.max_lat, sar_bbox.min_lon, sar_bbox.max_lon);
-        
-        // Temporarily disable strict coverage check for testing
-        log::info!("⚠️  Temporarily skipping strict DEM coverage validation for testing");
-        log::info!("   This allows processing to continue with available DEM data");
         
         // Step 3: Fill DEM voids
         log::info!("🔧 Step 3: Filling DEM voids");
