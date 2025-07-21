@@ -452,33 +452,78 @@ impl OrbitReader {
             ));
         }
         
-        // Find the closest state vectors for interpolation
         let target_timestamp = target_time.timestamp_millis() as f64 / 1000.0;
+        let selected_svs = Self::find_interpolation_vectors(&orbit.state_vectors, target_timestamp)?;
+        Self::lagrange_interpolate(&selected_svs, target_timestamp)
+    }
+
+    /// Fast binary search to find the best state vectors for interpolation
+    fn find_interpolation_vectors(
+        state_vectors: &[StateVector],
+        target_timestamp: f64,
+    ) -> SarResult<Vec<&StateVector>> {
+        if state_vectors.is_empty() {
+            return Err(SarError::Processing("No state vectors available".to_string()));
+        }
+
+        // Binary search to find the closest state vector
+        let closest_idx = Self::binary_search_closest_time(state_vectors, target_timestamp);
         
-        // Sort by time distance to target
-        let mut sv_with_distance: Vec<_> = orbit.state_vectors.iter()
-            .map(|sv| {
-                let sv_timestamp = sv.time.timestamp_millis() as f64 / 1000.0;
-                let distance = (sv_timestamp - target_timestamp).abs();
-                (sv, distance)
-            })
-            .collect();
-        
-        sv_with_distance.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        // Use 4-point Lagrange interpolation if we have enough points
-        let num_points = std::cmp::min(4, sv_with_distance.len());
+        // Select 4 vectors around the target time for interpolation
+        let num_points = std::cmp::min(4, state_vectors.len());
         if num_points < 2 {
             log::warn!("Not enough state vectors for interpolation, using nearest");
-            return Ok(sv_with_distance[0].0.position);
+            return Ok(vec![&state_vectors[closest_idx]]);
         }
+
+        // Get indices for interpolation points (try to center around target)
+        let start_idx = if closest_idx >= num_points / 2 {
+            std::cmp::min(closest_idx - num_points / 2, state_vectors.len() - num_points)
+        } else {
+            0
+        };
         
-        let selected_svs: Vec<&StateVector> = sv_with_distance[..num_points]
-            .iter()
-            .map(|(sv, _)| *sv)
+        let selected_svs: Vec<&StateVector> = (start_idx..start_idx + num_points)
+            .map(|i| &state_vectors[i])
             .collect();
+
+        Ok(selected_svs)
+    }
+
+    /// Binary search to find the state vector closest in time to target
+    fn binary_search_closest_time(
+        state_vectors: &[StateVector],
+        target_timestamp: f64,
+    ) -> usize {
+        if state_vectors.is_empty() {
+            return 0;
+        }
+
+        let mut left = 0;
+        let mut right = state_vectors.len() - 1;
         
-        Self::lagrange_interpolate(&selected_svs, target_timestamp)
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let mid_timestamp = state_vectors[mid].time.timestamp_millis() as f64 / 1000.0;
+            
+            if mid_timestamp < target_timestamp {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        // Check if left-1 is closer than left
+        if left > 0 {
+            let left_dist = (state_vectors[left].time.timestamp_millis() as f64 / 1000.0 - target_timestamp).abs();
+            let left_minus_1_dist = (state_vectors[left - 1].time.timestamp_millis() as f64 / 1000.0 - target_timestamp).abs();
+            
+            if left_minus_1_dist < left_dist {
+                return left - 1;
+            }
+        }
+
+        left
     }
     
     /// Lagrange polynomial interpolation for orbit position
@@ -524,28 +569,7 @@ impl OrbitReader {
         }
         
         let target_timestamp = target_time.timestamp_millis() as f64 / 1000.0;
-        
-        // Find closest state vectors
-        let mut sv_with_distance: Vec<_> = orbit.state_vectors.iter()
-            .map(|sv| {
-                let sv_timestamp = sv.time.timestamp_millis() as f64 / 1000.0;
-                let distance = (sv_timestamp - target_timestamp).abs();
-                (sv, distance)
-            })
-            .collect();
-        
-        sv_with_distance.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        let num_points = std::cmp::min(4, sv_with_distance.len());
-        if num_points < 2 {
-            return Ok(sv_with_distance[0].0.velocity);
-        }
-        
-        let selected_svs: Vec<&StateVector> = sv_with_distance[..num_points]
-            .iter()
-            .map(|(sv, _)| *sv)
-            .collect();
-        
+        let selected_svs = Self::find_interpolation_vectors(&orbit.state_vectors, target_timestamp)?;
         Self::lagrange_interpolate_velocity(&selected_svs, target_timestamp)
     }
     
@@ -591,6 +615,7 @@ impl OrbitReader {
     
     /// Get satellite position and velocity for a burst at specific azimuth times
     /// This is essential for SAR processing - each pixel row has a different azimuth time
+    /// OPTIMIZED VERSION: Uses batch processing and pre-sorted state vectors
     pub fn interpolate_burst_orbit(
         orbit: &OrbitData,
         burst_start_time: DateTime<Utc>,
@@ -600,18 +625,49 @@ impl OrbitReader {
         log::info!("Interpolating orbit for burst: {} lines, {} s interval", 
                   num_azimuth_lines, azimuth_time_interval);
         
+        if orbit.state_vectors.is_empty() {
+            return Err(SarError::Processing("No state vectors in orbit data".to_string()));
+        }
+
+        // Pre-sort state vectors by time for efficient binary search
+        let mut sorted_state_vectors = orbit.state_vectors.clone();
+        sorted_state_vectors.sort_by(|a, b| a.time.cmp(&b.time));
+
         let mut positions = Vec::with_capacity(num_azimuth_lines);
         let mut velocities = Vec::with_capacity(num_azimuth_lines);
         let mut azimuth_times = Vec::with_capacity(num_azimuth_lines);
         
+        // Batch processing: find interpolation range once for the entire burst
+        let burst_start_timestamp = burst_start_time.timestamp_millis() as f64 / 1000.0;
+        let burst_end_timestamp = burst_start_timestamp + (num_azimuth_lines as f64 * azimuth_time_interval);
+        
+        // Find the range of state vectors we'll need for this entire burst
+        let start_search_idx = Self::binary_search_closest_time(&sorted_state_vectors, burst_start_timestamp);
+        let end_search_idx = Self::binary_search_closest_time(&sorted_state_vectors, burst_end_timestamp);
+        
+        // Expand search range to ensure we have enough vectors for interpolation
+        let search_start = if start_search_idx >= 2 { start_search_idx - 2 } else { 0 };
+        let search_end = std::cmp::min(end_search_idx + 3, sorted_state_vectors.len());
+        
+        let relevant_vectors = &sorted_state_vectors[search_start..search_end];
+        
+        log::debug!("Using {} state vectors for {} azimuth lines (optimization: {:.1}x reduction)",
+                   relevant_vectors.len(), num_azimuth_lines, 
+                   sorted_state_vectors.len() as f64 / relevant_vectors.len() as f64);
+
         for line_idx in 0..num_azimuth_lines {
             // Calculate azimuth time for this pixel row
             let azimuth_time = burst_start_time + 
                 chrono::Duration::milliseconds((line_idx as f64 * azimuth_time_interval * 1000.0) as i64);
             
+            let target_timestamp = azimuth_time.timestamp_millis() as f64 / 1000.0;
+            
+            // Find interpolation vectors from the reduced set
+            let selected_svs = Self::find_interpolation_vectors_from_subset(relevant_vectors, target_timestamp)?;
+            
             // Interpolate satellite position and velocity at this time
-            let position = Self::interpolate_position(orbit, azimuth_time)?;
-            let velocity = Self::interpolate_velocity(orbit, azimuth_time)?;
+            let position = Self::lagrange_interpolate(&selected_svs, target_timestamp)?;
+            let velocity = Self::lagrange_interpolate_velocity(&selected_svs, target_timestamp)?;
             
             positions.push(position);
             velocities.push(velocity);
@@ -630,6 +686,39 @@ impl OrbitReader {
             burst_start_time,
             azimuth_time_interval,
         })
+    }
+
+    /// Find interpolation vectors from a pre-filtered subset (for batch processing)
+    fn find_interpolation_vectors_from_subset(
+        state_vectors: &[StateVector],
+        target_timestamp: f64,
+    ) -> SarResult<Vec<&StateVector>> {
+        if state_vectors.is_empty() {
+            return Err(SarError::Processing("No state vectors available".to_string()));
+        }
+
+        // Binary search within the subset
+        let closest_idx = Self::binary_search_closest_time(state_vectors, target_timestamp);
+        
+        // Select 4 vectors around the target time for interpolation
+        let num_points = std::cmp::min(4, state_vectors.len());
+        if num_points < 2 {
+            log::warn!("Not enough state vectors for interpolation, using nearest");
+            return Ok(vec![&state_vectors[closest_idx]]);
+        }
+
+        // Get indices for interpolation points (try to center around target)
+        let start_idx = if closest_idx >= num_points / 2 {
+            std::cmp::min(closest_idx - num_points / 2, state_vectors.len() - num_points)
+        } else {
+            0
+        };
+        
+        let selected_svs: Vec<&StateVector> = (start_idx..start_idx + num_points)
+            .map(|i| &state_vectors[i])
+            .collect();
+
+        Ok(selected_svs)
     }
     
     /// Calculate Doppler centroid frequency for a given satellite velocity and look direction
