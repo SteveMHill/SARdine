@@ -48,6 +48,32 @@ venv.bak/
 .idea/
 *.swp
 *.swo
+
+# Development & Testing Files
+test_*.py
+*test*.py
+debug_*.py
+validate_*.py
+analyze_*.py
+diagnose_*.py
+trace_*.py
+quick_*.py
+benchmark_*/
+*_output/
+*_cache/
+*_results.json
+*.log
+*.tif
+*.npy
+dummy*/
+temp*/
+validation_*/
+
+# Reports & Documentation (development)
+*_REPORT.md
+*_COMPLETE.md
+*_SUMMARY.md
+*_STATUS*.md
 *~
 
 # Operating System Files
