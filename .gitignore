@@ -1,0 +1,74 @@
+# Large data files and archives (don't commit large datasets)
+*.zip
+*.tar.gz
+*.SAFE/
+data/*.zip
+data/*.SAFE/
+
+# Output directories
+output/
+backscatter_output/
+*/output/
+*/cache/
+*_output/
+*_cache/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# SAR data files (large)
+*.zip
+*.SAFE/
+*.tif
+*.tiff
+
+# Processing results
+*.json
+*.xml
+*.png
+*.jpg
+
+# Cache directories
+dem_cache/
+orbit_cache/
+srtm_tiles/

@@ -1,0 +1,78 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sardine"
+version = "0.2.0"
+description = "A Fast, Modular Sentinel-1 Backscatter Processor"
+authors = [
+    {name = "Steven Hill", email = "steven@example.com"},
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+keywords = ["SAR", "Sentinel-1", "Remote Sensing", "Radar", "Earth Observation"]
+
+dependencies = [
+    "numpy>=1.20",
+    "rasterio>=1.3.0",
+    "pyproj>=3.4.0",
+    "lxml>=4.6.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=22.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+docs = [
+    "sphinx>=5.0",
+    "sphinx-rtd-theme>=1.0",
+]
+
+[project.scripts]
+sardine = "sardine.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/username/sardine"
+Repository = "https://github.com/username/sardine"
+Documentation = "https://sardine.readthedocs.io"
+"Bug Tracker" = "https://github.com/username/sardine/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "sardine._core"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.ruff]
+select = ["E", "F", "W", "I", "N", "UP", "YTT", "S", "BLE", "FBT", "B", "A", "COM", "C4", "DTZ", "T10", "EM", "EXE", "ISC", "ICN", "G", "INP", "PIE", "T20", "PYI", "PT", "Q", "RSE", "RET", "SLF", "SIM", "TID", "TCH", "INT", "ARG", "PTH", "ERA", "PD", "PGH", "PL", "TRY", "NPY", "RUF"]
+ignore = ["COM812", "ISC001"]
+line-length = 88
+target-version = "py38"
+
+[tool.mypy]
+python_version = "3.8"
+strict = true
+warn_return_any = true
+warn_unused_configs = true

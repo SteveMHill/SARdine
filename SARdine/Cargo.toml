@@ -1,0 +1,72 @@
+[package]
+name = "sardine"
+version = "0.2.0"
+edition = "2021"
+authors = ["Steven Hill <steven@example.com>"]
+description = "A Fast, Modular Sentinel-1 Backscatter Processor"
+license = "MIT"
+repository = "https://github.com/username/sardine"
+keywords = ["SAR", "Sentinel-1", "Remote-Sensing", "Radar"]
+categories = ["science", "algorithms"]
+
+[lib]
+name = "sardine"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# Python bindings
+pyo3 = { version = "0.20", features = ["extension-module"] }
+numpy = "0.20"
+
+# Core numerical computing
+ndarray = { version = "0.15", features = ["rayon"] }
+num-complex = "0.4"
+num-traits = "0.2"
+
+# I/O and data handling
+gdal = { version = "0.16", features = ["array"] }
+gdal-sys = "0.9"  # For VSI memory filesystem operations
+quick-xml = { version = "0.31", features = ["serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"  # JSON serialization for metadata
+zip = "0.6"
+tempfile = "3.8"
+flate2 = "1.0"  # For gzip decompression of SRTM tiles
+
+# HTTP client for orbit file downloads
+reqwest = { version = "0.11", features = ["blocking"] }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread"] }
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling and utilities
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+rayon = "1.7"  # Parallel processing
+dirs = "5.0"   # Platform-specific directories
+
+# Math and signal processing
+rustfft = "6.1"
+approx = "0.5"
+regex = "1.11.1"
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3.8"
+env_logger = "0.10"
+
+[features]
+default = ["parallel"]
+parallel = []
+gpu = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

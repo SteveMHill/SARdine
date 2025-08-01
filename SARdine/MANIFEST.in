@@ -1,0 +1,29 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include logo.png
+include pyproject.toml
+include Cargo.toml
+
+recursive-include src *.rs
+recursive-include python *.py
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include docs *.md
+
+# Exclude development files
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .git*
+global-exclude test_*
+global-exclude *_test*
+global-exclude debug_*
+global-exclude temp*
+global-exclude *.log
+global-exclude *.json
+prune target/debug
+prune validation_*
+prune *_output
+prune *_cache
+prune benchmark_*
