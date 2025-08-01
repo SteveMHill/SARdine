@@ -9,9 +9,19 @@
 
 **This package is experimental and designed for research, learning, and testing purposes only. It is NOT production-ready and should not be used in operational environments.**
 
-**Status**: Development/Research Tool  
-**Stability**: Experimental  
-**Support**: Community/Educational Use Only
+## 🚨 **CRITICAL SCIENTIFIC WARNING** 🚨
+
+**URGENT - DO NOT USE FOR SCIENTIFIC RESEARCH**: Critical scientific errors have been identified in the core processing algorithms:
+
+1. **❌ WRONG CALIBRATION FORMULA** - Backscatter values incorrect by orders of magnitude
+2. **❌ SYNTHETIC PROCESSING PARAMETERS** - Uses dummy values instead of real Sentinel-1 metadata  
+3. **❌ INCOMPLETE IMPLEMENTATIONS** - Critical functions return placeholder results
+
+**See `CRITICAL_SCIENTIFIC_AUDIT.md` and run `python3 critical_fixes_needed.py` for full details.**
+
+**Status**: Development/Research Tool (WITH MAJOR SCIENTIFIC ERRORS)  
+**Stability**: Experimental (SCIENTIFICALLY INCORRECT)  
+**Support**: Community/Educational Use Only (RESULTS NOT VALID FOR RESEARCH)
 
 ---
 
