@@ -1111,14 +1111,17 @@ mod tests {
 
     #[test]
     fn test_topsar_merge_creation() {
+        // Use realistic Sentinel-1 parameters from ESA Product Specification
+        // IW1: 2.3297m range, 14.059906m azimuth (typical values from real annotation)
+        // IW2: 2.8767m range, 14.059906m azimuth (varies by subswath)
         let subswaths = vec![
             SubSwath {
                 id: "IW1".to_string(),
                 burst_count: 9,
                 range_samples: 1000,
                 azimuth_samples: 1500,
-                range_pixel_spacing: 2.33,
-                azimuth_pixel_spacing: 14.1,
+                range_pixel_spacing: 2.3297,   // Realistic IW1 range spacing
+                azimuth_pixel_spacing: 14.059906, // Realistic IW azimuth spacing
                 slant_range_time: 5.44e-3,
                 burst_duration: 2.0,
             },
@@ -1127,8 +1130,8 @@ mod tests {
                 burst_count: 9,
                 range_samples: 1000,
                 azimuth_samples: 1500,
-                range_pixel_spacing: 2.33,
-                azimuth_pixel_spacing: 14.1,
+                range_pixel_spacing: 2.8767,   // Realistic IW2 range spacing (different from IW1)
+                azimuth_pixel_spacing: 14.059906, // Same azimuth spacing for all IW
                 slant_range_time: 5.50e-3,
                 burst_duration: 2.0,
             },
@@ -1141,14 +1144,15 @@ mod tests {
 
     #[test]
     fn test_overlap_calculation() {
+        // Use realistic Sentinel-1 parameters with proper IW spacing variations
         let subswaths = vec![
             SubSwath {
                 id: "IW1".to_string(),
                 burst_count: 9,
                 range_samples: 1000,
                 azimuth_samples: 1500,
-                range_pixel_spacing: 2.33,
-                azimuth_pixel_spacing: 14.1,
+                range_pixel_spacing: 2.3297,   // Realistic IW1 range spacing
+                azimuth_pixel_spacing: 14.059906, // Realistic IW azimuth spacing
                 slant_range_time: 5.44e-3,
                 burst_duration: 2.0,
             },
@@ -1157,8 +1161,8 @@ mod tests {
                 burst_count: 9,
                 range_samples: 1000,
                 azimuth_samples: 1500,
-                range_pixel_spacing: 2.33,
-                azimuth_pixel_spacing: 14.1,
+                range_pixel_spacing: 2.8767,   // Realistic IW2 range spacing
+                azimuth_pixel_spacing: 14.059906, // Same azimuth spacing
                 slant_range_time: 5.50e-3,
                 burst_duration: 2.0,
             },

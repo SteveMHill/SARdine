@@ -4,6 +4,7 @@ use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use pyo3::prelude::*;
 
 /// Complex-valued SAR data type (I + jQ)
 pub type SarComplex = Complex<f32>;
@@ -33,6 +34,7 @@ pub enum CoordinateSystem {
 
 /// Polarization modes for Sentinel-1
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[pyclass]
 pub enum Polarization {
     VV,
     VH,
@@ -52,7 +54,7 @@ impl std::fmt::Display for Polarization {
 }
 
 /// Sentinel-1 acquisition mode
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AcquisitionMode {
     IW, // Interferometric Wide swath
     EW, // Extra Wide swath
@@ -176,6 +178,15 @@ pub enum SarError {
     
     #[error("XML parsing error: {0}")]
     XmlParsing(String),
+    
+    #[error("Missing required parameter: {0}")]
+    MissingParameter(String),
+    
+    #[error("Invalid parameter value: {0}")]
+    InvalidParameter(String),
+    
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 /// Result type for SAR operations

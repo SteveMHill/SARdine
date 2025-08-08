@@ -1,0 +1,2 @@
+Result<Vec<BurstInfo>, Box<dyn StdError>>
+Result<Vec<BurstInfo>, Box<dyn StdError>>: OkWrap<_>

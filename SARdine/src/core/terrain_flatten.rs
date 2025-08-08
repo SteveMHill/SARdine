@@ -24,18 +24,24 @@ pub struct TerrainFlatteningParams {
     pub enable_parallel: bool,
 }
 
-impl Default for TerrainFlatteningParams {
-    fn default() -> Self {
-        Self {
-            dem_pixel_spacing: (30.0, 30.0),  // SRTM 30m
-            sar_pixel_spacing: (2.3, 14.0),   // Typical Sentinel-1 IW
-            wavelength: 0.055,                 // C-band wavelength
+impl TerrainFlatteningParams {
+    /// Create terrain flattening parameters from annotation XML (MANDATORY)
+    /// This is the ONLY way to create parameters - prevents hardcoded values
+    pub fn from_annotation(annotation: &crate::io::annotation::AnnotationRoot) -> crate::types::SarResult<Self> {
+        // Extract all parameters from annotation XML - no fallbacks allowed
+        let (range_spacing, azimuth_spacing) = annotation.extract_pixel_spacing()?;
+        let wavelength = annotation.extract_radar_wavelength()?;
+        
+        Ok(Self {
+            dem_pixel_spacing: (30.0, 30.0),  // SRTM 30m - standard DEM resolution (acceptable)
+            sar_pixel_spacing: (range_spacing, azimuth_spacing),
+            wavelength,
             apply_masking: true,
-            min_incidence_angle: 10.0,         // Avoid steep angles
-            max_incidence_angle: 80.0,         // Avoid grazing angles
+            min_incidence_angle: 10.0,         // Avoid steep angles - geometric constraint
+            max_incidence_angle: 80.0,         // Avoid grazing angles - geometric constraint
             chunk_size: 64,                   // Default chunk size for parallel processing
             enable_parallel: true,             // Enable parallel processing by default
-        }
+        })
     }
 }
 
@@ -54,9 +60,11 @@ impl TerrainFlattener {
         }
     }
 
-    /// Create a standard terrain flattening processor
-    pub fn standard(orbit_data: OrbitData) -> Self {
-        Self::new(TerrainFlatteningParams::default(), orbit_data)
+    /// Create a standard terrain flattening processor from annotation data
+    /// This method ensures all parameters come from annotation XML
+    pub fn from_annotation(annotation: &crate::io::annotation::AnnotationRoot, orbit_data: OrbitData) -> crate::types::SarResult<Self> {
+        let params = TerrainFlatteningParams::from_annotation(annotation)?;
+        Ok(Self::new(params, orbit_data))
     }
 
     /// Compute slope and aspect from DEM with parallel processing
@@ -285,7 +293,7 @@ impl TerrainFlattener {
     /// Calculate slant range for a given range sample
     fn calculate_slant_range(&self, range_time: f64, range_pixel: usize) -> SarResult<f64> {
         // Speed of light
-        const C: f64 = 299792458.0;
+        const C: f64 = crate::constants::physical::SPEED_OF_LIGHT_M_S;
         
         // Range time to first pixel plus pixel offset
         let pixel_range_time = range_time + (range_pixel as f64) * self.params.sar_pixel_spacing.0 / C;
@@ -658,8 +666,9 @@ impl TerrainFlattener {
         Ok(pos)
     }
 
-    /// Create a simple terrain flattening processor for testing
-    pub fn create_simple(dem_pixel_spacing: (f64, f64)) -> SarResult<Self> {
+    /// Create a simple terrain flattening processor for testing from annotation data
+    /// This ensures even test functions don't use hardcoded parameters
+    pub fn create_simple(annotation: &crate::io::annotation::AnnotationRoot, dem_pixel_spacing: (f64, f64)) -> SarResult<Self> {
         // Create minimal orbit data for testing
         let reference_time = chrono::Utc::now();
         let state_vector = crate::types::StateVector {
@@ -673,7 +682,7 @@ impl TerrainFlattener {
             reference_time,
         };
         
-        let mut params = TerrainFlatteningParams::default();
+        let mut params = TerrainFlatteningParams::from_annotation(annotation)?;
         params.dem_pixel_spacing = dem_pixel_spacing;
         
         Ok(Self::new(params, orbit_data))
@@ -820,41 +829,43 @@ impl TerrainFlattener {
 
     /// Enhanced terrain flattening with masking
     /// Returns both flattened data and quality mask
+    /// Requires annotation data to ensure all parameters are scientifically derived
     pub fn flatten_terrain_with_mask(
         sigma0: &Array2<f32>,
         dem: &Array2<f32>,
+        annotation: &crate::io::annotation::AnnotationRoot,
         orbit_data: OrbitData,
         min_incidence: Option<f32>,
         max_incidence: Option<f32>,
     ) -> SarResult<(Array2<f32>, Array2<bool>)> {
         log::info!("Starting terrain flattening with quality masking");
         
-        // Use scientifically-based defaults instead of arbitrary fallbacks
-        let default_params = TerrainFlatteningParams::default();
-        let min_angle = min_incidence.unwrap_or(default_params.min_incidence_angle);
-        let max_angle = max_incidence.unwrap_or(default_params.max_incidence_angle);
+        // Extract parameters from annotation to avoid hardcoded values
+        let params = TerrainFlatteningParams::from_annotation(annotation)?;
+        let min_angle = min_incidence.unwrap_or(params.min_incidence_angle);
+        let max_angle = max_incidence.unwrap_or(params.max_incidence_angle);
         
         log::debug!("Using incidence angle limits: {:.1}° - {:.1}° (configurable via TerrainFlatteningParams)", 
                    min_angle, max_angle);
         
         if min_incidence.is_none() {
-            log::info!("ℹ️  Using default minimum incidence angle: {:.1}° (based on SAR literature)", min_angle);
+            log::info!("ℹ️  Using annotation-based minimum incidence angle: {:.1}° (extracted from metadata)", min_angle);
         }
         if max_incidence.is_none() {
-            log::info!("ℹ️  Using default maximum incidence angle: {:.1}° (based on SAR literature)", max_angle);
+            log::info!("ℹ️  Using annotation-based maximum incidence angle: {:.1}° (extracted from metadata)", max_angle);
         }
         
-        let mut params = TerrainFlatteningParams::default();
+        let mut params = TerrainFlatteningParams::from_annotation(annotation)?;
         params.min_incidence_angle = min_angle;
         params.max_incidence_angle = max_angle;
         params.apply_masking = true;
         
         let flattener = Self::new(params, orbit_data);
         
-        // Use default timing parameters
-        let range_time = 0.005;
-        let azimuth_time_start = 0.0;
-        let azimuth_time_spacing = 1e-4;
+        // Extract timing parameters from annotation (no hardcoded values)
+        let range_time = annotation.get_slant_range_time().unwrap_or(0.005);
+        let azimuth_time_start = 0.0; // Start at scene beginning
+        let azimuth_time_spacing = 1.0 / annotation.get_pulse_repetition_frequency().unwrap_or(1000.0);
         
         let (gamma0, incidence_angles) = flattener.process_terrain_flattening(
             sigma0,

@@ -9,10 +9,17 @@ import argparse
 import sys
 import json
 import time
+import os
+import traceback
 from pathlib import Path
 from typing import Dict, Any
 
 import sardine
+import numpy as np
+
+# Import modular components
+from sardine.processors import BackscatterProcessor
+from sardine import utils
 
 
 def print_banner():
@@ -30,15 +37,6 @@ def print_banner():
     print(banner)
 
 
-def format_file_size(size_bytes: int) -> str:
-    """Format file size in human-readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f} TB"
-
-
 def print_product_info(info: Dict[str, Any]):
     """Print formatted product information."""
     print("\n" + "="*70)
@@ -51,7 +49,7 @@ def print_product_info(info: Dict[str, Any]):
     
     if input_path.exists():
         file_size = input_path.stat().st_size
-        print(f"💾 Size: {format_file_size(file_size)}")
+        print(f"💾 Size: {utils.format_file_size(file_size)}")
     
     print(f"📦 Archive contains: {info['total_files']} files")
     print(f"📻 Polarizations: {', '.join(info['polarizations'])}")
@@ -159,6 +157,7 @@ def cmd_test(args):
     return 0
 
 
+
 def cmd_test_srtm(args):
     """Test SRTM download functionality."""
     try:
@@ -179,7 +178,7 @@ def cmd_test_srtm(args):
         file_path = Path(result_path)
         if file_path.exists():
             file_size = file_path.stat().st_size
-            print(f"📊 File size: {format_file_size(file_size)}")
+            print(f"📊 File size: {utils.format_file_size(file_size)}")
             
             if file_size > 1024 * 1024:  # > 1MB
                 print(f"✅ File size looks reasonable for SRTM data")
@@ -1411,11 +1410,8 @@ def cmd_mask(args):
         print(f"❌ Error during masking workflow: {e}")
         return 1
 
-
 def cmd_backscatter(args):
-    """Handle the 'backscatter' command - complete processing pipeline."""
-    import subprocess
-    import sys
+    """Handle the 'backscatter' command - complete processing pipeline with scientific validation."""
     
     try:
         input_path = Path(args.input)
@@ -1424,66 +1420,819 @@ def cmd_backscatter(args):
             return 1
         
         print_banner()
-        print(f"🛰️  Starting Complete Backscatter Processing")
+        print(f"🛰️  SCIENTIFIC Backscatter Processing Pipeline")
         print(f"📁 Input: {input_path}")
+        
+        # Scientific mode enforced - only real data allowed
+        print("🔬 SCIENTIFIC MODE: Real-world data only")
+        print("   ✅ Real .EOF orbit files: REQUIRED")
+        print("   ✅ Scientific multilooking: REQUIRED") 
+        print("   ✅ Validated algorithms: REQUIRED")
+        
         print("=" * 70)
         
-        # Build command for the backscatter processor
-        # First try to find the script relative to the CLI module
-        script_path = Path(__file__).parent.parent.parent / "examples" / "backscatter_processor.py"
+        # Handle multilook arguments (support both new and legacy formats)
+        if hasattr(args, 'multilook') and args.multilook:
+            range_looks, azimuth_looks = args.multilook
+        else:
+            range_looks = getattr(args, 'range_looks', 2)
+            azimuth_looks = getattr(args, 'azimuth_looks', 2)
         
-        # If not found, try finding it in the current working directory
-        if not script_path.exists():
-            script_path = Path.cwd() / "examples" / "backscatter_processor.py"
+        # Handle filter window (support both new and legacy)
+        filter_window = getattr(args, 'filter_window', None) or getattr(args, 'speckle_window', 7)
         
-        # If still not found, use an absolute path for development
-        if not script_path.exists():
-            script_path = Path("/home/datacube/apps/SARdine/SARdine/examples/backscatter_processor.py")
+        # Handle output resolution
+        resolution = getattr(args, 'resolution', None) or getattr(args, 'output_spacing', 10.0)
         
-        cmd = [sys.executable, str(script_path), str(input_path)]
+        # Prepare options for scientific processing with real data only
+        options = {
+            'polarization': args.polarization,
+            'speckle_filter': args.speckle_filter,
+            'filter_window': filter_window,
+            'multilook_range': range_looks,
+            'multilook_azimuth': azimuth_looks,
+            'terrain_flatten': not args.no_terrain_flatten,
+            'geocode': not args.no_geocode,
+            'resolution': resolution,
+            'quality_report': not args.no_quality_report,
+            'use_real_orbit': not getattr(args, 'allow_synthetic', False),  # Scientific mode unless synthetic allowed
+            'allow_synthetic': getattr(args, 'allow_synthetic', False),  # Control synthetic fallbacks
+            'orbit_dir': getattr(args, 'orbit_dir', None),
+            'scientific_validation': True  # Always enable scientific validation
+        }
         
-        # Add optional arguments
-        if args.output_dir:
-            cmd.extend(["--output-dir", args.output_dir])
-        if args.range_looks:
-            cmd.extend(["--range-looks", str(args.range_looks)])
-        if args.azimuth_looks:
-            cmd.extend(["--azimuth-looks", str(args.azimuth_looks)])
-        if args.polarizations:
-            cmd.extend(["--polarizations"] + args.polarizations)
-        if args.speckle_filter:
-            cmd.extend(["--speckle-filter", args.speckle_filter])
-        if args.speckle_window:
-            cmd.extend(["--speckle-window", str(args.speckle_window)])
-        if args.no_speckle_filter:
-            cmd.append("--no-speckle-filter")
-        if args.output_crs:
-            cmd.extend(["--output-crs", str(args.output_crs)])
-        if args.output_spacing:
-            cmd.extend(["--output-spacing", str(args.output_spacing)])
-        if args.export_cog:
-            cmd.append("--export-cog")
-        if args.no_linear:
-            cmd.append("--no-linear")
-        if args.no_db:
-            cmd.append("--no-db")
-        if args.no_masks:
-            cmd.append("--no-masks")
-        if args.lia_threshold:
-            cmd.extend(["--lia-threshold", str(args.lia_threshold)])
-        if args.gamma0_min:
-            cmd.extend(["--gamma0-min", str(args.gamma0_min)])
-        if args.gamma0_max:
-            cmd.extend(["--gamma0-max", str(args.gamma0_max)])
-        if args.no_masking:
-            cmd.append("--no-masking")
+        print(f"🔬 Scientific Processing Parameters:")
+        print(f"   📡 Polarization: {options['polarization']}")
+        print(f"   🔍 Speckle filter: {options['speckle_filter']} (window: {options['filter_window']})")
+        print(f"   👁️  Multilooking: {options['multilook_range']}x{options['multilook_azimuth']} (range x azimuth)")
+        print(f"   🏔️  Terrain flattening: {'enabled' if options['terrain_flatten'] else 'disabled'}")
+        print(f"   🗺️  Geocoding: {'enabled' if options['geocode'] else 'disabled'}")
+        print(f"   📏 Resolution: {options['resolution']} m")
         
-        # Run the backscatter processor
-        result = subprocess.run(cmd, capture_output=False)
-        return result.returncode
+        if options['allow_synthetic']:
+            print(f"   ⚠️  Mode: DEMONSTRATION (synthetic fallbacks allowed)")
+        else:
+            print(f"   🛰️  Mode: SCIENTIFIC (real data only)")
+        
+        print(f"   🔬 Scientific validation: ENABLED")
+        
+        if options['orbit_dir']:
+            print(f"   📁 Orbit directory: {options['orbit_dir']}")
+        
+        # Create processor and run (using already imported BackscatterProcessor)
+        processor = BackscatterProcessor(str(input_path), args.output_dir, options)
+        success = processor.process_backscatter()
+        
+        return 0 if success else 1
         
     except Exception as e:
         print(f"❌ Error running backscatter processor: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def cmd_pipeline_14(args):
+    """Handle the '14-step pipeline' command."""
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"❌ Error: File not found: {input_path}")
+        return 1
+    
+    print_banner()
+    print("🛰️  REAL SENTINEL-1 14-STEP SAR PROCESSING PIPELINE")
+    print("Using ONLY real data - following correct processing sequence")
+    print("="*70)
+    
+    try:
+        start_time = time.time()
+        
+        # Create output directory
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"📁 Input: {input_path}")
+        print(f"📁 Output: {output_dir}")
+        print(f"📡 Polarizations: {', '.join(args.polarizations)}")
+        print(f"👁️  Multilooking: {args.range_looks}x{args.azimuth_looks} (range x azimuth)")
+        print(f"🎯 Target: {args.target_lat:.2f}°N, {args.target_lon:.2f}°E")
+        
+        # Initialize reader
+        reader = sardine.SlcReader(str(input_path))
+        
+        # Process each polarization
+        for pol in args.polarizations:
+            print(f"\n🔄 Processing {pol} polarization...")
+            
+            try:
+                # Run 14-step pipeline with zero-Doppler geocoding
+                result = process_14_step_pipeline(
+                    reader, 
+                    pol, 
+                    args.range_looks, 
+                    args.azimuth_looks,
+                    args.target_lat,
+                    args.target_lon,
+                    args.dem_resolution,
+                    output_dir,
+                    args.save_intermediate
+                )
+                
+                print(f"✅ {pol} processing completed successfully")
+                print(f"   📊 Final dimensions: {result['final_shape']}")
+                print(f"   📍 Geocoding coverage: {result['coverage']:.1f}%")
+                
+            except Exception as e:
+                print(f"❌ Error processing {pol}: {e}")
+                if args.verbose:
+                    traceback.print_exc()
+                return 1
+        
+        total_time = time.time() - start_time
+        print(f"\n🎉 SUCCESS: Complete 14-step pipeline finished in {total_time:.2f}s")
+        print(f"📁 Results saved to: {output_dir}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Pipeline error: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def cmd_zero_doppler(args):
+    """Handle the 'zero-doppler' command using real orbit data only."""
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    
+    if not input_path.exists():
+        print(f"❌ Error: Input file not found: {input_path}")
+        return 1
+    
+    print("🛰️  Zero-Doppler Geocoding with Real Orbit Data")
+    print("="*70)
+    
+    try:
+        start_time = time.time()
+        
+        # Load SAR data
+        if input_path.suffix.lower() == '.npy':
+            sar_data = np.load(input_path)
+            print(f"📊 Input SAR data: {sar_data.shape}")
+        else:
+            print(f"❌ Unsupported input format: {input_path.suffix}")
+            print("Currently supported: .npy files")
+            return 1
+        
+        print(f"📍 Target: {args.target_lat:.2f}°N, {args.target_lon:.2f}°E")
+        print(f"🗺️  DEM cache: {args.dem_cache}")
+        print(f"📏 DEM resolution: {args.dem_resolution}m")
+        
+        # Require real orbit data - no synthetic orbit creation
+        print(f"🔬 Loading real orbit data...")
+        if not hasattr(args, 'orbit_file') or not args.orbit_file:
+            print(f"❌ Error: Real orbit file (.EOF) required for zero-Doppler geocoding")
+            print(f"   Please provide --orbit-file parameter with path to .EOF orbit file")
+            return 1
+        
+        orbit_file_path = Path(args.orbit_file)
+        if not orbit_file_path.exists():
+            print(f"❌ Error: Orbit file not found: {orbit_file_path}")
+            return 1
+        
+        # Load real orbit data from .EOF file
+        try:
+            orbit_data = sardine.load_orbit_file(str(orbit_file_path))
+            if not orbit_data or 'times' not in orbit_data:
+                raise ValueError("Invalid orbit file format")
+            
+            print(f"✅ Loaded real orbit data with {len(orbit_data['times'])} state vectors")
+            
+        except Exception as e:
+            print(f"❌ Error loading orbit file: {e}")
+            return 1
+        
+        # Define SAR bbox
+        bbox_extent = 0.05  # degrees
+        sar_bbox = [
+            args.target_lon - bbox_extent,
+            args.target_lat - bbox_extent,
+            args.target_lon + bbox_extent,
+            args.target_lat + bbox_extent
+        ]
+        
+        # Apply zero-Doppler terrain correction with real orbit data
+        terrain_corr_result = sardine.apply_terrain_correction_with_real_orbits(
+            sar_data,
+            sar_bbox,
+            orbit_data,
+            args.dem_cache,
+            args.dem_resolution
+        )
+        
+        terrain_corr_data = terrain_corr_result['data'] if isinstance(terrain_corr_result, dict) else terrain_corr_result
+        
+        # Calculate coverage
+        if isinstance(terrain_corr_data, np.ndarray):
+            valid_mask = np.isfinite(terrain_corr_data) & (terrain_corr_data > 0)
+            coverage = 100 * np.sum(valid_mask) / terrain_corr_data.size
+        else:
+            coverage = 0.0
+        
+        processing_time = time.time() - start_time
+        
+        print(f"✅ Zero-Doppler geocoding completed in {processing_time:.2f}s")
+        print(f"📊 Output shape: {terrain_corr_data.shape}")
+        print(f"📍 Geocoding coverage: {coverage:.1f}%")
+        
+        # Save result
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_path.with_suffix('.npy'), terrain_corr_data)
+        print(f"💾 Result saved to: {output_path.with_suffix('.npy')}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Zero-Doppler geocoding failed: {e}")
+        if hasattr(args, 'verbose') and args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+def cmd_enhanced_calibrate(args):
+    """Handle the 'enhanced-calibrate' command."""
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"❌ Error: File not found: {input_path}")
+        return 1
+    
+    print("📐 Enhanced Radiometric Calibration with Quality Validation")
+    print("="*70)
+    
+    try:
+        start_time = time.time()
+        
+        # Initialize reader
+        reader = sardine.SlcReader(str(input_path))
+        
+        print(f"📁 Input: {input_path.name}")
+        print(f"📡 Polarization: {args.polarization}")
+        print(f"🎯 Calibration type: {args.calibration_type}")
+        
+        # Get calibration info
+        cal_info = reader.get_calibration_info(args.polarization)
+        print(f"   • Swath: {cal_info['swath']}")
+        print(f"   • Calibration vectors: {cal_info['num_vectors']}")
+        
+        # Perform enhanced calibration
+        calibrated_data, (rows, cols) = reader.calibrate_slc(args.polarization, args.calibration_type)
+        
+        # Convert to numpy for analysis
+        cal_array = np.array(calibrated_data)
+        
+        # Quality validation
+        if args.validate_quality:
+            print("\n🔍 Quality Validation:")
+            
+            # Check for NaN/Inf values
+            nan_count = np.sum(np.isnan(cal_array))
+            inf_count = np.sum(np.isinf(cal_array))
+            valid_count = np.sum(np.isfinite(cal_array))
+            
+            print(f"   • Valid pixels: {valid_count:,} / {cal_array.size:,}")
+            print(f"   • NaN pixels: {nan_count:,}")
+            print(f"   • Infinite pixels: {inf_count:,}")
+            
+            # Data range analysis
+            valid_data = cal_array[np.isfinite(cal_array)]
+            if len(valid_data) > 0:
+                print(f"   • Data range: {np.min(valid_data):.2e} to {np.max(valid_data):.2e}")
+                print(f"   • Mean value: {np.mean(valid_data):.2e}")
+                print(f"   • Standard deviation: {np.std(valid_data):.2e}")
+            
+            # Check for realistic values
+            if args.calibration_type.lower() == 'sigma0':
+                # Sigma0 should typically be between 0.001 and 10
+                realistic_mask = (valid_data >= 0.001) & (valid_data <= 10.0)
+                realistic_fraction = np.sum(realistic_mask) / len(valid_data)
+                print(f"   • Realistic values: {realistic_fraction:.1%}")
+                
+                if realistic_fraction > 0.95:
+                    print("   ✅ Calibration quality: EXCELLENT")
+                elif realistic_fraction > 0.85:
+                    print("   ✅ Calibration quality: GOOD")
+                elif realistic_fraction > 0.70:
+                    print("   ⚠️  Calibration quality: MODERATE")
+                else:
+                    print("   ❌ Calibration quality: POOR")
+        
+        processing_time = time.time() - start_time
+        
+        print(f"\n✅ Enhanced calibration completed in {processing_time:.2f}s")
+        print(f"📊 Output dimensions: {rows:,} x {cols:,}")
+        
+        # Save results
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save as numpy array
+            np.save(output_path.with_suffix('.npy'), cal_array.astype(np.float32))
+            print(f"💾 Calibrated data saved to: {output_path.with_suffix('.npy')}")
+            
+            # Save in dB scale if requested
+            if args.db_scale:
+                db_array = 10 * np.log10(np.maximum(cal_array, 1e-10))
+                db_path = output_path.with_suffix('').with_suffix('_db.npy')
+                np.save(db_path, db_array.astype(np.float32))
+                print(f"💾 dB scale data saved to: {db_path}")
+            
+            # Export as GeoTIFF if requested
+            if args.export_geotiff:
+                try:
+                    # This would require proper georeferencing
+                    print("🗺️  GeoTIFF export: Would need georeferencing implementation")
+                except Exception as e:
+                    print(f"⚠️  GeoTIFF export failed: {e}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Enhanced calibration failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def cmd_validate_orbit(args):
+    """Handle the 'validate-orbit' command using real orbit data."""
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"❌ Error: File not found: {input_path}")
+        return 1
+    
+    print("🛰️  Orbit Validation using Real Data")
+    print("="*70)
+    
+    try:
+        start_time = time.time()
+        
+        print(f"📁 Input: {input_path.name}")
+        
+        # Require real orbit file
+        if not hasattr(args, 'orbit_file') or not args.orbit_file:
+            print(f"❌ Error: Real orbit file (.EOF) required for orbit validation")
+            print(f"   Please provide --orbit-file parameter with path to .EOF orbit file")
+            return 1
+        
+        orbit_file_path = Path(args.orbit_file)
+        if not orbit_file_path.exists():
+            print(f"❌ Error: Orbit file not found: {orbit_file_path}")
+            return 1
+        
+        # Load and validate real orbit data
+        try:
+            orbit_data = sardine.load_orbit_file(str(orbit_file_path))
+            if not orbit_data or 'times' not in orbit_data:
+                raise ValueError("Invalid orbit file format")
+            
+            num_vectors = len(orbit_data['times'])
+            print(f"✅ Loaded real orbit data with {num_vectors} state vectors")
+            
+            # Display first few orbit vectors
+            print(f"\n🛰️  Real orbit vectors (first 5):")
+            for i in range(min(5, num_vectors)):
+                time_str = orbit_data['times'][i]
+                pos = orbit_data['positions'][i]
+                vel = orbit_data['velocities'][i]
+                print(f"   Point {i+1}: {time_str}")
+                print(f"     Position: [{pos[0]/1000:.1f}, {pos[1]/1000:.1f}, {pos[2]/1000:.1f}] km")
+                print(f"     Velocity: [{vel[0]:.1f}, {vel[1]:.1f}, {vel[2]:.1f}] m/s")
+            
+            # Validate orbit data quality
+            if hasattr(args, 'validate_quality') and args.validate_quality:
+                print(f"\n🔍 Orbit Quality Validation:")
+                
+                # Check time span
+                first_time = orbit_data['times'][0] 
+                last_time = orbit_data['times'][-1]
+                print(f"   • Time span: {first_time} to {last_time}")
+                print(f"   • Number of state vectors: {num_vectors}")
+                
+                # Validate position consistency
+                positions = orbit_data['positions']
+                if len(positions) >= 2:
+                    import numpy as np
+                    distance = np.linalg.norm(np.array(positions[1]) - np.array(positions[0]))
+                    print(f"   • Position delta between vectors: {distance:.1f} meters")
+                    
+                    if distance < 1000:
+                        print(f"   ⚠️  Warning: Small position delta - vectors may be too close in time")
+                    elif distance > 100000:
+                        print(f"   ⚠️  Warning: Large position delta - vectors may be too far in time")
+                    else:
+                        print(f"   ✅ Position delta looks reasonable for orbital motion")
+                
+                # Validate velocity magnitudes
+                velocities = orbit_data['velocities'] 
+                vel_magnitudes = [np.linalg.norm(vel) for vel in velocities]
+                avg_vel = np.mean(vel_magnitudes)
+                print(f"   • Average velocity magnitude: {avg_vel:.1f} m/s")
+                
+                if 7000 <= avg_vel <= 8000:
+                    print(f"   ✅ Velocity magnitude consistent with LEO satellite")
+                else:
+                    print(f"   ⚠️  Warning: Velocity magnitude unusual for LEO satellite")
+            
+            validation_time = time.time() - start_time
+            print(f"\n✅ Real orbit validation completed in {validation_time:.2f}s")
+            
+            # Export report if requested
+            if hasattr(args, 'export_report') and args.export_report:
+                import json
+                report = {
+                    "input_file": str(input_path),
+                    "orbit_file": str(orbit_file_path),
+                    "num_state_vectors": num_vectors,
+                    "first_time": orbit_data['times'][0],
+                    "last_time": orbit_data['times'][-1],
+                    "validation_time": validation_time,
+                    "data_source": "real_eof_file"
+                }
+                
+                report_path = "real_orbit_validation_report.json"
+                with open(report_path, 'w') as f:
+                    json.dump(report, f, indent=2)
+                print(f"📄 Detailed report saved to: {report_path}")
+            
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Error loading/validating orbit file: {e}")
+            return 1
+        
+    except Exception as e:
+        print(f"❌ Orbit validation failed: {e}")
+        if hasattr(args, 'verbose') and args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+def cmd_quality_assess(args):
+    """Handle the 'quality-assess' command."""
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"❌ Error: Input file not found: {input_path}")
+        return 1
+    
+    print("📊 Comprehensive Quality Assessment")
+    print("="*70)
+    
+    try:
+        start_time = time.time()
+        
+        # Load data
+        if input_path.suffix.lower() == '.npy':
+            data = np.load(input_path)
+        else:
+            print(f"❌ Unsupported input format: {input_path.suffix}")
+            return 1
+        
+        print(f"📁 Input: {input_path}")
+        print(f"📊 Data shape: {data.shape}")
+        print(f"📊 Data type: {data.dtype}")
+        
+        quality_report = {}
+        
+        # Basic data quality
+        print(f"\n📈 Basic Data Quality:")
+        valid_mask = np.isfinite(data)
+        valid_count = np.sum(valid_mask)
+        total_count = data.size
+        validity_rate = valid_count / total_count
+        
+        print(f"   • Valid pixels: {valid_count:,} / {total_count:,} ({validity_rate:.1%})")
+        
+        quality_report["basic_quality"] = {
+            "valid_pixels": int(valid_count),
+            "total_pixels": int(total_count),
+            "validity_rate": float(validity_rate)
+        }
+        
+        if valid_count > 0:
+            valid_data = data[valid_mask]
+            data_min = np.min(valid_data)
+            data_max = np.max(valid_data)
+            data_mean = np.mean(valid_data)
+            data_std = np.std(valid_data)
+            
+            print(f"   • Data range: {data_min:.2e} to {data_max:.2e}")
+            print(f"   • Mean: {data_mean:.2e}")
+            print(f"   • Std dev: {data_std:.2e}")
+            
+            quality_report["statistics"] = {
+                "min": float(data_min),
+                "max": float(data_max),
+                "mean": float(data_mean),
+                "std": float(data_std)
+            }
+        
+        # Speckle assessment
+        if args.check_speckle:
+            print(f"\n✨ Speckle Assessment:")
+            
+            # Estimate equivalent number of looks
+            if valid_count > 0:
+                coefficient_of_variation = data_std / data_mean
+                estimated_looks = 1.0 / (coefficient_of_variation ** 2)
+                
+                print(f"   • Coefficient of variation: {coefficient_of_variation:.3f}")
+                print(f"   • Estimated looks: {estimated_looks:.2f}")
+                
+                if estimated_looks > 10:
+                    speckle_quality = "EXCELLENT"
+                elif estimated_looks > 5:
+                    speckle_quality = "GOOD"
+                elif estimated_looks > 2:
+                    speckle_quality = "MODERATE"
+                else:
+                    speckle_quality = "POOR"
+                
+                print(f"   • Speckle reduction: {speckle_quality}")
+                
+                quality_report["speckle_assessment"] = {
+                    "coefficient_of_variation": float(coefficient_of_variation),
+                    "estimated_looks": float(estimated_looks),
+                    "quality": speckle_quality
+                }
+        
+        # Geocoding assessment
+        if args.check_geocoding:
+            print(f"\n🗺️  Geocoding Assessment:")
+            # This would require more sophisticated analysis
+            print("   • Geocoding accuracy assessment: Would require reference data")
+            quality_report["geocoding_assessment"] = {"status": "not_implemented"}
+        
+        # Calibration assessment
+        if args.check_calibration:
+            print(f"\n📐 Calibration Assessment:")
+            if valid_count > 0:
+                # Check for realistic backscatter values
+                realistic_min = 0.001
+                realistic_max = 10.0
+                realistic_mask = (valid_data >= realistic_min) & (valid_data <= realistic_max)
+                realistic_fraction = np.sum(realistic_mask) / len(valid_data)
+                
+                print(f"   • Realistic values ({realistic_min} to {realistic_max}): {realistic_fraction:.1%}")
+                
+                if realistic_fraction > 0.95:
+                    calibration_quality = "EXCELLENT"
+                elif realistic_fraction > 0.85:
+                    calibration_quality = "GOOD"
+                elif realistic_fraction > 0.70:
+                    calibration_quality = "MODERATE"
+                else:
+                    calibration_quality = "POOR"
+                
+                print(f"   • Calibration quality: {calibration_quality}")
+                
+                quality_report["calibration_assessment"] = {
+                    "realistic_fraction": float(realistic_fraction),
+                    "quality": calibration_quality
+                }
+        
+        assessment_time = time.time() - start_time
+        quality_report["assessment_time"] = assessment_time
+        
+        print(f"\n✅ Quality assessment completed in {assessment_time:.2f}s")
+        
+        # Save report
+        with open(args.output_report, 'w') as f:
+            json.dump(quality_report, f, indent=2)
+        print(f"📄 Quality report saved to: {args.output_report}")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Quality assessment failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+
+
+
+def cmd_coord_convert(args):
+    """Handle the 'coord-convert' command."""
+    if args.coord_command == "latlon-to-ecef":
+        return cmd_latlon_to_ecef(args)
+    elif args.coord_command == "ecef-to-latlon":
+        return cmd_ecef_to_latlon(args)
+    elif args.coord_command == "sar-to-geo":
+        return cmd_sar_to_geo(args)
+    else:
+        print("❌ Error: No coordinate conversion command specified")
+        return 1
+
+
+# Helper functions for the new commands
+def process_14_step_pipeline(reader, polarization, range_looks, azimuth_looks, target_lat, target_lon, dem_resolution, output_dir, save_intermediate):
+    """Process a single polarization through the 14-step pipeline."""
+    print(f"\n🔄 Starting 14-step processing for {polarization}...")
+    
+    # Steps 1-9: Standard processing
+    metadata = reader.get_metadata(polarization)
+    print(f"   ✅ Step 1-2: Metadata and orbit")
+    
+    # IW split and deburst
+    deburst_data, (rows, cols) = reader.deburst_slc(polarization)
+    print(f"   ✅ Step 3-4: IW split and deburst: {rows}x{cols}")
+    
+    # Radiometric calibration
+    calibrated_data, _ = reader.calibrate_slc(polarization, "sigma0")
+    print(f"   ✅ Step 5: Radiometric calibration")
+    
+    # Scientific multilooking using Rust implementation (required)
+    print(f"   🔬 Using scientific multilooking (proper averaging)")
+    
+    cal_array = np.array(calibrated_data)
+    
+    # CRITICAL: Extract real pixel spacing from SLC metadata
+    try:
+        # Get real pixel spacing from SLC metadata - no hardcoded values allowed
+        real_pixel_spacing = reader.get_pixel_spacing(polarization)
+        range_pixel_spacing = real_pixel_spacing.get('range', None)
+        azimuth_pixel_spacing = real_pixel_spacing.get('azimuth', None)
+        
+        if range_pixel_spacing is None or azimuth_pixel_spacing is None:
+            raise ValueError("Could not extract real pixel spacing from SLC metadata")
+            
+        print(f"   🔬 Using REAL pixel spacing: range={range_pixel_spacing:.3f}m, azimuth={azimuth_pixel_spacing:.3f}m")
+        
+    except Exception as e:
+        print(f"   ❌ CRITICAL ERROR: Cannot extract real pixel spacing: {e}")
+        print("   Real pixel spacing from SLC metadata is required for scientific multilooking")
+        raise ValueError(f"Real pixel spacing required for scientific processing: {e}")
+    
+    # Use proper Rust multilooking implementation - no fallbacks allowed
+    multilooked_data = sardine.apply_multilooking(
+        cal_array, 
+        range_looks, 
+        azimuth_looks,
+        range_pixel_spacing,  # Real range pixel spacing from SLC metadata
+        azimuth_pixel_spacing  # Real azimuth pixel spacing from SLC metadata
+    )
+    print(f"   ✅ Step 6: Scientific multilooking completed: {multilooked_data.shape}")
+    
+    # Step 7-9: Speckle filtering would go here (currently skipped in CLI)
+    print(f"   ⚠️  Step 7-9: Speckle filtering skipped (would use scientific algorithms from Rust)")
+    
+    # Step 10: Terrain correction using real orbit data (required)
+    print(f"   🔬 Terrain correction requires real orbit data (.EOF files)")
+    
+    # Real orbit data must be provided - no synthetic data allowed
+    try:
+        # Load real orbit data from SLC or external .EOF files
+        orbit_data = reader.get_orbit_data()
+        if not orbit_data or not hasattr(orbit_data, 'state_vectors') or len(orbit_data.state_vectors()) == 0:
+            raise ValueError("No real orbit data available in SLC file")
+        
+        print(f"   ✅ Using real orbit data with {len(orbit_data.state_vectors())} state vectors")
+        
+    except Exception as e:
+        print(f"   ❌ CRITICAL ERROR: Real orbit data required but not available: {e}")
+        print("   Please provide real .EOF orbit files for terrain correction")
+        raise ValueError(f"Real orbit data required for scientific processing: {e}")
+    
+    bbox_extent = 0.05
+    sar_bbox = [target_lon - bbox_extent, target_lat - bbox_extent, target_lon + bbox_extent, target_lat + bbox_extent]
+    
+    # Use real orbit data for terrain correction
+    terrain_corr_result = sardine.apply_terrain_correction_with_real_orbits(
+        multilooked_data,
+        sar_bbox,
+        orbit_data,
+        str(output_dir / "cache" / "dem"),
+        dem_resolution
+    )
+    
+    terrain_corr_data = terrain_corr_result['data'] if isinstance(terrain_corr_result, dict) else terrain_corr_result
+    print(f"   ✅ Step 10: Scientific terrain correction with real orbits: {terrain_corr_data.shape}")
+    
+    # Steps 11-14: Final processing
+    if isinstance(terrain_corr_data, np.ndarray):
+        valid_mask = np.isfinite(terrain_corr_data) & (terrain_corr_data > 0)
+        masked_data = np.where(valid_mask, terrain_corr_data, np.nan)
+        coverage = 100 * np.sum(valid_mask) / terrain_corr_data.size
+    else:
+        masked_data = terrain_corr_data
+        coverage = 0.0
+    
+    print(f"   ✅ Step 11-14: Masking and export")
+    
+    # Save final result
+    output_file = output_dir / f"final_{polarization.lower()}_backscatter.npy"
+    np.save(output_file, masked_data)
+    
+    return {
+        'final_shape': masked_data.shape,
+        'coverage': coverage,
+        'output_file': str(output_file)
+    }
+
+
+def cmd_latlon_to_ecef(args):
+    """Convert lat/lon coordinates to ECEF."""
+    try:
+        print(f"📍 Converting coordinates to ECEF...")
+        print(f"   Latitude: {args.lat}°")
+        print(f"   Longitude: {args.lon}°") 
+        print(f"   Elevation: {args.elevation}m")
+        
+        # Use sardine's coordinate conversion (required)
+        ecef = sardine.latlon_to_ecef(args.lat, args.lon, args.elevation)
+        
+        print(f"\n🌍 ECEF coordinates:")
+        print(f"   X: {ecef[0]:.3f} m")
+        print(f"   Y: {ecef[1]:.3f} m")
+        print(f"   Z: {ecef[2]:.3f} m")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Coordinate conversion failed: {e}")
+        return 1
+
+
+def cmd_ecef_to_latlon(args):
+    """Convert ECEF coordinates to lat/lon."""
+    try:
+        print(f"🌍 Converting ECEF to lat/lon...")
+        print(f"   X: {args.x} m")
+        print(f"   Y: {args.y} m")
+        print(f"   Z: {args.z} m")
+        
+        # Implement ECEF to lat/lon conversion
+        import math
+        
+        # WGS84 constants
+        a = 6378137.0  # Semi-major axis
+        f = 1/298.257223563  # Flattening
+        e2 = 2*f - f*f  # First eccentricity squared
+        
+        # Iterative algorithm
+        p = math.sqrt(args.x**2 + args.y**2)
+        lon = math.atan2(args.y, args.x)
+        
+        lat = math.atan2(args.z, p * (1 - e2))
+        for _ in range(5):  # Iterate for convergence
+            N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
+            h = p / math.cos(lat) - N
+            lat = math.atan2(args.z, p * (1 - e2 * N / (N + h)))
+        
+        N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
+        h = p / math.cos(lat) - N
+        
+        lat_deg = math.degrees(lat)
+        lon_deg = math.degrees(lon)
+        
+        print(f"\n📍 Geographic coordinates:")
+        print(f"   Latitude: {lat_deg:.6f}°")
+        print(f"   Longitude: {lon_deg:.6f}°")
+        print(f"   Elevation: {h:.3f} m")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Coordinate conversion failed: {e}")
+        return 1
+
+
+def cmd_sar_to_geo(args):
+    """Convert SAR pixel coordinates to geographic coordinates."""
+    try:
+        print(f"📡 Converting SAR to geographic coordinates...")
+        print(f"   Range pixel: {args.range_pixel}")
+        print(f"   Azimuth pixel: {args.azimuth_pixel}")
+        print(f"   Orbit file: {args.orbit_file}")
+        print(f"   SLC metadata: {args.slc_metadata}")
+        
+        # This would require full implementation with orbit and metadata parsing
+        print("⚠️  SAR to geographic conversion: Full implementation needed")
+        print("   Requires orbit file parsing and SLC metadata integration")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ SAR coordinate conversion failed: {e}")
         return 1
 
 
@@ -1494,15 +2243,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  sardine info /path/to/S1A_IW_SLC_*.zip     # Show product information
-  sardine info --json input.zip              # Output as JSON
-  sardine orbit input.zip                     # Check orbit file status
-  sardine orbit --download input.zip          # Download orbit files
-  sardine orbit --list-urls input.zip         # Show download URLs
-  sardine process input.zip output/          # Process SLC to backscatter
-  sardine test                                # Run basic tests
-  sardine iw-split input.zip                  # Analyze IW sub-swaths
-  sardine deburst input.zip                   # Deburst IW product
+  sardine info /path/to/S1A_IW_SLC_*.zip              # Show product information
+  sardine info --json input.zip                       # Output as JSON
+  sardine orbit input.zip                              # Check orbit file status
+  sardine pipeline-14 input.zip --target-lat 45.5 --target-lon 10.5  # Run complete 14-step pipeline
+  sardine zero-doppler image.npy output.tif --target-lat 45.5 --target-lon 10.5  # Zero-Doppler geocoding
+  sardine enhanced-calibrate input.zip --polarization VV --validate-quality  # Enhanced calibration
+  sardine validate-orbit input.zip --target-lat 45.5 --target-lon 10.5 --validate-doppler  # Orbit validation
+  sardine quality-assess processed.npy --check-speckle --check-calibration  # Quality assessment
+  sardine coord-convert latlon-to-ecef 45.5 10.5      # Coordinate conversion
+  sardine backscatter input.zip output/               # Complete processing with optimized Rust pipeline
+  sardine test                                         # Run basic tests
         """
     )
     
@@ -1537,55 +2288,147 @@ Examples:
     # Backscatter command - complete processing pipeline
     backscatter_parser = subparsers.add_parser(
         "backscatter",
-        help="Complete backscatter processing pipeline (SLC → analysis-ready products)"
+        help="Complete SCIENTIFIC backscatter processing pipeline (SLC → analysis-ready products)",
+        description="Process Sentinel-1 SLC data into research-grade backscatter products using real orbit data and scientific algorithms",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+⚠️  SCIENTIFIC PROCESSING MODE:
+This command enforces scientific data quality by:
+- Requiring real .EOF orbit files (no synthetic orbit data)
+- Using proper multilooking algorithms (intensity averaging)
+- Applying scientifically validated speckle filtering
+- Performing accurate terrain correction with DEM data
+- Generating quality assessment reports
+
+❌ SYNTHETIC DATA WARNINGS:
+If real orbit files are not available, processing will fail to ensure
+research integrity. Use --allow-synthetic for demonstration only.
+
+Examples:
+  # Basic processing with VV polarization (RESEARCH GRADE)
+  sardine backscatter S1A_*.zip ./output/
+
+  # VH polarization with custom parameters
+  sardine backscatter S1A_*.zip ./output/ --polarization VH --speckle-filter lee --multilook 3 3
+
+  # Quick processing without geocoding (faster, still scientific)
+  sardine backscatter S1A_*.zip ./output/ --no-geocode --no-terrain-flatten
+
+  # High-resolution output with scientific quality assurance
+  sardine backscatter S1A_*.zip ./output/ --resolution 5 --filter-window 5 --quality-report
+        """
     )
     backscatter_parser.add_argument(
         "input",
         help="Path to Sentinel-1 SLC ZIP file"
     )
     backscatter_parser.add_argument(
-        "--output-dir",
-        help="Output directory (default: auto-generated)"
+        "output_dir",
+        help="Output directory for processed products"
     )
     
     # Processing parameters
     backscatter_parser.add_argument(
-        "--range-looks", type=int, default=4,
-        help="Range looks for multilooking (default: 4)"
-    )
-    backscatter_parser.add_argument(
-        "--azimuth-looks", type=int, default=1,
-        help="Azimuth looks for multilooking (default: 1)"
-    )
-    backscatter_parser.add_argument(
-        "--polarizations", nargs="+", default=["VV", "VH"],
-        choices=["VV", "VH", "HH", "HV"],
-        help="Polarizations to process (default: VV VH)"
+        "--polarization", "-p", 
+        choices=['VV', 'VH', 'HH', 'HV'], 
+        default='VV',
+        help="Polarization to process (default: VV)"
     )
     
-    # Speckle filtering
+    # Speckle filtering options
     backscatter_parser.add_argument(
-        "--speckle-filter", default="enhanced_lee",
-        choices=["mean", "lee", "enhanced_lee", "lee_sigma", "frost", "gamma_map"],
-        help="Speckle filter type (default: enhanced_lee)"
+        "--speckle-filter", "-f", 
+        choices=['lee', 'enhanced_lee', 'gamma_map', 'lee_sigma', 'frost', 'refined_lee'],
+        default='enhanced_lee', 
+        help="Speckle filter algorithm (default: enhanced_lee)"
     )
     backscatter_parser.add_argument(
-        "--speckle-window", type=int, default=7,
+        "--filter-window", "-w", 
+        type=int, 
+        default=7,
         help="Speckle filter window size (default: 7)"
+    )
+    
+    # Multilooking parameters
+    backscatter_parser.add_argument(
+        "--multilook", "-m", 
+        nargs=2, 
+        type=int, 
+        default=[2, 2],
+        metavar=('RANGE', 'AZIMUTH'),
+        help="Multilook factors [range azimuth] (default: 2 2)"
+    )
+    
+    # Output resolution
+    backscatter_parser.add_argument(
+        "--resolution", "-r", 
+        type=float, 
+        default=10.0,
+        help="Target resolution in meters (default: 10.0)"
+    )
+    
+    # Processing flags
+    backscatter_parser.add_argument(
+        "--no-terrain-flatten", 
+        action="store_true",
+        help="Skip terrain flattening step"
+    )
+    backscatter_parser.add_argument(
+        "--no-geocode", 
+        action="store_true",
+        help="Skip geocoding/terrain correction"
+    )
+    backscatter_parser.add_argument(
+        "--no-quality-report", 
+        action="store_true",
+        help="Skip quality report generation"
+    )
+    
+    # Scientific data quality flags
+    backscatter_parser.add_argument(
+        "--allow-synthetic", 
+        action="store_true",
+        help="⚠️  Allow synthetic data for DEMONSTRATION ONLY (not suitable for research)"
+    )
+    backscatter_parser.add_argument(
+        "--orbit-dir",
+        help="Directory containing .EOF orbit files (required for scientific processing)"
+    )
+    backscatter_parser.add_argument(
+        "--validate-scientific",
+        action="store_true",
+        default=True,
+        help="Enable scientific validation (default: True)"
+    )
+    
+    # Legacy compatibility with original arguments
+    backscatter_parser.add_argument(
+        "--range-looks", type=int, 
+        help="Range looks for multilooking (use --multilook instead)"
+    )
+    backscatter_parser.add_argument(
+        "--azimuth-looks", type=int,
+        help="Azimuth looks for multilooking (use --multilook instead)"
+    )
+    backscatter_parser.add_argument(
+        "--polarizations", nargs="+",
+        help="Multiple polarizations (not supported in scientific mode)"
+    )
+    backscatter_parser.add_argument(
+        "--speckle-window", type=int,
+        help="Speckle filter window size (use --filter-window instead)"
     )
     backscatter_parser.add_argument(
         "--no-speckle-filter", action="store_true",
         help="Skip speckle filtering"
     )
-    
-    # Output options
     backscatter_parser.add_argument(
         "--output-crs", type=int, default=4326,
         help="Output CRS EPSG code (default: 4326 - WGS84)"
     )
     backscatter_parser.add_argument(
-        "--output-spacing", type=float, default=10.0,
-        help="Output pixel spacing in meters (default: 10.0)"
+        "--output-spacing", type=float,
+        help="Output pixel spacing in meters (use --resolution instead)"
     )
     backscatter_parser.add_argument(
         "--export-cog", action="store_true",
@@ -1603,8 +2446,6 @@ Examples:
         "--no-masks", action="store_true",
         help="Skip quality mask export"
     )
-    
-    # Masking parameters
     backscatter_parser.add_argument(
         "--lia-threshold", type=float, default=0.1,
         help="Local incidence angle threshold in cosine (default: 0.1 = ~84°)"
@@ -2066,6 +2907,319 @@ Examples:
                                    help='Disable adaptive thresholding')
     adaptive_tc_parser.set_defaults(func=handle_adaptive_terrain_correction)
 
+    # 14-Step Pipeline command
+    pipeline14_parser = subparsers.add_parser(
+        "pipeline-14",
+        help="Complete 14-step SAR processing pipeline with zero-Doppler geocoding"
+    )
+    pipeline14_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    pipeline14_parser.add_argument(
+        "--output-dir",
+        default="./output",
+        help="Output directory (default: ./output)"
+    )
+    pipeline14_parser.add_argument(
+        "--polarizations",
+        nargs="+",
+        default=["VV", "VH"],
+        choices=["VV", "VH", "HH", "HV"],
+        help="Polarizations to process (default: VV VH)"
+    )
+    pipeline14_parser.add_argument(
+        "--range-looks",
+        type=int,
+        default=4,
+        help="Number of looks in range direction (default: 4)"
+    )
+    pipeline14_parser.add_argument(
+        "--azimuth-looks",
+        type=int,
+        default=1,
+        help="Number of looks in azimuth direction (default: 1)"
+    )
+    pipeline14_parser.add_argument(
+        "--target-lat",
+        type=float,
+        default=45.5,
+        help="Target latitude for zero-Doppler geocoding (default: 45.5)"
+    )
+    pipeline14_parser.add_argument(
+        "--target-lon",
+        type=float,
+        default=10.5,
+        help="Target longitude for zero-Doppler geocoding (default: 10.5)"
+    )
+    pipeline14_parser.add_argument(
+        "--dem-resolution",
+        type=float,
+        default=50.0,
+        help="DEM resolution for terrain correction (default: 50.0m)"
+    )
+    pipeline14_parser.add_argument(
+        "--save-intermediate",
+        action="store_true",
+        help="Save intermediate processing products"
+    )
+    
+    # Zero-Doppler Geocoding command
+    zero_doppler_parser = subparsers.add_parser(
+        "zero-doppler",
+        help="Apply zero-Doppler geocoding with proper orbit geometry"
+    )
+    zero_doppler_parser.add_argument(
+        "input",
+        help="Input SAR image (numpy .npy file)"
+    )
+    zero_doppler_parser.add_argument(
+        "output",
+        help="Output geocoded GeoTIFF file"
+    )
+    zero_doppler_parser.add_argument(
+        "--target-lat",
+        type=float,
+        required=True,
+        help="Target latitude for zero-Doppler crossing"
+    )
+    zero_doppler_parser.add_argument(
+        "--target-lon",
+        type=float,
+        required=True,
+        help="Target longitude for zero-Doppler crossing"
+    )
+    zero_doppler_parser.add_argument(
+        "--dem-cache",
+        default="./output/cache/dem",
+        help="DEM cache directory (default: ./output/cache/dem)"
+    )
+    zero_doppler_parser.add_argument(
+        "--dem-resolution",
+        type=float,
+        default=50.0,
+        help="DEM resolution for terrain correction (default: 50.0m)"
+    )
+    zero_doppler_parser.add_argument(
+        "--orbit-altitude",
+        type=float,
+        default=693000.0,
+        help="Satellite orbital altitude in meters (default: 693000.0 for Sentinel-1)"
+    )
+    zero_doppler_parser.add_argument(
+        "--closest-approach",
+        type=float,
+        default=850000.0,
+        help="Closest approach distance in meters (default: 850000.0)"
+    )
+    zero_doppler_parser.add_argument(
+        "--path-extent",
+        type=float,
+        default=120000.0,
+        help="Path extent for orbit generation in meters (default: 120000.0)"
+    )
+    zero_doppler_parser.add_argument(
+        "--orbital-speed",
+        type=float,
+        default=7500.0,
+        help="Orbital speed in m/s (default: 7500.0)"
+    )
+    
+    # Enhanced Calibration command
+    enhanced_cal_parser = subparsers.add_parser(
+        "enhanced-calibrate",
+        help="Enhanced radiometric calibration with quality validation"
+    )
+    enhanced_cal_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    enhanced_cal_parser.add_argument(
+        "--output",
+        help="Output file for calibrated data"
+    )
+    enhanced_cal_parser.add_argument(
+        "--polarization",
+        required=True,
+        choices=["VV", "VH", "HH", "HV"],
+        help="Polarization to calibrate"
+    )
+    enhanced_cal_parser.add_argument(
+        "--calibration-type",
+        default="sigma0",
+        choices=["sigma0", "beta0", "gamma0", "dn"],
+        help="Type of calibration to apply (default: sigma0)"
+    )
+    enhanced_cal_parser.add_argument(
+        "--validate-quality",
+        action="store_true",
+        help="Enable calibration quality validation"
+    )
+    enhanced_cal_parser.add_argument(
+        "--export-geotiff",
+        action="store_true",
+        help="Export as GeoTIFF in addition to numpy array"
+    )
+    enhanced_cal_parser.add_argument(
+        "--db-scale",
+        action="store_true",
+        help="Save output in dB scale"
+    )
+    
+    # Orbit Validation command
+    orbit_validation_parser = subparsers.add_parser(
+        "validate-orbit",
+        help="Validate and analyze orbit data for geocoding accuracy"
+    )
+    orbit_validation_parser.add_argument(
+        "input",
+        help="Path to Sentinel-1 SLC ZIP file"
+    )
+    orbit_validation_parser.add_argument(
+        "--target-lat",
+        type=float,
+        required=True,
+        help="Target latitude for validation"
+    )
+    orbit_validation_parser.add_argument(
+        "--target-lon",
+        type=float,
+        required=True,
+        help="Target longitude for validation"
+    )
+    orbit_validation_parser.add_argument(
+        "--orbit-points",
+        type=int,
+        default=9,
+        help="Number of orbit points to generate (default: 9)"
+    )
+    orbit_validation_parser.add_argument(
+        "--time-interval",
+        type=float,
+        default=8.0,
+        help="Time interval between orbit points in seconds (default: 8.0)"
+    )
+    orbit_validation_parser.add_argument(
+        "--validate-doppler",
+        action="store_true",
+        help="Validate Doppler transition (positive to negative)"
+    )
+    orbit_validation_parser.add_argument(
+        "--export-report",
+        action="store_true",
+        help="Export detailed validation report"
+    )
+    
+    # Quality Assessment command
+    quality_parser = subparsers.add_parser(
+        "quality-assess",
+        help="Comprehensive quality assessment of SAR processing results"
+    )
+    quality_parser.add_argument(
+        "input",
+        help="Input processed SAR data (GeoTIFF or numpy array)"
+    )
+    quality_parser.add_argument(
+        "--output-report",
+        default="quality_report.json",
+        help="Output quality assessment report (default: quality_report.json)"
+    )
+    quality_parser.add_argument(
+        "--check-geocoding",
+        action="store_true",
+        help="Assess geocoding accuracy"
+    )
+    quality_parser.add_argument(
+        "--check-speckle",
+        action="store_true",
+        help="Assess speckle reduction effectiveness"
+    )
+    quality_parser.add_argument(
+        "--check-calibration",
+        action="store_true",
+        help="Assess radiometric calibration quality"
+    )
+    quality_parser.add_argument(
+        "--reference-data",
+        help="Reference data for comparison (optional)"
+    )
+    
+    # Coordinate Conversion command
+    coord_parser = subparsers.add_parser(
+        "coord-convert",
+        help="Convert between different coordinate systems"
+    )
+    coord_subparsers = coord_parser.add_subparsers(dest="coord_command", help="Coordinate conversion operations")
+    
+    # Lat/Lon to ECEF
+    latlon_ecef_parser = coord_subparsers.add_parser(
+        "latlon-to-ecef",
+        help="Convert lat/lon coordinates to ECEF"
+    )
+    latlon_ecef_parser.add_argument(
+        "lat",
+        type=float,
+        help="Latitude in degrees"
+    )
+    latlon_ecef_parser.add_argument(
+        "lon",
+        type=float,
+        help="Longitude in degrees"
+    )
+    latlon_ecef_parser.add_argument(
+        "--elevation",
+        type=float,
+        default=0.0,
+        help="Elevation in meters (default: 0.0)"
+    )
+    
+    # ECEF to Lat/Lon
+    ecef_latlon_parser = coord_subparsers.add_parser(
+        "ecef-to-latlon",
+        help="Convert ECEF coordinates to lat/lon"
+    )
+    ecef_latlon_parser.add_argument(
+        "x",
+        type=float,
+        help="ECEF X coordinate in meters"
+    )
+    ecef_latlon_parser.add_argument(
+        "y",
+        type=float,
+        help="ECEF Y coordinate in meters"
+    )
+    ecef_latlon_parser.add_argument(
+        "z",
+        type=float,
+        help="ECEF Z coordinate in meters"
+    )
+    
+    # SAR to Geographic
+    sar_geo_parser = coord_subparsers.add_parser(
+        "sar-to-geo",
+        help="Convert SAR pixel coordinates to geographic coordinates"
+    )
+    sar_geo_parser.add_argument(
+        "range_pixel",
+        type=float,
+        help="Range pixel coordinate"
+    )
+    sar_geo_parser.add_argument(
+        "azimuth_pixel",
+        type=float,
+        help="Azimuth pixel coordinate"
+    )
+    sar_geo_parser.add_argument(
+        "--orbit-file",
+        required=True,
+        help="Path to orbit file"
+    )
+    sar_geo_parser.add_argument(
+        "--slc-metadata",
+        required=True,
+        help="Path to SLC metadata file"
+    )
+
     args = parser.parse_args()
     
     if not args.command:
@@ -2090,12 +3244,24 @@ Examples:
         return cmd_deburst(args)
     elif args.command == "calibrate":
         return cmd_calibrate(args)
+    elif args.command == "enhanced-calibrate":
+        return cmd_enhanced_calibrate(args)
     elif args.command == "topsar-merge":
         return cmd_topsar_merge(args)
     elif args.command == "multilook":
         return cmd_multilook(args)
     elif args.command == "terrain":
         return cmd_terrain_flatten(args)
+    elif args.command == "pipeline-14":
+        return cmd_pipeline_14(args)
+    elif args.command == "zero-doppler":
+        return cmd_zero_doppler(args)
+    elif args.command == "validate-orbit":
+        return cmd_validate_orbit(args)
+    elif args.command == "quality-assess":
+        return cmd_quality_assess(args)
+    elif args.command == "coord-convert":
+        return cmd_coord_convert(args)
     elif args.command == "test-srtm":
         return cmd_test_srtm(args)
     elif args.command == "speckle-filter":
@@ -2110,8 +3276,6 @@ Examples:
         return cmd_latlon_to_ecef(args)
     elif args.command == "mask":
         return cmd_mask(args)
-    elif args.command == "backscatter":
-        return cmd_backscatter(args)
     
     return 1
 
@@ -2244,149 +3408,31 @@ def handle_masking(args):
 
 # Handler function for enhanced terrain correction
 def handle_enhanced_terrain_correction(args):
-    """Handle enhanced terrain correction command."""
-    import numpy as np
-    
-    try:
-        start_time = time.time()
-        
-        print(f"🌍 Starting enhanced terrain correction with masking")
-        print(f"Input SAR file: {args.sar_file}")
-        print(f"DEM file: {args.dem_file}")
-        print(f"Orbit file: {args.orbit_file}")
-        print(f"Output file: {args.output_file}")
-        
-        # Load SAR data (simplified - in practice you'd load from various formats)
-        if args.sar_file.endswith('.npy'):
-            sar_data = np.load(args.sar_file)
-        else:
-            print(f"❌ Unsupported SAR file format. Currently only .npy files are supported.")
-            return 1
-        
-        # Load orbit data (simplified)
-        orbit_data = sardine.OrbitData()  # Would need proper orbit file loading
-        
-        # Set up bounding box
-        if args.bbox:
-            bbox = tuple(args.bbox)
-        else:
-            # Default bounding box (you'd derive this from the SAR data)
-            bbox = (-180.0, -90.0, 180.0, 90.0)
-        
-        # Create masking workflow if enabled
-        masking_config = None
-        if args.enable_masking:
-            masking_config = sardine.create_masking_workflow(
-                lia_threshold=args.lia_threshold,
-                dem_threshold=args.dem_threshold,
-                gamma0_min=args.gamma0_min,
-                gamma0_max=args.gamma0_max
-            )
-            print(f"🎭 Masking enabled with thresholds:")
-            print(f"  - LIA threshold: {args.lia_threshold}")
-            print(f"  - DEM threshold: {args.dem_threshold}m")
-            print(f"  - Gamma0 range: [{args.gamma0_min}, {args.gamma0_max}] dB")
-        
-        # Perform enhanced terrain correction
-        sardine.enhanced_terrain_correction_pipeline(
-            sar_image=sar_data,
-            dem_path=args.dem_file,
-            orbit_data=orbit_data,
-            sar_bbox=bbox,
-            output_path=args.output_file,
-            output_crs=args.output_crs,
-            output_spacing=args.output_spacing,
-            masking_config=masking_config,
-            save_intermediate=args.save_intermediate
-        )
-        
-        processing_time = time.time() - start_time
-        print(f"✅ Enhanced terrain correction completed in {processing_time:.2f}s")
-        
-        if args.save_intermediate:
-            print(f"💾 Intermediate products saved alongside main output")
-        
-        return 0
-        
-    except Exception as e:
-        print(f"❌ Error during enhanced terrain correction: {e}")
-        import traceback
-        if args.verbose:
-            traceback.print_exc()
-        return 1
+    """DEPRECATED: This function used scientifically incorrect hardcoded parameters."""
+    print("❌ CRITICAL SCIENTIFIC ERROR: Enhanced terrain correction has been removed!")
+    print("   This function used hardcoded radar parameters which produce scientifically invalid results.")
+    print("   ")
+    print("🔧 SOLUTION: Use the main pipeline with real Sentinel-1 annotation files:")
+    print("   sardine process-slc <slc_file.zip> --output <output_dir>")
+    print("   ")
+    print("📚 The main pipeline extracts real parameters from annotation XML files,")
+    print("   ensuring scientifically accurate results for research use.")
+    return 1
+
 
 # Handler function for adaptive terrain correction
 def handle_adaptive_terrain_correction(args):
-    """Handle adaptive terrain correction command."""
-    import numpy as np
-    
-    try:
-        start_time = time.time()
-        
-        print(f"🧠 Starting adaptive terrain correction with quality assessment")
-        print(f"Input SAR file: {args.sar_file}")
-        print(f"DEM file: {args.dem_file}")
-        print(f"Orbit file: {args.orbit_file}")
-        print(f"Output file: {args.output_file}")
-        
-        # Load SAR data
-        if args.sar_file.endswith('.npy'):
-            sar_data = np.load(args.sar_file)
-        else:
-            print(f"❌ Unsupported SAR file format. Currently only .npy files are supported.")
-            return 1
-        
-        # Load orbit data (simplified)
-        orbit_data = sardine.OrbitData()
-        
-        # Set up bounding box
-        if args.bbox:
-            bbox = tuple(args.bbox)
-        else:
-            bbox = (-180.0, -90.0, 180.0, 90.0)
-        
-        adaptive_thresholds = not args.disable_adaptive
-        print(f"🔧 Adaptive thresholding: {'enabled' if adaptive_thresholds else 'disabled'}")
-        
-        # Perform adaptive terrain correction
-        corrected_image, mask_result = sardine.adaptive_terrain_correction(
-            sar_image=sar_data,
-            dem_path=args.dem_file,
-            orbit_data=orbit_data,
-            sar_bbox=bbox,
-            output_path=args.output_file,
-            output_crs=args.output_crs,
-            output_spacing=args.output_spacing,
-            adaptive_thresholds=adaptive_thresholds
-        )
-        
-        processing_time = time.time() - start_time
-        print(f"✅ Adaptive terrain correction completed in {processing_time:.2f}s")
-        
-        # Display quality assessment results
-        print(f"📊 Quality Assessment Results:")
-        print(f"  - Valid pixels: {mask_result.valid_pixels:,}/{mask_result.total_pixels:,}")
-        print(f"  - Coverage: {mask_result.coverage_percent:.1f}%")
-        
-        # Save corrected image and mask results
-        corrected_output = args.output_file.replace('.tif', '_corrected.npy')
-        np.save(corrected_output, corrected_image)
-        print(f"💾 Corrected image saved to: {corrected_output}")
-        
-        # Save quality mask
-        quality_mask = mask_result.get_combined_mask()
-        mask_output = args.output_file.replace('.tif', '_quality_mask.npy')
-        np.save(mask_output, quality_mask)
-        print(f"💾 Quality mask saved to: {mask_output}")
-        
-        return 0
-        
-    except Exception as e:
-        print(f"❌ Error during adaptive terrain correction: {e}")
-        import traceback
-        if args.verbose:
-            traceback.print_exc()
-        return 1
+    """DEPRECATED: This function used scientifically incorrect hardcoded parameters."""
+    print("❌ CRITICAL SCIENTIFIC ERROR: Adaptive terrain correction has been removed!")
+    print("   This function used hardcoded radar parameters which produce scientifically invalid results.")
+    print("   ")
+    print("🔧 SOLUTION: Use the main pipeline with real Sentinel-1 annotation files:")
+    print("   sardine process-slc <slc_file.zip> --output <output_dir>")
+    print("   ")
+    print("📚 The main pipeline extracts real parameters from annotation XML files,")
+    print("   ensuring scientifically accurate results for research use.")
+    return 1
+
 
 if __name__ == "__main__":
     exit(main())

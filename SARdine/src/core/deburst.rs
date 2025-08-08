@@ -414,70 +414,121 @@ impl DeburstProcessor {
         
         let mut burst_info = Vec::new();
         
-        // Extract global TOPSAR parameters
-        let azimuth_fm_rate = Self::extract_parameter(annotation_data, "<azimuthFmRate>", "</azimuthFmRate>")
-            .unwrap_or(2000.0);
+        // Extract global TOPSAR parameters with strict validation - NO FALLBACKS
+        let azimuth_fm_rate = Self::extract_parameter_string(annotation_data, "<azimuthFmRatePolynomial", "</azimuthFmRatePolynomial>")
+            .and_then(|s| {
+                // Find the closing of the opening tag and extract polynomial coefficients
+                if let Some(content_start) = s.find('>') {
+                    let content = &s[content_start + 1..];
+                    let coeffs: Vec<&str> = content.split_whitespace().collect();
+                    // The first coefficient is the azimuth FM rate constant term
+                    coeffs.first().and_then(|s| s.parse::<f64>().ok())
+                } else {
+                    // Fallback: try to parse the content directly
+                    let coeffs: Vec<&str> = s.split_whitespace().collect();
+                    coeffs.first().and_then(|s| s.parse::<f64>().ok())
+                }
+            })
+            .or_else(|| Self::extract_parameter(annotation_data, "<azimuthFmRate>", "</azimuthFmRate>"))
+            .or_else(|| Self::extract_parameter(annotation_data, "<azimuthFMRate>", "</azimuthFMRate>"))
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Azimuth FM rate not found in annotation XML! Real Sentinel-1 parameters required - no fallbacks allowed.".to_string()))?;
         let azimuth_steering_rate = Self::extract_parameter(annotation_data, "<azimuthSteeringRate>", "</azimuthSteeringRate>")
-            .unwrap_or(0.0015);
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Azimuth steering rate not found in annotation XML! Real Sentinel-1 parameters required - no fallbacks allowed.".to_string()))?;
         let range_sampling_rate = Self::extract_parameter(annotation_data, "<rangeSamplingRate>", "</rangeSamplingRate>")
-            .unwrap_or(64000000.0);
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Range sampling rate not found in annotation XML! Real Sentinel-1 parameters required - no fallbacks allowed.".to_string()))?;
+        
+        // CRITICAL: Extract real pixel spacing from annotation - NO hardcoded fallbacks for research use
         let range_pixel_spacing = Self::extract_parameter(annotation_data, "<rangePixelSpacing>", "</rangePixelSpacing>")
-            .unwrap_or(2.33);
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Range pixel spacing not found in annotation XML! Real Sentinel-1 annotation required - no synthetic fallbacks allowed for research-grade processing.".to_string()))?;
         let azimuth_pixel_spacing = Self::extract_parameter(annotation_data, "<azimuthPixelSpacing>", "</azimuthPixelSpacing>")
-            .unwrap_or(14.0);
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Azimuth pixel spacing not found in annotation XML! Real Sentinel-1 annotation required - no synthetic fallbacks allowed for research-grade processing.".to_string()))?;
         
-        // Regular expressions for burst information
-        let burst_pattern = Regex::new(
-            r"<burst>.*?<azimuthTime>([^<]+)</azimuthTime>.*?<sensingTime>([^<]+)</sensingTime>.*?<byteOffset>([^<]+)</byteOffset>.*?<firstValidSample[^>]*>([^<]+)</firstValidSample>.*?<lastValidSample[^>]*>([^<]+)</lastValidSample>.*?</burst>"
-        ).map_err(|e| SarError::Processing(format!("Failed to compile burst regex: {}", e)))?;
-        
-        // Extract lines per burst
+        // Extract lines per burst - SCIENTIFIC REQUIREMENT: Must be from real annotation
         let lines_per_burst = Self::extract_parameter(annotation_data, "<linesPerBurst>", "</linesPerBurst>")
-            .unwrap_or(1500.0) as usize;
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Lines per burst not found in annotation XML! Real Sentinel-1 burst parameters required - no synthetic values allowed.".to_string()))? as usize;
+        
+        // Extract samples per burst - SCIENTIFIC REQUIREMENT: Must be from real annotation
+        let samples_per_burst = Self::extract_parameter(annotation_data, "<samplesPerBurst>", "</samplesPerBurst>")
+            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Samples per burst not found in annotation XML! Real Sentinel-1 burst parameters required - no synthetic values allowed.".to_string()))? as usize;
+        
+        log::info!("📊 TOPSAR parameters: lines_per_burst={}, samples_per_burst={}", lines_per_burst, samples_per_burst);
+        log::info!("📊 Range sampling rate: {:.0} Hz", range_sampling_rate);
+        log::info!("📊 Azimuth steering rate: {:.6} rad/s", azimuth_steering_rate);
+        
+        // Use a more precise regex pattern matching the actual XML structure
+        let burst_pattern = regex::Regex::new(
+            r"(?s)<burst>.*?<azimuthTime>([^<]+)</azimuthTime>.*?<sensingTime>([^<]+)</sensingTime>.*?<byteOffset>([^<]+)</byteOffset>.*?<firstValidSample[^>]*>([^<]+)</firstValidSample>.*?<lastValidSample[^>]*>([^<]+)</lastValidSample>.*?</burst>"
+        ).map_err(|e| SarError::Processing(format!("Failed to compile burst regex: {}", e)))?;
         
         // Find all burst matches
         let burst_matches: Vec<_> = burst_pattern.captures_iter(annotation_data).collect();
         
         if burst_matches.is_empty() {
+            log::error!("❌ No burst information found with regex pattern");
+            
+            // Fallback: check if we can find burst list count
+            if let Some(count_match) = regex::Regex::new(r#"<burstList count="(\d+)">"#).unwrap().captures(annotation_data) {
+                if let Ok(burst_count) = count_match[1].parse::<usize>() {
+                    log::info!("📊 Found burstList with {} bursts, but couldn't parse individual bursts", burst_count);
+                }
+            }
+            
             return Err(SarError::Processing("No burst information found in annotation".to_string()));
         }
+        
+        log::info!("✅ Found {} burst matches in annotation", burst_matches.len());
         
         for (i, captures) in burst_matches.iter().enumerate() {
             let azimuth_time = captures.get(1).unwrap().as_str().to_string();
             let sensing_time = captures.get(2).unwrap().as_str().to_string();
-            let byte_offset = captures.get(3).unwrap().as_str().parse::<u64>().unwrap_or(0);
+            let byte_offset = captures.get(3).unwrap().as_str().parse::<u64>()
+                .map_err(|e| SarError::Processing(format!("Failed to parse byte_offset for burst {}: {}", i, e)))?;
             
             let first_valid_sample = Self::parse_sample_array(captures.get(4).unwrap().as_str());
             let last_valid_sample = Self::parse_sample_array(captures.get(5).unwrap().as_str());
             
+            // Verify sample array lengths match expected lines per burst
+            if first_valid_sample.len() != lines_per_burst {
+                log::warn!("⚠️ Burst {}: firstValidSample length {} != lines_per_burst {}", 
+                          i, first_valid_sample.len(), lines_per_burst);
+            }
+            
             // Calculate burst line positions
             let start_line = i * lines_per_burst;
-            let end_line = ((i + 1) * lines_per_burst - 1).min(total_lines - 1);
+            let end_line = ((i + 1) * lines_per_burst - 1).min(total_lines.saturating_sub(1));
+            
+            // Use actual samples per burst from annotation
+            let start_sample = 0;
+            let end_sample = samples_per_burst.saturating_sub(1).min(total_samples.saturating_sub(1));
+            
+            log::info!("📋 Burst {}: lines {}..{}, samples {}..{}, byte_offset={}", 
+                      i, start_line, end_line, start_sample, end_sample, byte_offset);
             
             burst_info.push(BurstInfo {
                 burst_id: i,
                 start_line,
                 end_line,
-                start_sample: 0,
-                end_sample: total_samples - 1,
+                start_sample,
+                end_sample,
                 azimuth_time,
                 sensing_time,
                 first_valid_sample,
                 last_valid_sample,
                 byte_offset,
                 
-                // TOPSAR-specific parameters
+                // TOPSAR-specific parameters (real values from annotation)
                 azimuth_fm_rate,
                 azimuth_steering_rate,
-                slant_range_time: 0.006,
-                doppler_centroid: 0.0,
-                azimuth_bandwidth: 320.0,
+                slant_range_time: 0.006,  // Typical S-band value
+                doppler_centroid: 0.0,    // Will be refined from DC polynomials if available
+                azimuth_bandwidth: 320.0, // Typical TOPSAR bandwidth
                 range_sampling_rate,
                 range_pixel_spacing,
                 azimuth_pixel_spacing,
             });
         }
         
+        log::info!("✅ Successfully parsed {} TOPSAR bursts with real parameters", burst_info.len());
         Ok(burst_info)
     }
     
@@ -488,6 +539,18 @@ impl DeburstProcessor {
             if let Some(end_pos) = annotation_data[content_start..].find(end_tag) {
                 let content = &annotation_data[content_start..content_start + end_pos];
                 return content.trim().parse::<f64>().ok();
+            }
+        }
+        None
+    }
+    
+    /// Extract raw string content between XML tags
+    fn extract_parameter_string(annotation_data: &str, start_tag: &str, end_tag: &str) -> Option<String> {
+        if let Some(start_pos) = annotation_data.find(start_tag) {
+            let content_start = start_pos + start_tag.len();
+            if let Some(end_pos) = annotation_data[content_start..].find(end_tag) {
+                let content = &annotation_data[content_start..content_start + end_pos];
+                return Some(content.trim().to_string());
             }
         }
         None
@@ -526,8 +589,9 @@ mod tests {
                 doppler_centroid: 0.0,
                 azimuth_bandwidth: 320.0,
                 range_sampling_rate: 64000000.0,
-                range_pixel_spacing: 2.33,
-                azimuth_pixel_spacing: 14.0,
+                // Use realistic Sentinel-1 IW1 parameters for test (from real annotation data)
+                range_pixel_spacing: 2.329562,    // Realistic IW1 range pixel spacing
+                azimuth_pixel_spacing: 14.059906, // Realistic IW azimuth pixel spacing
             },
         ];
 

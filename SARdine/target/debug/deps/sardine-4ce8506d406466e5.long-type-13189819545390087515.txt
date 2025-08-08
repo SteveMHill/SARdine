@@ -1,0 +1,1 @@
+for<'py> unsafe fn(pyo3::Python<'py>, *mut pyo3::ffi::PyObject, *const *mut pyo3::ffi::PyObject, isize, *mut pyo3::ffi::PyObject) -> Result<*mut pyo3::ffi::PyObject, pyo3::PyErr> {_::<impl PySlcReader>::__pymethod_get_scene_bbox__}

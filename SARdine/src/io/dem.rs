@@ -18,23 +18,21 @@ impl DemReader {
         log::debug!("Bounding box: {:?}", bbox);
         log::debug!("Target resolution: {} meters", target_resolution);
 
-        println!("DEBUG: read_dem called with path: {}", dem_path.as_ref().display());
-        println!("DEBUG: read_dem bounding box: {:?}", bbox);
+        // Debug output suppressed
 
         // Check if this is an SRTM .hgt file which needs special handling
         let is_hgt_file = dem_path.as_ref().extension()
             .map(|ext| ext.to_str().unwrap_or("").to_lowercase() == "hgt")
             .unwrap_or(false);
 
-        println!("DEBUG: File extension check: {:?}", dem_path.as_ref().extension());
-        println!("DEBUG: Is HGT file: {}", is_hgt_file);
+        // Debug output suppressed
 
         if is_hgt_file {
-            println!("DEBUG: Routing to SRTM HGT reader");
+            // Debug output suppressed
             return Self::read_srtm_hgt_file_safe(dem_path, Some(bbox)).map(|(dem, transform)| (dem, transform));
         }
 
-        println!("DEBUG: Routing to GDAL reader");
+        // Debug output suppressed
         
         // Open DEM file with GDAL (for GeoTIFF and other formats)
         let dataset = Dataset::open(dem_path.as_ref())?;
@@ -467,18 +465,15 @@ impl DemReader {
         
         // First, check for existing DEM files (much faster than downloading)
         log::info!("Checking for existing DEM files...");
-        println!("DEBUG: Checking for DEM files in: {}", srtm_cache_dir);
+        // Debug output suppressed
         let tile_files = match Self::find_existing_dem_files(&srtm_cache_dir, bbox) {
             Ok(files) if !files.is_empty() => {
                 log::info!("Found {} existing DEM files", files.len());
-                println!("DEBUG: Found {} DEM files", files.len());
-                for (i, file) in files.iter().enumerate() {
-                    println!("DEBUG: File {}: {}", i, file);
-                }
+                // Debug output suppressed
                 files
             },
             Ok(_files) => {
-                println!("DEBUG: find_existing_dem_files returned empty list");
+                // Debug output suppressed
                 log::info!("No existing DEM files found. Attempting to download SRTM tiles...");
                 // Only download if no existing files found
                 match Self::download_srtm_tiles(bbox, &srtm_cache_dir) {
@@ -491,7 +486,6 @@ impl DemReader {
                 }
             },
             Err(e) => {
-                println!("DEBUG: find_existing_dem_files failed: {}", e);
                 log::info!("No existing DEM files found. Attempting to download SRTM tiles...");
                 // Only download if no existing files found
                 match Self::download_srtm_tiles(bbox, &srtm_cache_dir) {
@@ -519,72 +513,53 @@ impl DemReader {
     fn find_existing_dem_files(cache_dir: &str, bbox: &BoundingBox) -> SarResult<Vec<String>> {
         let mut dem_files = Vec::new();
         
-        println!("DEBUG: find_existing_dem_files called with cache_dir: {}", cache_dir);
-        println!("DEBUG: Looking for files that overlap with bbox: {:?}", bbox);
+        // Debug output suppressed
+        // Debug output suppressed
         
         // Look in the main cache directory
-        println!("DEBUG: Checking main cache directory: {}", cache_dir);
         if let Ok(entries) = std::fs::read_dir(cache_dir) {
             let mut count = 0;
             for entry in entries.flatten() {
                 let path = entry.path();
                 count += 1;
-                println!("DEBUG: Found entry {}: {:?}", count, path);
                 if let Some(extension) = path.extension() {
                     if extension == "hgt" || extension == "tif" || extension == "tiff" {
                         // Check if this DEM file overlaps with the requested bbox
                         let path_str = path.to_string_lossy().to_string();
                         if Self::dem_file_overlaps_bbox(&path_str, bbox)? {
                             dem_files.push(path_str.clone());
-                            println!("DEBUG: Added overlapping DEM file: {}", path.display());
-                        } else {
-                            println!("DEBUG: Skipping non-overlapping DEM file: {}", path.display());
                         }
                     }
                 }
             }
-            println!("DEBUG: Checked {} entries in main cache directory", count);
-        } else {
-            println!("DEBUG: Failed to read main cache directory");
         }
         
         // Also look in the srtm_tiles subdirectory (common convention)
         let srtm_tiles_dir = format!("{}/srtm_tiles", cache_dir);
-        println!("DEBUG: Checking srtm_tiles subdirectory: {}", srtm_tiles_dir);
         if std::path::Path::new(&srtm_tiles_dir).exists() {
-            println!("DEBUG: srtm_tiles directory exists");
             if let Ok(entries) = std::fs::read_dir(&srtm_tiles_dir) {
                 let mut count = 0;
                 for entry in entries.flatten() {
                     let path = entry.path();
                     count += 1;
-                    println!("DEBUG: Found srtm entry {}: {:?}", count, path);
                     if let Some(extension) = path.extension() {
                         if extension == "hgt" || extension == "tif" || extension == "tiff" {
                             // Check if this DEM file overlaps with the requested bbox
                             let path_str = path.to_string_lossy().to_string();
                             if Self::dem_file_overlaps_bbox(&path_str, bbox)? {
                                 dem_files.push(path_str.clone());
-                                println!("DEBUG: Added overlapping SRTM DEM file: {}", path.display());
-                            } else {
-                                println!("DEBUG: Skipping non-overlapping SRTM DEM file: {}", path.display());
                             }
                         }
                     }
                 }
-                println!("DEBUG: Checked {} entries in srtm_tiles directory", count);
-            } else {
-                println!("DEBUG: Failed to read srtm_tiles directory");
             }
         } else {
-            println!("DEBUG: srtm_tiles directory does not exist");
+            // srtm_tiles directory does not exist
         }
         
         log::info!("Found {} overlapping DEM files in {} and subdirectories", dem_files.len(), cache_dir);
-        println!("DEBUG: Total overlapping DEM files found: {}", dem_files.len());
         for file in &dem_files {
             log::debug!("  Found DEM file: {}", file);
-            println!("DEBUG: Final file: {}", file);
         }
         
         Ok(dem_files)
@@ -598,12 +573,9 @@ impl DemReader {
                           file_bbox.min_lon < bbox.max_lon &&
                           file_bbox.max_lat > bbox.min_lat && 
                           file_bbox.min_lat < bbox.max_lat;
-            println!("DEBUG: File {} bbox {:?} overlaps with {:?}: {}", 
-                     dem_file_path, file_bbox, bbox, overlaps);
             Ok(overlaps)
         } else {
             // If we can't determine the bbox from filename, assume it might overlap
-            println!("DEBUG: Could not determine bbox for {}, assuming overlap", dem_file_path);
             Ok(true)
         }
     }
@@ -615,14 +587,11 @@ impl DemReader {
         target_resolution: f64,
     ) -> SarResult<(Array2<f32>, GeoTransform)> {
         log::info!("Creating DEM mosaic from {} tiles", tile_files.len());
-        println!("DEBUG: create_dem_mosaic called with {} files", tile_files.len());
-        for (i, file) in tile_files.iter().enumerate() {
-            println!("DEBUG: Tile file {}: {}", i, file);
-        }
+        // Debug output suppressed
         
         if tile_files.len() == 1 {
             // Single tile, just read and clip
-            println!("DEBUG: Single tile - calling read_dem on: {}", tile_files[0]);
+            // Debug output suppressed
             return Self::read_dem_safe(&tile_files[0], Some(bbox));
         }
         
@@ -638,20 +607,15 @@ impl DemReader {
         
         for tile_file in tile_files {
             log::debug!("Reading tile: {}", tile_file);
-            println!("DEBUG: Processing tile file: {}", tile_file);
             
             // Calculate the intersection of tile coverage with requested bbox
             let tile_bbox = match Self::get_tile_bbox_from_filename(tile_file) {
                 Ok(bbox) => bbox,
                 Err(e) => {
                     log::warn!("Failed to determine tile bbox for {}: {}", tile_file, e);
-                    println!("DEBUG: Failed to get tile bbox for {}: {}", tile_file, e);
                     continue;
                 }
             };
-            
-            println!("DEBUG: Tile bbox: {:?}", tile_bbox);
-            println!("DEBUG: Requested bbox: {:?}", bbox);
             
             // Check if tile overlaps with requested bbox
             let overlaps = tile_bbox.max_lon > bbox.min_lon && 
@@ -659,11 +623,8 @@ impl DemReader {
                           tile_bbox.max_lat > bbox.min_lat && 
                           tile_bbox.min_lat < bbox.max_lat;
             
-            println!("DEBUG: Tile overlaps with bbox: {}", overlaps);
-            
             if !overlaps {
                 log::debug!("Tile {} does not overlap with requested bbox, skipping", tile_file);
-                println!("DEBUG: Skipping non-overlapping tile: {}", tile_file);
                 continue;
             }
             
@@ -676,11 +637,9 @@ impl DemReader {
             };
             
             log::debug!("Reading tile {} with intersection bbox {:?}", tile_file, intersect_bbox);
-            println!("DEBUG: Reading tile with intersect bbox: {:?}", intersect_bbox);
             
             match Self::read_dem_safe(tile_file, Some(&intersect_bbox)) {
                 Ok((tile_dem, tile_transform)) => {
-                    println!("DEBUG: Successfully read DEM tile, shape: {:?}", tile_dem.dim());
                     let (tile_height, tile_width) = tile_dem.dim();
                     
                     // Calculate tile bounds from transform
@@ -689,9 +648,6 @@ impl DemReader {
                     let tile_min_lat = tile_transform.top_left_y + (tile_height as f64) * tile_transform.pixel_height;
                     let tile_max_lat = tile_transform.top_left_y;
                     
-                    println!("DEBUG: Tile bounds calculated: lon=[{}, {}], lat=[{}, {}]", 
-                             tile_min_lon, tile_max_lon, tile_min_lat, tile_max_lat);
-                    
                     // Update overall bounds
                     overall_min_lon = overall_min_lon.min(tile_min_lon);
                     overall_max_lon = overall_max_lon.max(tile_max_lon);
@@ -699,11 +655,9 @@ impl DemReader {
                     overall_max_lat = overall_max_lat.max(tile_max_lat);
                     
                     tile_data.push((tile_dem, tile_transform));
-                    println!("DEBUG: Added tile to tile_data, total tiles: {}", tile_data.len());
                     log::debug!("Successfully read tile {} with dimensions {}x{}", tile_file, tile_height, tile_width);
                 },
                 Err(e) => {
-                    println!("DEBUG: Failed to read tile {}: {}", tile_file, e);
                     log::warn!("Failed to read tile {}: {}", tile_file, e);
                     // Continue with other tiles
                 }
@@ -1598,25 +1552,25 @@ impl DemReader {
         hgt_path: P,
         bbox: Option<&BoundingBox>,
     ) -> SarResult<(Array2<f32>, GeoTransform)> {
-        println!("DEBUG: read_srtm_hgt_file_safe called with path: {}", hgt_path.as_ref().display());
+        // Debug output suppressed
         
         let filename = hgt_path.as_ref()
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| SarError::Processing("Invalid HGT filename".to_string()))?;
         
-        println!("DEBUG: Parsing HGT filename: {}", filename);
+        // Debug output suppressed
         
         // Parse coordinates from filename (e.g., "N50E010")
         let (lat, lon) = Self::parse_hgt_filename(filename)?;
-        println!("DEBUG: SRTM tile coordinates: lat={}, lon={}", lat, lon);
+        // Debug output suppressed
         
         // Read the raw HGT data
         let mut file = std::fs::File::open(&hgt_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         
-        println!("DEBUG: HGT file data read, size: {} bytes", buffer.len());
+        // Debug output suppressed
         
         // SRTM HGT files are 1201x1201 for 3-arc-second data (most common)
         let expected_size = 1201 * 1201 * 2; // 16-bit values
@@ -1668,7 +1622,7 @@ impl DemReader {
         let mut dem_array = Array2::from_shape_vec((safe_size, safe_size), elevation_data)
             .map_err(|e| SarError::Processing(format!("Failed to create DEM array: {}", e)))?;
         
-        println!("DEBUG: Created DEM array with shape: {:?}", dem_array.dim());
+        // Debug output suppressed
         
         // Fill voids
         Self::fill_dem_voids(&mut dem_array, -32768.0)?;
@@ -1691,7 +1645,6 @@ impl DemReader {
             return Ok((cropped_dem, cropped_transform));
         }
         
-        println!("DEBUG: Successfully read DEM tile, shape: {:?}", dem_array.dim());
         Ok((dem_array, transform))
     }
     
@@ -1737,7 +1690,7 @@ impl DemReader {
             pixel_height: transform.pixel_height,
         };
         
-        println!("DEBUG: Cropped DEM from {}x{} to {}x{}", height, width, crop_height, crop_width);
+        // Debug output suppressed
         
         Ok((cropped, cropped_transform))
     }
@@ -1908,7 +1861,7 @@ impl DemReader {
                 let lat_rad = lat.to_radians();
                 let lon_rad = lon.to_radians();
                 
-                let a = 6378137.0; // WGS84 semi-major axis
+                let a = crate::constants::geodetic::WGS84_SEMI_MAJOR_AXIS_M; // WGS84 semi-major axis
                 let e2 = 0.00669437999014; // WGS84 first eccentricity squared
                 
                 let n = a / (1.0 - e2 * lat_rad.sin().powi(2)).sqrt();
@@ -2132,7 +2085,7 @@ impl DemReader {
 
     /// Convert ECEF coordinates to WGS84 longitude/latitude
     fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64) {
-        let a = 6378137.0;  // WGS84 semi-major axis
+        let a = crate::constants::geodetic::WGS84_SEMI_MAJOR_AXIS_M;  // WGS84 semi-major axis
         let f = 1.0 / 298.257223563;  // WGS84 flattening
         let e_sq = 2.0 * f - f * f;  // First eccentricity squared
         
