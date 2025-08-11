@@ -1455,10 +1455,13 @@ def cmd_backscatter(args):
             'geocode': not args.no_geocode,
             'resolution': resolution,
             'quality_report': not args.no_quality_report,
-            'use_real_orbit': not getattr(args, 'allow_synthetic', False),  # Scientific mode unless synthetic allowed
-            'allow_synthetic': getattr(args, 'allow_synthetic', False),  # Control synthetic fallbacks
             'orbit_dir': getattr(args, 'orbit_dir', None),
-            'scientific_validation': True  # Always enable scientific validation
+            'scientific_validation': True,  # Always enable scientific validation
+            # Parallel processing options
+            'parallel': getattr(args, 'parallel', True) and not getattr(args, 'sequential', False),
+            'num_threads': getattr(args, 'num_threads', None),
+            'sequential': getattr(args, 'sequential', False),
+            'chunk_size': getattr(args, 'chunk_size', 1024)
         }
         
         print(f"🔬 Scientific Processing Parameters:")
@@ -1469,11 +1472,19 @@ def cmd_backscatter(args):
         print(f"   🗺️  Geocoding: {'enabled' if options['geocode'] else 'disabled'}")
         print(f"   📏 Resolution: {options['resolution']} m")
         
-        if options['allow_synthetic']:
-            print(f"   ⚠️  Mode: DEMONSTRATION (synthetic fallbacks allowed)")
+        # Parallel processing status
+        if options['sequential']:
+            print(f"   🔄 Processing mode: SEQUENTIAL (single-threaded)")
+        elif options['parallel']:
+            if options['num_threads']:
+                print(f"   🚀 Processing mode: PARALLEL ({options['num_threads']} threads)")
+            else:
+                print(f"   🚀 Processing mode: PARALLEL (auto-detect cores)")
+            print(f"   📊 Chunk size: {options['chunk_size']}")
         else:
-            print(f"   🛰️  Mode: SCIENTIFIC (real data only)")
+            print(f"   🔄 Processing mode: SEQUENTIAL (parallel disabled)")
         
+        print(f"   🛰️  Mode: SCIENTIFIC (real data only)")
         print(f"   🔬 Scientific validation: ENABLED")
         
         if options['orbit_dir']:
@@ -2300,16 +2311,22 @@ This command enforces scientific data quality by:
 - Performing accurate terrain correction with DEM data
 - Generating quality assessment reports
 
-❌ SYNTHETIC DATA WARNINGS:
-If real orbit files are not available, processing will fail to ensure
-research integrity. Use --allow-synthetic for demonstration only.
+❌ SCIENTIFIC DATA INTEGRITY:
+Real orbit files are required for all processing to ensure
+research integrity. No synthetic data fallbacks are allowed.
 
 Examples:
-  # Basic processing with VV polarization (RESEARCH GRADE)
+  # Basic processing with VV polarization (RESEARCH GRADE + PARALLEL)
   sardine backscatter S1A_*.zip ./output/
 
-  # VH polarization with custom parameters
+  # VH polarization with custom parameters and parallel processing
   sardine backscatter S1A_*.zip ./output/ --polarization VH --speckle-filter lee --multilook 3 3
+
+  # High-performance parallel processing with 8 threads
+  sardine backscatter S1A_*.zip ./output/ --num-threads 8 --chunk-size 2048
+
+  # Sequential processing for debugging or limited resources
+  sardine backscatter S1A_*.zip ./output/ --sequential
 
   # Quick processing without geocoding (faster, still scientific)
   sardine backscatter S1A_*.zip ./output/ --no-geocode --no-terrain-flatten
@@ -2384,12 +2401,31 @@ Examples:
         help="Skip quality report generation"
     )
     
-    # Scientific data quality flags
+    # Parallel processing controls
     backscatter_parser.add_argument(
-        "--allow-synthetic", 
+        "--parallel", 
         action="store_true",
-        help="⚠️  Allow synthetic data for DEMONSTRATION ONLY (not suitable for research)"
+        default=True,
+        help="Enable parallel processing using all CPU cores (default: True)"
     )
+    backscatter_parser.add_argument(
+        "--num-threads", "-j",
+        type=int,
+        help="Number of threads for parallel processing (default: auto-detect)"
+    )
+    backscatter_parser.add_argument(
+        "--sequential", 
+        action="store_true",
+        help="Force sequential processing (disable parallelization)"
+    )
+    backscatter_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1024,
+        help="Chunk size for parallel processing (default: 1024)"
+    )
+    
+    # Scientific data quality flags
     backscatter_parser.add_argument(
         "--orbit-dir",
         help="Directory containing .EOF orbit files (required for scientific processing)"

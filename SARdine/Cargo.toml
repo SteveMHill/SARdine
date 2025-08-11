@@ -23,6 +23,9 @@ ndarray = { version = "0.15", features = ["rayon"] }
 num-complex = "0.4"
 num-traits = "0.2"
 
+# Performance optimizations
+num_cpus = "1.0"          # Better thread detection
+
 # I/O and data handling
 gdal = { version = "0.16", features = ["array"] }
 gdal-sys = "0.9"  # For VSI memory filesystem operations
@@ -67,6 +70,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+# Enable target-specific optimizations
+target-cpu = "native"
 
 [profile.dev]
 opt-level = 1

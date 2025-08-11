@@ -1,39 +1,21 @@
 //! Scientific Constants Module
 //! 
-//! Contains only universally accepted physical and geodetic constants
+//! Contains universally accepted physical, geodetic, and mission-specific constants
 //! with full literature references for scientific reproducibility.
-//!
-//! IMPORTANT: Sensor-specific parameters (wavelength, pixel spacing, etc.)
-//! MUST be extracted from annotation XML files - NOT defined here!
 
-/// Physical Constants
-/// Reference: NIST/CODATA 2018 values
-pub mod physical {
-    /// Speed of light in vacuum (exact, by definition)
-    /// Reference: SI base unit definition
-    pub const SPEED_OF_LIGHT_M_S: f64 = 299_792_458.0;
-}
+/// Physical constants (CODATA 2018)
+pub mod physical;
 
-/// Geodetic Constants  
-/// Reference: WGS84 (World Geodetic System 1984)
-pub mod geodetic {
-    /// WGS84 Earth semi-major axis (meters)
-    /// Reference: NIMA TR8350.2, Department of Defense World Geodetic System 1984
-    pub const WGS84_SEMI_MAJOR_AXIS_M: f64 = 6_378_137.0;
-    
-    /// WGS84 Earth flattening factor
-    /// Reference: WGS84 definition
-    pub const WGS84_FLATTENING: f64 = 1.0 / 298.257223563;
-}
+/// Sentinel-1 mission-specific constants
+pub mod sentinel1;
 
-/// Mathematical Constants
-pub mod math {
-    /// Pi (high precision)
-    pub const PI: f64 = std::f64::consts::PI;
-    
-    /// 2 * Pi
-    pub const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
-}
+// Re-export commonly used constants for convenience
+pub use physical::{SPEED_OF_LIGHT_M_S, EARTH_EQUATORIAL_RADIUS_M, EARTH_MEAN_RADIUS_M};
+pub use physical::geodetic;  // Re-export geodetic module for backward compatibility
+pub use sentinel1::{
+    orbital::NOMINAL_ORBIT_HEIGHT_M,
+    radar::{CENTER_FREQUENCY_HZ, RANGE_SAMPLING_RATE_HZ},
+};
 
 #[cfg(test)]
 mod tests {
