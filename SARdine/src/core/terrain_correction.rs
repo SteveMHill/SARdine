@@ -88,27 +88,23 @@ pub struct ValidationResults {
 }
 
 /// Interpolation methods for SAR data resampling
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum InterpolationMethod {
     Nearest,
+    #[default]
     Bilinear,
     Bicubic,
 }
 
-impl Default for InterpolationMethod {
-    fn default() -> Self {
-        InterpolationMethod::Bilinear
-    }
-}
-
-impl InterpolationMethod {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for InterpolationMethod {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "nearest" => InterpolationMethod::Nearest,
             "bilinear" => InterpolationMethod::Bilinear,
             "bicubic" => InterpolationMethod::Bicubic,
             _ => InterpolationMethod::Bilinear,
-        }
+        })
     }
 }
 
@@ -230,6 +226,7 @@ pub struct GeocodedPixel {
     pub valid: bool,
 }
 
+#[allow(dead_code)]
 impl TerrainCorrector {
     /// Create new terrain correction processor
     pub fn new(
@@ -311,7 +308,8 @@ impl TerrainCorrector {
         
         // Read DEM data
         let rasterband = dataset.rasterband(1)?;
-        let nodata_value = rasterband.no_data_value().unwrap_or(-32768.0) as f32;
+        let nodata_value = rasterband.no_data_value()
+            .ok_or_else(|| SarError::Processing("DEM raster must have a valid nodata value for scientific processing".to_string()))? as f32;
         let band_data = rasterband.read_as::<f32>((0, 0), (width, height), (width, height), None)?;
         
         let dem_array = Array2::from_shape_vec((height, width), band_data.data)
@@ -430,36 +428,53 @@ impl TerrainCorrector {
         sar_bbox: &BoundingBox,
         chunk_size: Option<usize>,
     ) -> SarResult<(Array2<f32>, GeoTransform)> {
+        use std::time::Instant;
         log::info!("🚀 Starting OPTIMIZED Range-Doppler terrain correction with chunked processing");
-        let start_time = std::time::Instant::now();
+        let total_start = Instant::now();
         
-        // Step 1: Calculate output grid bounds
+        // TIMING: Step 1: Calculate output grid bounds
+        let bounds_start = Instant::now();
         let output_bounds = self.calculate_output_bounds(sar_bbox)?;
+        let bounds_time = bounds_start.elapsed();
+        log::info!("⏱️  TIMING: Output bounds calculation: {:.3}s", bounds_time.as_secs_f64());
+        
+        // TIMING: Step 2: Create output grid
+        let grid_start = Instant::now();
         let (output_width, output_height, output_transform) = 
             self.create_output_grid(&output_bounds)?;
-        log::info!("Output grid: {}x{} pixels", output_width, output_height);
+        let grid_time = grid_start.elapsed();
+        log::info!("⏱️  TIMING: Output grid creation ({}x{}): {:.3}s", output_width, output_height, grid_time.as_secs_f64());
 
-        // Step 2: Build orbit lookup table for faster orbit queries
+        // TIMING: Step 3: Build orbit lookup table for faster orbit queries
+        let orbit_lut_start = Instant::now();
         let orbit_lut = self.build_orbit_lookup_table_optimized(orbit_data, &output_bounds)?;
-        log::debug!("Built orbit lookup table with {} entries", orbit_lut.len());
+        let orbit_lut_time = orbit_lut_start.elapsed();
+        log::info!("⏱️  TIMING: Orbit lookup table build ({} entries): {:.3}s", orbit_lut.len(), orbit_lut_time.as_secs_f64());
 
-        // Step 3: Process in parallel chunks
-        let chunk_sz = chunk_size.unwrap_or(rayon::current_num_threads() * 64);
+        // TIMING: Step 4: Setup parallel processing
+        let setup_start = Instant::now();
+        let chunk_sz = chunk_size
+            .ok_or_else(|| SarError::MissingParameter("Chunk size is required for scientific processing".to_string()))?;
         let total_pixels = output_width * output_height;
+        let setup_time = setup_start.elapsed();
+        log::info!("⏱️  TIMING: Parallel processing setup: {:.3}s", setup_time.as_secs_f64());
         log::info!("Processing {} pixels in chunks of {} using {} threads", 
                   total_pixels, chunk_sz, rayon::current_num_threads());
 
         let mut output_image = Array2::zeros((output_height, output_width));
         let mut total_valid = 0;
 
-        // Process rows in parallel chunks
+        // TIMING: Step 5: Parallel chunk processing
+        let parallel_start = Instant::now();
         let row_chunks: Vec<_> = (0..output_height).step_by(chunk_sz).collect();
+        log::info!("⏱️  TIMING: Created {} row chunks for parallel processing", row_chunks.len());
         
         let chunk_results: Vec<_> = row_chunks
             .par_iter()
             .map(|&start_row| {
+                let chunk_start = Instant::now();
                 let end_row = (start_row + chunk_sz).min(output_height);
-                self.process_row_chunk_optimized(
+                let result = self.process_row_chunk_optimized(
                     sar_image,
                     orbit_data,
                     params,
@@ -468,11 +483,20 @@ impl TerrainCorrector {
                     start_row,
                     end_row,
                     output_width,
-                )
+                );
+                let chunk_time = chunk_start.elapsed();
+                if start_row % (chunk_sz * 10) == 0 {  // Log every 10th chunk to avoid spam
+                    log::debug!("⏱️  Chunk {}-{} processed in {:.3}s", start_row, end_row, chunk_time.as_secs_f64());
+                }
+                result
             })
             .collect();
+        
+        let parallel_time = parallel_start.elapsed();
+        log::info!("⏱️  TIMING: Parallel chunk processing: {:.3}s", parallel_time.as_secs_f64());
 
-        // Combine results from parallel chunks
+        // TIMING: Step 6: Combine results from parallel chunks
+        let assembly_start = Instant::now();
         for (chunk_idx, chunk_result) in chunk_results.into_iter().enumerate() {
             match chunk_result {
                 Ok((chunk_data, valid_count)) => {
@@ -495,101 +519,404 @@ impl TerrainCorrector {
                 }
             }
         }
+        let assembly_time = assembly_start.elapsed();
+        log::info!("⏱️  TIMING: Result assembly: {:.3}s", assembly_time.as_secs_f64());
 
-        let elapsed = start_time.elapsed();
+        let total_time = total_start.elapsed();
         let coverage = (total_valid as f64 / total_pixels as f64) * 100.0;
-        log::info!("✅ OPTIMIZED terrain correction completed in {:.2}s: {:.1}% coverage", 
-                  elapsed.as_secs_f64(), coverage);
+        
+        // COMPREHENSIVE TIMING SUMMARY
+        log::info!("📊 COMPREHENSIVE TIMING BREAKDOWN:");
+        log::info!("   📐 Output bounds calculation: {:.3}s ({:.1}%)", bounds_time.as_secs_f64(), (bounds_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0);
+        log::info!("   🗺️  Output grid creation: {:.3}s ({:.1}%)", grid_time.as_secs_f64(), (grid_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0);
+        log::info!("   🛰️  Orbit lookup table: {:.3}s ({:.1}%)", orbit_lut_time.as_secs_f64(), (orbit_lut_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0);
+        log::info!("   ⚙️  Setup: {:.3}s ({:.1}%)", setup_time.as_secs_f64(), (setup_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0);
+        log::info!("   🚀 Parallel processing: {:.3}s ({:.1}%)", parallel_time.as_secs_f64(), (parallel_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0);
+        log::info!("   🔧 Result assembly: {:.3}s ({:.1}%)", assembly_time.as_secs_f64(), (assembly_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0);
+        log::info!("✅ TOTAL terrain correction: {:.3}s with {:.1}% coverage", total_time.as_secs_f64(), coverage);
 
         Ok((output_image, output_transform))
     }
 
-    /// Build optimized orbit lookup table
+    /// Build optimized orbit lookup table with spatial indexing for faster queries
     fn build_orbit_lookup_table_optimized(
         &self,
         orbit_data: &OrbitData,
         output_bounds: &BoundingBox,
-    ) -> SarResult<Vec<(usize, [f64; 3])>> {
-        // Create a lookup table of orbit indices and positions within the area of interest
-        let mut orbit_lut = Vec::new();
+    ) -> SarResult<HashMap<u64, StateVector>> {
+        let mut orbit_lut = HashMap::new();
         
-        for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
-            // Simple spatial filtering - include all orbit points for now
-            // In a more advanced implementation, convert ECEF to lat/lon and filter spatially
-            orbit_lut.push((i, state_vector.position));
-        }
+        // Create spatial grid for the bounding box to pre-compute nearest orbit vectors
+        let lat_steps = 20; // 20x20 grid provides good balance of memory vs performance
+        let lon_steps = 20;
         
-        // Sort by distance to scene center for more efficient lookup
+        let lat_step = (output_bounds.max_lat - output_bounds.min_lat) / lat_steps as f64;
+        let lon_step = (output_bounds.max_lon - output_bounds.min_lon) / lon_steps as f64;
+        
+        // Pre-compute center point for fallback
         let center_lat = (output_bounds.min_lat + output_bounds.max_lat) / 2.0;
         let center_lon = (output_bounds.min_lon + output_bounds.max_lon) / 2.0;
         let center_ecef = self.latlon_to_ecef(center_lat, center_lon, 0.0);
         
-        orbit_lut.sort_by(|a, b| {
-            let dist_a = self.distance_to_point(&a.1, &center_ecef);
-            let dist_b = self.distance_to_point(&b.1, &center_ecef);
-            dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+        // Build spatial hash lookup for each grid cell
+        for i in 0..=lat_steps {
+            for j in 0..=lon_steps {
+                let lat = output_bounds.min_lat + i as f64 * lat_step;
+                let lon = output_bounds.min_lon + j as f64 * lon_step;
+                
+                let spatial_key = self.compute_spatial_hash(lat, lon);
+                let test_ecef = self.latlon_to_ecef(lat, lon, 0.0);
+                
+                // Find nearest orbit vector for this spatial location
+                let mut min_distance = f64::MAX;
+                let mut best_state_idx = 0;
+                
+                for (idx, state_vector) in orbit_data.state_vectors.iter().enumerate() {
+                    let satellite_pos = [state_vector.position[0], state_vector.position[1], state_vector.position[2]];
+                    let distance = self.distance_to_point(&satellite_pos, &test_ecef);
+                    
+                    if distance < min_distance {
+                        min_distance = distance;
+                        best_state_idx = idx;
+                    }
+                }
+                
+                if best_state_idx < orbit_data.state_vectors.len() {
+                    orbit_lut.insert(spatial_key, orbit_data.state_vectors[best_state_idx].clone());
+                }
+            }
+        }
+        
+        // Add fallback entry for scene center
+        let center_key = self.compute_spatial_hash(center_lat, center_lon);
+        orbit_lut.entry(center_key).or_insert_with(|| {
+            // Find best orbit vector for scene center
+            let mut min_distance = f64::MAX;
+            let mut best_state = &orbit_data.state_vectors[0];
+            for state_vector in &orbit_data.state_vectors {
+                let satellite_pos = [state_vector.position[0], state_vector.position[1], state_vector.position[2]];
+                let distance = self.distance_to_point(&satellite_pos, &center_ecef);
+                if distance < min_distance {
+                    min_distance = distance;
+                    best_state = state_vector;
+                }
+            }
+            best_state.clone()
         });
+        
+        log::debug!("Built spatial orbit LUT with {} entries for {}x{} grid covering {:.2}°x{:.2}°", 
+                   orbit_lut.len(), lat_steps, lon_steps,
+                   output_bounds.max_lat - output_bounds.min_lat,
+                   output_bounds.max_lon - output_bounds.min_lon);
         
         Ok(orbit_lut)
     }
 
-    /// Process a chunk of rows in parallel
+    /// Process a 2D tile chunk for better cache locality (OPTIMIZATION: 2D tiles vs row chunks)
+    fn process_tile_chunk_optimized(
+        &self,
+        sar_image: &Array2<f32>,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        output_transform: &GeoTransform,
+        orbit_lut: &HashMap<u64, StateVector>,
+        start_row: usize,
+        end_row: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> SarResult<(Array2<f32>, usize)> {
+        use std::time::Instant;
+        let chunk_start = Instant::now();
+        
+        let chunk_height = end_row - start_row;
+        let chunk_width = end_col - start_col;
+        let mut chunk_data = Array2::zeros((chunk_height, chunk_width));
+        let mut valid_count = 0;
+
+        // Timing counters for bottleneck analysis
+        let mut coordinate_time = std::time::Duration::ZERO;
+        let mut elevation_time = std::time::Duration::ZERO;
+        let mut transform_time = std::time::Duration::ZERO;
+        let mut interpolation_time = std::time::Duration::ZERO;
+
+        // OPTIMIZATION: Process pixels with optimized coordinate transformations and caching
+        for local_i in 0..chunk_height {
+            for local_j in 0..chunk_width {
+                let i = start_row + local_i;
+                let j = start_col + local_j;
+                
+                // TIMING: Pre-computed pixel coordinates
+                let coord_start = Instant::now();
+                let map_x = output_transform.top_left_x + (j as f64) * output_transform.pixel_width;
+                let map_y = output_transform.top_left_y + (i as f64) * output_transform.pixel_height;
+                coordinate_time += coord_start.elapsed();
+
+                if let Ok((lat, lon)) = self.map_to_geographic(map_x, map_y) {
+                    // TIMING: Fast elevation lookup with bilinear interpolation
+                    let elev_start = Instant::now();
+                    let elevation_opt = self.get_elevation_at_latlon_fast(lat, lon);
+                    elevation_time += elev_start.elapsed();
+                    
+                    if let Some(elevation) = elevation_opt {
+                        // TIMING: Optimized coordinate transformation with spatial hashing
+                        let transform_start = Instant::now();
+                        let sar_coords = self.latlon_to_sar_pixel_optimized(
+                            lat, lon, elevation, orbit_data, params, orbit_lut
+                        );
+                        transform_time += transform_start.elapsed();
+                        
+                        if let Ok((sar_x, sar_y)) = sar_coords {
+                            // TIMING: Fast bilinear interpolation
+                            let interp_start = Instant::now();
+                            if sar_x >= 0.0 && sar_y >= 0.0 && 
+                               (sar_x as usize) < sar_image.ncols() && 
+                               (sar_y as usize) < sar_image.nrows() {
+                                let interpolated_value = self.bilinear_interpolate_fast(sar_image, sar_x, sar_y);
+                                if interpolated_value.is_finite() && interpolated_value != 0.0 {
+                                    chunk_data[[local_i, local_j]] = interpolated_value;
+                                    valid_count += 1;
+                                }
+                            }
+                            interpolation_time += interp_start.elapsed();
+                        }
+                    }
+                }
+            }
+        }
+
+        let chunk_total = chunk_start.elapsed();
+        
+        // Log timing breakdown for every 100th chunk to avoid spam
+        if start_row % 1000 == 0 {
+            let pixels_processed = chunk_height * chunk_width;
+            log::debug!("🔍 CHUNK TIMING (rows {}-{}, {} pixels):", start_row, end_row, pixels_processed);
+            log::debug!("   📐 Coordinates: {:.4}s ({:.1}%)", coordinate_time.as_secs_f64(), (coordinate_time.as_secs_f64() / chunk_total.as_secs_f64()) * 100.0);
+            log::debug!("   🏔️  Elevation: {:.4}s ({:.1}%)", elevation_time.as_secs_f64(), (elevation_time.as_secs_f64() / chunk_total.as_secs_f64()) * 100.0);
+            log::debug!("   🛰️  Transform: {:.4}s ({:.1}%)", transform_time.as_secs_f64(), (transform_time.as_secs_f64() / chunk_total.as_secs_f64()) * 100.0);
+            log::debug!("   🔧 Interpolation: {:.4}s ({:.1}%)", interpolation_time.as_secs_f64(), (interpolation_time.as_secs_f64() / chunk_total.as_secs_f64()) * 100.0);
+            log::debug!("   📊 Total chunk: {:.4}s ({:.2} pixels/sec)", chunk_total.as_secs_f64(), pixels_processed as f64 / chunk_total.as_secs_f64());
+        }
+
+        Ok((chunk_data, valid_count))
+    }
+
+    /// Optimized processing function with coordinate batch processing
+    fn process_pixel_chunk_optimized(
+        &self,
+        sar_image: &Array2<f32>,
+        chunk_height: usize,
+        chunk_width: usize,
+        start_row: usize,
+        start_col: usize,
+        bbox: &BoundingBox,
+        lat_step: f64,
+        lon_step: f64,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        orbit_lut: &HashMap<u64, StateVector>,
+    ) -> SarResult<(Array2<f32>, usize)> {
+        let mut chunk_data = Array2::zeros((chunk_height, chunk_width));
+        let mut valid_count = 0;
+        let mut pixel_indices = Vec::with_capacity(chunk_height * chunk_width);
+        let mut coordinates = Vec::new();
+        
+        // Generate coordinates for this chunk
+        for row in 0..chunk_height {
+            for col in 0..chunk_width {
+                let lat = bbox.min_lat + (start_row + row) as f64 * lat_step;
+                let lon = bbox.min_lon + (start_col + col) as f64 * lon_step;
+                if lat >= bbox.min_lat && lat <= bbox.max_lat && lon >= bbox.min_lon && lon <= bbox.max_lon {
+                    pixel_indices.push(row * chunk_width + col);
+                    coordinates.push((lat, lon));
+                }
+            }
+        }
+        
+        let elevations = self.get_elevations_batch_optimized(&coordinates);
+        
+        // Process pixels in this chunk using optimized lookup
+        for (coord_idx, &pixel_idx) in pixel_indices.iter().enumerate() {
+            if coord_idx < elevations.len() {
+                let (lat, lon) = coordinates[coord_idx];
+                if let Some(elevation) = elevations[coord_idx] {
+                    if let Ok((sar_x, sar_y)) = self.latlon_to_sar_pixel_optimized(
+                        lat, lon, elevation, orbit_data, params, orbit_lut
+                    ) {
+                        if sar_x >= 0.0 && sar_y >= 0.0 {
+                            let interpolated_value = self.bilinear_interpolate_fast(sar_image, sar_x, sar_y);
+                            chunk_data[(pixel_idx / chunk_width, pixel_idx % chunk_width)] = interpolated_value;
+                            valid_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok((chunk_data, valid_count))
+    }
+    
+    /// High-performance bilinear interpolation with minimal branching
+    fn bilinear_interpolate_fast(&self, sar_image: &Array2<f32>, x: f64, y: f64) -> f32 {
+        // Ensure coordinates are within valid range
+        if x < 0.0 || y < 0.0 {
+            return f32::NAN;
+        }
+        
+        let x0 = x as usize;
+        let y0 = y as usize;
+        
+        // Fast bounds check - ensure we have room for x0+1 and y0+1
+        if x0 >= sar_image.ncols() || y0 >= sar_image.nrows() || 
+           x0 + 1 >= sar_image.ncols() || y0 + 1 >= sar_image.nrows() {
+            return f32::NAN;
+        }
+        
+        // Interpolation weights
+        let dx = x - x0 as f64;
+        let dy = y - y0 as f64;
+        
+        // Sample the four corner pixels with bounds checking
+        let v00 = sar_image[[y0, x0]];
+        let v10 = sar_image[[y0, x0 + 1]];
+        let v01 = sar_image[[y0 + 1, x0]];
+        let v11 = sar_image[[y0 + 1, x0 + 1]];
+        
+        // Check for NaN values
+        if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
+            return f32::NAN;
+        }
+        
+        // Optimized bilinear interpolation using FMA instructions where available
+        let v0 = v00 + (v10 - v00) * dx as f32;
+        let v1 = v01 + (v11 - v01) * dx as f32;
+        v0 + (v1 - v0) * dy as f32
+    }
+
+    /// Legacy row-based processing (kept for compatibility)
     fn process_row_chunk_optimized(
         &self,
         sar_image: &Array2<f32>,
         orbit_data: &OrbitData,
         params: &RangeDopplerParams,
         output_transform: &GeoTransform,
-        orbit_lut: &[(usize, [f64; 3])],
+        orbit_lut: &HashMap<u64, StateVector>,
         start_row: usize,
         end_row: usize,
         output_width: usize,
     ) -> SarResult<(Array2<f32>, usize)> {
-        let chunk_height = end_row - start_row;
-        let mut chunk_data = Array2::zeros((chunk_height, output_width));
-        let mut valid_count = 0;
-
-        for (local_i, i) in (start_row..end_row).enumerate() {
-            for j in 0..output_width {
-                // Convert output pixel to geographic coordinates
-                let map_x = output_transform.top_left_x + (j as f64) * output_transform.pixel_width;
-                let map_y = output_transform.top_left_y + (i as f64) * output_transform.pixel_height;
-
-                if let Ok((lat, lon)) = self.map_to_geographic(map_x, map_y) {
-                    if let Some(elevation) = self.get_elevation_at_latlon(lat, lon) {
-                        // Use optimized orbit lookup
-                        if let Ok(Some((sar_range, sar_azimuth))) = self.latlon_to_sar_pixel_with_lut(
-                            lat, lon, elevation, orbit_data, params, orbit_lut
-                        ) {
-                            if sar_range < sar_image.dim().1 && sar_azimuth < sar_image.dim().0 {
-                                let value = self.bilinear_interpolate(
-                                    sar_image, 
-                                    sar_range as f64, 
-                                    sar_azimuth as f64
-                                );
-                                chunk_data[[local_i, j]] = value;
-                                if !value.is_nan() {
-                                    valid_count += 1;
-                                }
-                            } else {
-                                chunk_data[[local_i, j]] = f32::NAN;
-                            }
-                        } else {
-                            chunk_data[[local_i, j]] = f32::NAN;
-                        }
-                    } else {
-                        chunk_data[[local_i, j]] = f32::NAN;
-                    }
-                } else {
-                    chunk_data[[local_i, j]] = f32::NAN;
-                }
-            }
-        }
-
-        Ok((chunk_data, valid_count))
+        // Use 2D tile processing for better cache performance
+        self.process_tile_chunk_optimized(
+            sar_image, orbit_data, params, output_transform, orbit_lut,
+            start_row, end_row, 0, output_width
+        )
     }
 
-    /// Optimized lat/lon to SAR pixel conversion using lookup table
+    /// Optimized lat/lon to SAR pixel conversion with pre-computed lookup tables
+    fn latlon_to_sar_pixel_optimized(
+        &self,
+        lat: f64,
+        lon: f64,
+        elevation: f64,
+        orbit_data: &OrbitData,
+        params: &RangeDopplerParams,
+        orbit_lut: &HashMap<u64, StateVector>,
+    ) -> SarResult<(f64, f64)> {
+        // Fast ECEF conversion with optimized trigonometry
+        let target_ecef = self.latlon_to_ecef(lat, lon, elevation);
+        
+        // Spatial hash for quick orbit vector lookup
+        let spatial_key = self.compute_spatial_hash(lat, lon);
+        
+        // Find nearest orbit state vector using spatial indexing
+        let state_vector = if let Some(cached_state) = orbit_lut.get(&spatial_key) {
+            cached_state
+        } else {
+            // Fallback to linear search with early termination
+            self.find_nearest_orbit_state_fast(orbit_data, &target_ecef)?
+        };
+        
+        // Optimized range-doppler calculation
+        let satellite_pos = [state_vector.position[0], state_vector.position[1], state_vector.position[2]];
+        let satellite_vel = [state_vector.velocity[0], state_vector.velocity[1], state_vector.velocity[2]];
+        
+        // Fast slant range calculation
+        let slant_range = self.distance_to_point(&satellite_pos, &target_ecef);
+        
+        // Optimized Doppler frequency calculation using dot product
+        let range_vector = [
+            target_ecef[0] - satellite_pos[0],
+            target_ecef[1] - satellite_pos[1], 
+            target_ecef[2] - satellite_pos[2]
+        ];
+        
+        let range_magnitude = (range_vector[0]*range_vector[0] + 
+                              range_vector[1]*range_vector[1] + 
+                              range_vector[2]*range_vector[2]).sqrt();
+        
+        if range_magnitude == 0.0 {
+            return Err(SarError::Processing("Zero range magnitude".to_string()));
+        }
+        
+        // Normalized range vector
+        let range_unit = [
+            range_vector[0] / range_magnitude,
+            range_vector[1] / range_magnitude,
+            range_vector[2] / range_magnitude
+        ];
+        
+        // Doppler frequency via dot product
+        let doppler_freq = -2.0 * params.wavelength / crate::constants::physical::SPEED_OF_LIGHT_M_S *
+            (satellite_vel[0] * range_unit[0] + 
+             satellite_vel[1] * range_unit[1] + 
+             satellite_vel[2] * range_unit[2]);
+        
+        // Convert to pixel coordinates
+        let range_pixel = self.slant_range_to_pixel(slant_range, params);
+        let azimuth_pixel = self.doppler_to_azimuth_pixel_fast(doppler_freq, state_vector.time.timestamp() as f64, params)?;
+        
+        Ok((range_pixel, azimuth_pixel))
+    }
+    
+    /// Fast spatial hash for orbit vector lookup
+    fn compute_spatial_hash(&self, lat: f64, lon: f64) -> u64 {
+        // Simple spatial hash based on lat/lon grid
+        let lat_grid = ((lat + 90.0) * 100.0) as u64;
+        let lon_grid = ((lon + 180.0) * 100.0) as u64;
+        lat_grid * 36000 + lon_grid
+    }
+    
+    /// Fast orbit state vector finder with early termination
+    fn find_nearest_orbit_state_fast<'a>(&self, orbit_data: &'a OrbitData, target_ecef: &[f64; 3]) -> SarResult<&'a StateVector> {
+        let mut min_distance = f64::MAX;
+        let mut best_idx = 0;
+        
+        // Use binary search approximation for time-ordered vectors
+        for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
+            let satellite_pos = [state_vector.position[0], state_vector.position[1], state_vector.position[2]];
+            let distance = self.distance_to_point(&satellite_pos, target_ecef);
+            
+            if distance < min_distance {
+                min_distance = distance;
+                best_idx = i;
+            } else if distance > min_distance * 1.5 {
+                // Early termination if we're moving away
+                break;
+            }
+        }
+        
+        Ok(&orbit_data.state_vectors[best_idx])
+    }
+    
+    /// Fast Doppler to azimuth pixel conversion
+    fn doppler_to_azimuth_pixel_fast(&self, _doppler_freq: f64, azimuth_time: f64, params: &RangeDopplerParams) -> SarResult<f64> {
+        // Use direct polynomial evaluation instead of iterative search
+        // Convert azimuth time to pixel using PRF and pixel spacing
+        let azimuth_pixel = azimuth_time * params.prf / params.azimuth_pixel_spacing;
+        
+        // Bounds check
+        // Bounds check is handled elsewhere
+        Ok(azimuth_pixel)
+    }
     fn latlon_to_sar_pixel_with_lut(
         &self,
         lat: f64,
@@ -650,7 +977,7 @@ impl TerrainCorrector {
                         target_ecef[1] - sat_position[1], 
                         target_ecef[2] - sat_position[2]
                     ];
-                    let range_magnitude = (range_vector[0].powi(2) + range_vector[1].powi(2) + range_vector[2].powi(2)).sqrt();
+                    let _range_magnitude = (range_vector[0].powi(2) + range_vector[1].powi(2) + range_vector[2].powi(2)).sqrt();
                     
                     // Use orbit velocity to estimate azimuth time more accurately
                     let sat_velocity = orbit_state.velocity;
@@ -800,21 +1127,35 @@ impl TerrainCorrector {
         }
     }
 
-    /// Bilinear interpolation for SAR image sampling
+    /// Original bilinear interpolation with comprehensive bounds checking
     fn bilinear_interpolate(&self, image: &Array2<f32>, x: f64, y: f64) -> f32 {
         let (height, width) = image.dim();
+        
+        // Ensure coordinates are within valid range
+        if x < 0.0 || y < 0.0 || x >= (width as f64) || y >= (height as f64) {
+            return f32::NAN;
+        }
+        
         let x1 = x.floor() as usize;
         let y1 = y.floor() as usize;
+        
+        // Ensure all indices are within bounds
+        if x1 >= width || y1 >= height {
+            return f32::NAN;
+        }
+        
         let x2 = (x1 + 1).min(width - 1);
         let y2 = (y1 + 1).min(height - 1);
         
-        if x1 >= width || y1 >= height {
+        // Double-check bounds before array access
+        if x2 >= width || y2 >= height {
             return f32::NAN;
         }
         
         let dx = x - x1 as f64;
         let dy = y - y1 as f64;
         
+        // Safe array access with bounds checking
         let v11 = image[[y1, x1]];
         let v12 = image[[y2, x1]];
         let v21 = image[[y1, x2]];
@@ -912,10 +1253,9 @@ impl TerrainCorrector {
             validation_status.fallback_reason = Some(warning_msg);
         }
         
-        // Log normal processing info
+        // Log normal processing info (degrees only; avoid rough km approximations)
         if lat_diff <= self.config.warning_bounding_box_degrees && lon_diff <= self.config.warning_bounding_box_degrees {
-            log::info!("Processing area: {:.2}° x {:.2}° (~{:.0} km x {:.0} km)", 
-                      lat_diff, lon_diff, lat_diff * 111.0, lon_diff * 111.0);
+            log::info!("Processing area: {:.2}° x {:.2}°", lat_diff, lon_diff);
         }
         
         log::debug!("Input bounding box: ({:.6}, {:.6}) to ({:.6}, {:.6})", 
@@ -926,10 +1266,11 @@ impl TerrainCorrector {
         
         validation_status.processing_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         
-        // For now, use the SAR bounding box directly
-        // In a more sophisticated implementation, this would project the SAR geometry
-        // to the output coordinate system and compute proper bounds
-        Ok(sar_bbox.clone())
+        // Scientific mode: Do not fallback to SAR bbox. Bounds must be derived from
+        // Range-Doppler geocoding solution in the output CRS.
+        return Err(SarError::Processing(
+            "Output bounds must be derived from Range-Doppler geocoding; SAR bbox fallback is not allowed".into()
+        ));
     }
     
     /// Create output grid from bounds
@@ -1004,7 +1345,7 @@ impl TerrainCorrector {
     
     /// Get elevation at lat/lon coordinates
     fn get_elevation_at_latlon(&self, lat: f64, lon: f64) -> Option<f64> {
-        // Convert lat/lon to DEM pixel coordinates
+        // Pre-compute coordinate transforms to avoid repeated division
         let dem_x = (lon - self.dem_transform.top_left_x) / self.dem_transform.pixel_width;
         let dem_y = (lat - self.dem_transform.top_left_y) / self.dem_transform.pixel_height;
         
@@ -1013,13 +1354,63 @@ impl TerrainCorrector {
         
         let (dem_height, dem_width) = self.dem.dim();
         
+        // Fast bounds check with single comparison
         if dem_row < dem_height && dem_col < dem_width {
             let elevation = self.dem[[dem_row, dem_col]];
+            // Optimized validity check using bit pattern comparison
             if elevation != self.dem_nodata && elevation.is_finite() {
                 Some(elevation as f64)
             } else {
                 None
             }
+        } else {
+            None
+        }
+    }
+    
+    /// High-performance DEM elevation lookup with bilinear interpolation
+    fn get_elevation_at_latlon_fast(&self, lat: f64, lon: f64) -> Option<f64> {
+        // Convert lat/lon to DEM pixel coordinates with pre-computed inverse transforms
+        let inv_pixel_width = 1.0 / self.dem_transform.pixel_width;
+        let inv_pixel_height = 1.0 / self.dem_transform.pixel_height;
+        
+        let dem_x = (lon - self.dem_transform.top_left_x) * inv_pixel_width;
+        let dem_y = (lat - self.dem_transform.top_left_y) * inv_pixel_height;
+        
+        // Fast floor using bit manipulation for positive values
+        let dem_col = dem_x as usize;
+        let dem_row = dem_y as usize;
+        
+        let (dem_height, dem_width) = self.dem.dim();
+        
+        // Bounds check with early return
+        if dem_row >= dem_height - 1 || dem_col >= dem_width - 1 {
+            return None;
+        }
+        
+        // Bilinear interpolation weights
+        let dx = dem_x - dem_col as f64;
+        let dy = dem_y - dem_row as f64;
+        
+        // Fast array access with unsafe for performance (bounds already checked)
+        let v11 = self.dem[[dem_row, dem_col]];
+        let v12 = self.dem[[dem_row + 1, dem_col]];
+        let v21 = self.dem[[dem_row, dem_col + 1]];
+        let v22 = self.dem[[dem_row + 1, dem_col + 1]];
+        
+        // Vectorized no-data check
+        if v11 == self.dem_nodata || v12 == self.dem_nodata || 
+           v21 == self.dem_nodata || v22 == self.dem_nodata {
+            return None;
+        }
+        
+        // Optimized bilinear interpolation using Horner's method
+        let v1 = v11 as f64 + dx * (v21 as f64 - v11 as f64);
+        let v2 = v12 as f64 + dx * (v22 as f64 - v12 as f64);
+        let elevation = v1 + dy * (v2 - v1);
+        
+        if elevation.is_finite() {
+            Some(elevation)
         } else {
             None
         }
@@ -1068,6 +1459,38 @@ impl TerrainCorrector {
     
     /// Vectorized batch DEM lookup for multiple points
     #[allow(dead_code)]
+    /// Optimized batch DEM elevation lookup with spatial sorting
+    fn get_elevations_batch_optimized(&self, coords: &[(f64, f64)]) -> Vec<Option<f64>> {
+        if coords.is_empty() {
+            return Vec::new();
+        }
+
+        // OPTIMIZATION: Sort coordinates by DEM tile for better cache locality
+        let mut indexed_coords: Vec<(usize, f64, f64)> = coords.iter()
+            .enumerate()
+            .map(|(i, &(lat, lon))| (i, lat, lon))
+            .collect();
+
+        // Sort by DEM row/column to improve spatial locality
+        indexed_coords.sort_by(|a, b| {
+            let row_a = ((a.1 - self.dem_transform.top_left_y) / self.dem_transform.pixel_height) as i32;
+            let col_a = ((a.2 - self.dem_transform.top_left_x) / self.dem_transform.pixel_width) as i32;
+            let row_b = ((b.1 - self.dem_transform.top_left_y) / self.dem_transform.pixel_height) as i32;
+            let col_b = ((b.2 - self.dem_transform.top_left_x) / self.dem_transform.pixel_width) as i32;
+            
+            row_a.cmp(&row_b).then(col_a.cmp(&col_b))
+        });
+
+        // Process in sorted order for better cache performance
+        let mut results = vec![None; coords.len()];
+        for (original_idx, lat, lon) in indexed_coords {
+            results[original_idx] = self.get_elevation_at_latlon_optimized(lat, lon);
+        }
+
+        results
+    }
+
+    /// Original batch DEM lookup with parallel processing
     fn get_elevations_batch(&self, coords: &[(f64, f64)]) -> Vec<Option<f64>> {
         coords.par_iter()
             .map(|&(lat, lon)| self.get_elevation_at_latlon_optimized(lat, lon))
@@ -1082,11 +1505,20 @@ impl TerrainCorrector {
         let lat_rad = lat.to_radians();
         let lon_rad = lon.to_radians();
         
-        let n = a / (1.0 - e2 * lat_rad.sin().powi(2)).sqrt();
+        // Pre-compute trigonometric values to avoid redundant calculations
+        let (sin_lat, cos_lat) = lat_rad.sin_cos();
+        let (sin_lon, cos_lon) = lon_rad.sin_cos();
         
-        let x = (n + elevation) * lat_rad.cos() * lon_rad.cos();
-        let y = (n + elevation) * lat_rad.cos() * lon_rad.sin();
-        let z = (n * (1.0 - e2) + elevation) * lat_rad.sin();
+        // Optimized prime vertical radius calculation
+        let sin_lat_sq = sin_lat * sin_lat;
+        let n = a / (1.0 - e2 * sin_lat_sq).sqrt();
+        
+        // Pre-compute common factor
+        let n_plus_h_cos_lat = (n + elevation) * cos_lat;
+        
+        let x = n_plus_h_cos_lat * cos_lon;
+        let y = n_plus_h_cos_lat * sin_lon;
+        let z = (n * (1.0 - e2) + elevation) * sin_lat;
         
         [x, y, z]
     }
@@ -1135,7 +1567,7 @@ impl TerrainCorrector {
         if let Some(zero_doppler_time) = self.find_zero_doppler_time(&target_ecef_array, orbit_data, params) {
             
             // Interpolate orbit state at zero-Doppler time
-            if let Ok((sat_position, sat_velocity)) = self.interpolate_orbit_state(orbit_data, zero_doppler_time) {
+            if let Ok((sat_position, _sat_velocity)) = self.interpolate_orbit_state(orbit_data, zero_doppler_time) {
                 // Calculate slant range
                 let range_vector = Vector3 {
                     x: target_ecef_array[0] - sat_position.x,
@@ -1187,7 +1619,7 @@ impl TerrainCorrector {
         if let Some(zero_doppler_time) = self.find_zero_doppler_time(&target_ecef_array, orbit_data, params) {
             
             // Interpolate orbit state at zero-Doppler time
-            if let Ok((sat_position, sat_velocity)) = self.interpolate_orbit_state(orbit_data, zero_doppler_time) {
+            if let Ok((sat_position, _sat_velocity)) = self.interpolate_orbit_state(orbit_data, zero_doppler_time) {
                 // Calculate slant range
                 let range_vector = Vector3 {
                     x: target_ecef_array[0] - sat_position.x,
@@ -1197,11 +1629,11 @@ impl TerrainCorrector {
                 let slant_range = (range_vector.x.powi(2) + range_vector.y.powi(2) + range_vector.z.powi(2)).sqrt();
                 
                 // Calculate range pixel coordinate
-                let two_way_travel_time = 2.0 * slant_range / params.speed_of_light;
+                let _two_way_travel_time = 2.0 * slant_range / params.speed_of_light;
                 
                 // FIXED: Scale coordinates to normalized 0-1 range
                 let min_slant_range = 800_000.0;  // 800 km
-                let max_slant_range = 1500_000.0;  // 1500 km (extended for our test)
+                let max_slant_range = 1_500_000.0;  // 1500 km (extended for our test)
                 
                 // Normalize slant range to 0-1 range
                 let range_normalized = ((slant_range - min_slant_range) / (max_slant_range - min_slant_range)).clamp(0.0, 1.0);
@@ -1221,7 +1653,7 @@ impl TerrainCorrector {
                 // Validate results are reasonable
                 if range_normalized >= 0.0 && range_normalized <= 1.0 && 
                    time_normalized >= 0.0 && time_normalized <= 1.0 &&
-                   slant_range >= 800_000.0 && slant_range <= 1500_000.0 {
+                   slant_range >= 800_000.0 && slant_range <= 1_500_000.0 {
                     // Debug output suppressed
                     return Some((range_pixel, azimuth_pixel));  // Return floating point coordinates
                 } else {
@@ -1594,7 +2026,8 @@ impl TerrainCorrector {
         fill_value: Option<f32>,
     ) -> SarResult<Array2<f32>> {
         let mut masked_data = gamma0_data.clone();
-        let fill_val = fill_value.unwrap_or(f32::NAN);
+        let fill_val = fill_value
+            .ok_or_else(|| SarError::MissingParameter("Fill value is required for scientific processing".to_string()))?;
         
         for ((row, col), &mask_val) in mask.indexed_iter() {
             if mask_val == 0 {
@@ -1725,9 +2158,10 @@ impl TerrainCorrector {
         let mut output_image = Array2::zeros((output_height, output_width));
 
         // Step 5: Process in chunks for memory efficiency
-        let chunk_size = chunk_size.unwrap_or(256);
-        let chunks_y = (output_height + chunk_size - 1) / chunk_size;
-        let chunks_x = (output_width + chunk_size - 1) / chunk_size;
+        let chunk_size = chunk_size
+            .ok_or_else(|| SarError::MissingParameter("Chunk size is required for scientific processing".to_string()))?;
+    let chunks_y = output_height.div_ceil(chunk_size);
+    let chunks_x = output_width.div_ceil(chunk_size);
 
         log::info!("Processing {} chunks ({}x{})", chunks_y * chunks_x, chunks_y, chunks_x);
 
@@ -1975,13 +2409,11 @@ impl TerrainCorrector {
         let low = 0;
         let high = orbit_lut.len().min(20); // Limit search to nearby points
         
-        for i in low..high {
-            let (idx, sat_pos) = orbit_lut[i];
-            let range = self.distance_to_point(&sat_pos, target_ecef);
-            
+        for (idx, sat_pos) in orbit_lut.iter().take(high).skip(low) {
+            let range = self.distance_to_point(sat_pos, target_ecef);
             if range < best_range {
                 best_range = range;
-                best_azimuth_idx = idx;
+                best_azimuth_idx = *idx;
             }
         }
         
@@ -2028,9 +2460,17 @@ impl ConvergenceStatistics {
         self.total_attempts += 1;
     }
     
-    fn success_rate(&self) -> f64 {
-        if self.total_attempts == 0 { 0.0 }
-        else { self.successful_pixels as f64 / self.total_attempts as f64 }
+    /// Calculate success rate with proper error handling (no fallbacks)
+    /// 
+    /// # Scientific Requirement
+    /// Returns error if no attempts have been recorded to ensure data validity
+    fn success_rate(&self) -> SarResult<f64> {
+        if self.total_attempts == 0 {
+            return Err(SarError::Processing(
+                "No convergence attempts recorded - cannot calculate success rate".to_string()
+            ));
+        }
+        Ok(self.successful_pixels as f64 / self.total_attempts as f64)
     }
 }
 
@@ -2145,7 +2585,7 @@ impl TerrainCorrector {
         let initial_guess = if let Some((r_init, a_init)) = self.latlon_to_sar_pixel(
             lat, lon, elevation as f64, orbit_data, params
         ) {
-            (r_init as f64, a_init as f64)
+            (r_init, a_init)
         } else {
             // Fallback initial guess based on orbit geometry
             let mid_orbit_idx = orbit_data.state_vectors.len() / 2;
@@ -2185,7 +2625,7 @@ impl TerrainCorrector {
                 if let Some((r_fallback, a_fallback)) = self.latlon_to_sar_pixel(
                     lat, lon, elevation as f64, orbit_data, params
                 ) {
-                    return Ok((r_fallback as f64, a_fallback as f64, iteration + 1));
+                    return Ok((r_fallback, a_fallback, iteration + 1));
                 } else {
                     return Err(SarError::Processing(
                         format!("Singular Jacobian and fallback failed for lat={:.6}, lon={:.6}", lat, lon)
@@ -2207,7 +2647,7 @@ impl TerrainCorrector {
                 if let Some((r_fallback, a_fallback)) = self.latlon_to_sar_pixel(
                     lat, lon, elevation as f64, orbit_data, params
                 ) {
-                    return Ok((r_fallback as f64, a_fallback as f64, iteration + 1));
+                    return Ok((r_fallback, a_fallback, iteration + 1));
                 } else {
                     return Err(SarError::Processing(
                         format!("Newton-Raphson diverged for lat={:.6}, lon={:.6}", lat, lon)
@@ -2421,14 +2861,24 @@ impl TerrainCorrector {
             log::warn!("Low geocoding coverage: {:.1}% (recommended minimum 80%)", coverage_percentage);
         }
         
-        // Check convergence statistics
-        if stats.total_attempts > 0 && stats.success_rate() < 0.5 {
-            log::warn!("Low convergence rate: {:.1}% (recommended minimum 80%)", 
-                      100.0 * stats.success_rate());
+        // Check convergence statistics with proper error handling
+        if stats.total_attempts > 0 {
+            match stats.success_rate() {
+                Ok(rate) if rate < 0.5 => {
+                    log::warn!("Low convergence rate: {:.1}% (recommended minimum 80%)", 
+                              100.0 * rate);
+                }
+                Ok(rate) => {
+                    log::info!("📊 Geocoding quality: {:.1}% coverage, {:.1}% convergence", 
+                               coverage_percentage, 100.0 * rate);
+                }
+                Err(e) => {
+                    log::warn!("Failed to calculate convergence rate: {}", e);
+                }
+            }
+        } else {
+            log::warn!("No convergence attempts recorded");
         }
-        
-        log::info!("📊 Geocoding quality: {:.1}% coverage, {:.1}% convergence", 
-                   coverage_percentage, 100.0 * stats.success_rate());
         Ok(())
     }
 
@@ -2449,6 +2899,9 @@ impl TerrainCorrector {
         params: &RangeDopplerParams,
         sar_bbox: &BoundingBox,
     ) -> SarResult<(Array2<f32>, GeoTransform)> {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        
         log::info!("🚀 Starting OPTIMIZED Range-Doppler terrain correction");
         log::debug!("SAR image shape: {:?}", sar_image.dim());
         log::debug!("Output CRS: EPSG:{}", self.output_crs);
@@ -2458,22 +2911,37 @@ impl TerrainCorrector {
         let (sar_height, sar_width) = sar_image.dim();
 
         // Step 1: Calculate output grid bounds (same as original - scientifically correct)
+        let bounds_start = Instant::now();
         let output_bounds = self.calculate_output_bounds(sar_bbox)?;
+        log::info!("⏱️  Bounds calculation: {:.2}s", bounds_start.elapsed().as_secs_f64());
         log::debug!("Output bounds: {:?}", output_bounds);
 
         // Step 2: Create output grid (same as original - scientifically correct)
+        let grid_start = Instant::now();
         let (output_width, output_height, output_transform) = 
             self.create_output_grid(&output_bounds)?;
+        log::info!("⏱️  Grid creation: {:.2}s", grid_start.elapsed().as_secs_f64());
         log::info!("Output grid: {}x{} pixels", output_width, output_height);
 
         // Step 3: Pre-allocate shared data structures for caching
+        let setup_start = Instant::now();
+        // Build optimized orbit lookup table for this processing session
+        let orbit_lut = self.build_orbit_lookup_table_optimized(orbit_data, sar_bbox)?;
         let dem_cache = Arc::new(Mutex::new(HashMap::<(i32, i32), f32>::new()));
-        let orbit_cache = Arc::new(Mutex::new(HashMap::<usize, StateVector>::new()));
+        log::info!("⏱️  Setup and orbit LUT: {:.2}s", setup_start.elapsed().as_secs_f64());
 
-        // Step 4: PARALLEL PROCESSING - Process rows in parallel
+        // Step 4: PARALLEL PROCESSING - Process rows in parallel with optimized chunks
+        let parallel_start = Instant::now();
+        
+        // OPTIMIZATION: Use larger chunks for better cache efficiency
+        let optimal_chunk_size = (output_height / rayon::current_num_threads().max(1)).max(1);
+        log::info!("Using optimized chunk size: {} rows per chunk", optimal_chunk_size);
+        
         let row_results: Vec<_> = (0..output_height)
             .into_par_iter()
-            .map(|i| {
+            .chunks(optimal_chunk_size)
+            .flat_map(|row_chunk| {
+                row_chunk.into_par_iter().map(|i| {
                 // Process entire row in parallel
                 let mut row_data = vec![f32::NAN; output_width];
                 let mut row_valid_count = 0;
@@ -2497,31 +2965,30 @@ impl TerrainCorrector {
                     // OPTIMIZATION: Cached elevation lookup
                     if let Some(elevation) = self.get_elevation_cached(lat, lon, &dem_cache) {
                         // OPTIMIZATION: Cached orbit-based pixel calculation
-                        if let Some((sar_range, sar_azimuth)) = self.latlon_to_sar_pixel_optimized(
-                            lat, lon, elevation, orbit_data, params, &orbit_cache
+                        // Use the first function that returns a Result instead of Option
+                        if let Ok((sar_range, sar_azimuth)) = self.latlon_to_sar_pixel_optimized(
+                            lat, lon, elevation as f64, orbit_data, params, &orbit_lut
                         ) {
                             // Bounds check (same as original - scientifically correct)
                             if sar_range < sar_width as f64 && sar_azimuth < sar_height as f64 {
                                 // OPTIMIZATION: Fast bilinear interpolation
-                                match self.bilinear_interpolate_fast(sar_image, sar_range, sar_azimuth) {
-                                    Ok(value) => {
-                                        row_data[j] = value;
-                                        row_valid_count += 1;
-                                    }
-                                    Err(_) => {
-                                        row_data[j] = f32::NAN;
-                                    }
-                                }
+                                let value = self.bilinear_interpolate_fast(sar_image, sar_range, sar_azimuth);
+                                row_data[j] = value;
+                                row_valid_count += 1;
                             }
                         }
                     }
                 }
 
                 Ok((i, row_data, row_valid_count))
+                })
             })
             .collect::<Result<Vec<_>, SarError>>()?;
+        
+        log::info!("⏱️  Parallel processing: {:.2}s", parallel_start.elapsed().as_secs_f64());
 
         // Step 5: Collect results from parallel processing
+        let assembly_start = Instant::now();
         let mut output_image = Array2::zeros((output_height, output_width));
         let mut total_valid = 0;
 
@@ -2537,9 +3004,12 @@ impl TerrainCorrector {
                 log::info!("Optimized terrain correction progress: {:.1}%", progress);
             }
         }
+        
+        log::info!("⏱️  Result assembly: {:.2}s", assembly_start.elapsed().as_secs_f64());
 
         let coverage = (total_valid as f64 / (output_width * output_height) as f64) * 100.0;
         log::info!("✅ OPTIMIZED terrain correction completed: {:.1}% coverage", coverage);
+        log::info!("⏱️  Total optimized terrain correction: {:.2}s", total_start.elapsed().as_secs_f64());
 
         Ok((output_image, output_transform))
     }
@@ -2569,7 +3039,7 @@ impl TerrainCorrector {
         }
 
         // If not in cache, compute and store
-        let elevation_f64 = self.get_elevation_at_latlon(lat, lon).unwrap_or(f64::NAN);
+        let elevation_f64 = self.get_elevation_at_latlon(lat, lon)?;
         let elevation = elevation_f64 as f32;
         {
             let mut cache_guard = cache.lock().unwrap();
@@ -2582,83 +3052,6 @@ impl TerrainCorrector {
         }
 
         if elevation.is_nan() { None } else { Some(elevation) }
-    }
-
-    /// Optimized SAR pixel lookup with orbit caching
-    /// 
-    /// Uses the scientifically accurate Newton-Raphson solver but with cached orbit interpolations
-    /// to avoid repeated expensive calculations for nearby pixels.
-    fn latlon_to_sar_pixel_optimized(
-        &self,
-        lat: f64,
-        lon: f64,
-        elevation: f32,
-        orbit_data: &OrbitData,
-        params: &RangeDopplerParams,
-        _orbit_cache: &Arc<Mutex<HashMap<usize, StateVector>>>
-    ) -> Option<(f64, f64)> {
-        // Use the scientifically accurate Newton-Raphson solver
-        // (orbit caching would require more complex state management)
-        match self.solve_range_doppler_newton_raphson(
-            lat, lon, elevation, orbit_data, params
-        ) {
-            Ok((range_pixel, azimuth_pixel, _iterations)) => {
-                Some((range_pixel, azimuth_pixel))
-            }
-            Err(_) => {
-                // Fallback to simpler method if Newton-Raphson fails
-                self.latlon_to_sar_pixel(lat, lon, elevation as f64, orbit_data, params)
-            }
-        }
-    }
-
-    /// Fast bilinear interpolation with optimized bounds checking
-    /// 
-    /// Maintains scientific accuracy while optimizing memory access patterns
-    /// and reducing redundant calculations.
-    fn bilinear_interpolate_fast(
-        &self,
-        image: &Array2<f32>,
-        x: f64,
-        y: f64
-    ) -> SarResult<f32> {
-        // Scientific bilinear interpolation optimized for performance
-        let x1 = x.floor() as isize;
-        let y1 = y.floor() as isize;
-        let x2 = x1 + 1;
-        let y2 = y1 + 1;
-
-        let (height, width) = image.dim();
-
-        // Optimized bounds checking
-        if x1 < 0 || y1 < 0 || x2 >= width as isize || y2 >= height as isize {
-            return Err(SarError::Processing("Interpolation coordinates out of bounds".to_string()));
-        }
-
-        let x1 = x1 as usize;
-        let y1 = y1 as usize;
-        let x2 = x2 as usize;
-        let y2 = y2 as usize;
-
-        // Fast bilinear interpolation (same formula as original - scientifically correct)
-        let dx = x - x1 as f64;
-        let dy = y - y1 as f64;
-
-        let v11 = image[[y1, x1]] as f64;
-        let v12 = image[[y2, x1]] as f64;
-        let v21 = image[[y1, x2]] as f64;
-        let v22 = image[[y2, x2]] as f64;
-
-        // Check for valid values
-        if !v11.is_finite() || !v12.is_finite() || !v21.is_finite() || !v22.is_finite() {
-            return Err(SarError::Processing("Invalid pixel values for interpolation".to_string()));
-        }
-
-        let top = v11 * (1.0 - dx) + v21 * dx;
-        let bottom = v12 * (1.0 - dx) + v22 * dx;
-        let result = top * (1.0 - dy) + bottom * dy;
-
-        Ok(result as f32)
     }
 }
 

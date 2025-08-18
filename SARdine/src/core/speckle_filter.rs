@@ -781,6 +781,7 @@ impl SpeckleFilter {
     }
 
     /// Calculate local statistics for a window
+    #[allow(dead_code)]
     fn calculate_local_statistics(&self, image: &Array2<f32>, center_i: usize, center_j: usize, half_window: usize) -> (f32, f32) {
         let (height, width) = image.dim();
         let mut values = Vec::new();

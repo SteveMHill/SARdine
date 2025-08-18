@@ -29,52 +29,50 @@ except ImportError as e:
     print(f"❌ Failed to import SARdine: {e}")
     sys.exit(1)
 
-def create_realistic_sar_data() -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Create realistic synthetic SAR data"""
+def load_real_sar_data() -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Load real Sentinel-1 SAR data for testing"""
     
-    print("🛰️  Creating realistic synthetic SAR data...")
+    print("🛰️  Loading real Sentinel-1 SAR data...")
     
-    # Create a realistic SAR image (1000x800 pixels)
-    rows, cols = 1000, 800
+    # Check for real SAR data file
+    real_data_path = Path("../../data/S1A_IW_SLC__1SDV_20200103T170815_20200103T170842_030639_0382D5_DADE.zip")
+    if not real_data_path.exists():
+        raise FileNotFoundError(f"❌ SCIENTIFIC MODE: Real Sentinel-1 data required for testing. Expected: {real_data_path}")
     
-    # Generate spatially correlated SAR data with realistic statistics
-    np.random.seed(42)  # For reproducible results
+    # Use sardine to load real data
+    import sardine
     
-    # Create base terrain features
-    x = np.linspace(0, 4*np.pi, cols)
-    y = np.linspace(0, 4*np.pi, rows)
-    X, Y = np.meshgrid(x, y)
+    # Read product info and metadata
+    info = sardine.get_product_info(str(real_data_path))
+    reader = sardine.SlcReader(str(real_data_path))
+    metadata = reader.get_metadata()
     
-    # Simulate different land cover types
-    urban_areas = 0.8 * np.exp(-((X-2*np.pi)**2 + (Y-2*np.pi)**2) / 4)
-    forest_areas = 0.3 * (np.sin(X/2) * np.cos(Y/2) + 1) / 2
-    water_areas = 0.05 * np.ones_like(X)
-    water_mask = (X < np.pi) & (Y < np.pi)
+    # Read real SLC data for VV polarization
+    slc_data = reader.read_slc_data("VV")
     
-    # Combine land cover types
-    base_backscatter = urban_areas + forest_areas + water_areas
-    base_backscatter[water_mask] = water_areas[water_mask]
+    # Convert complex to magnitude (intensity)
+    sar_magnitude = np.abs(slc_data).astype(np.float32)
     
-    # Add speckle noise (multiplicative)
-    speckle = np.random.gamma(1.0, 1.0, (rows, cols))
-    sar_image = base_backscatter * speckle
-    
-    # Ensure realistic value range (typical Sentinel-1 values)
-    sar_image = np.clip(sar_image, 0.001, 2.0)
-    
+    # Extract real image statistics
     stats = {
-        'min_value': np.min(sar_image),
-        'max_value': np.max(sar_image),
-        'mean_value': np.mean(sar_image),
-        'std_value': np.std(sar_image),
-        'shape': sar_image.shape
+        'min_value': np.min(sar_magnitude),
+        'max_value': np.max(sar_magnitude),
+        'mean_value': np.mean(sar_magnitude),
+        'std_value': np.std(sar_magnitude),
+        'shape': sar_magnitude.shape,
+        'product_id': info.get('product_id', 'Unknown'),
+        'platform': info.get('platform', 'Sentinel-1'),
+        'sensor_mode': info.get('sensor_mode', 'IW'),
+        'polarization': 'VV',
+        'data_type': 'Real Sentinel-1 SLC'
     }
     
-    print(f"📊 SAR image created: {rows}x{cols}")
-    print(f"📈 Value range: {stats['min_value']:.4f} to {stats['max_value']:.4f}")
+    print(f"📊 Real SAR data loaded: {sar_magnitude.shape}")
+    print(f"📈 Intensity range: {stats['min_value']:.4f} to {stats['max_value']:.4f}")
     print(f"📊 Mean: {stats['mean_value']:.4f}, Std: {stats['std_value']:.4f}")
+    print(f"🛰️  Product: {stats['product_id']}")
     
-    return sar_image.astype(np.float32), stats
+    return sar_magnitude, stats
 
 def create_realistic_orbit_data(num_vectors: int = 15) -> Tuple[list, list, list]:
     """Create realistic Sentinel-1 orbit data"""
@@ -147,7 +145,7 @@ def run_full_pipeline_test():
     
     # Create test data
     print("\n📋 Step 1: Creating test data...")
-    sar_image, image_stats = create_realistic_sar_data()
+    sar_image, image_stats = load_real_sar_data()
     times, positions, velocities = create_realistic_orbit_data()
     metadata = create_realistic_metadata()
     

@@ -160,7 +160,7 @@ impl QualityAssessor {
         gamma0_db: &Array2<f32>,
         dem_data: &Array2<f32>,
         local_incidence_angles: &Array2<f32>,
-        orbit_params: &OrbitParams,
+        _orbit_params: &OrbitParams,
         config: &QualityConfig,
     ) -> SarResult<QualityAssessment> {
         let (rows, cols) = gamma0_db.dim();
@@ -395,9 +395,9 @@ impl QualityAssessor {
         
         for i in 0..rows {
             for j in 0..cols {
-                let start_i = if i >= half_window { i - half_window } else { 0 };
+                let start_i = i.saturating_sub(half_window);
                 let end_i = (i + half_window + 1).min(rows);
-                let start_j = if j >= half_window { j - half_window } else { 0 };
+                let start_j = j.saturating_sub(half_window);
                 let end_j = (j + half_window + 1).min(cols);
                 
                 // Extract window
@@ -546,8 +546,7 @@ impl QualityAssessor {
     ) -> SarResult<()> {
         let (rows, cols) = assessment.combined_quality_mask.dim();
         
-        let mut stats = QualityStatistics::default();
-        stats.total_pixels = rows * cols;
+    let mut stats = QualityStatistics { total_pixels: rows * cols, ..Default::default() };
         
         let mut snr_values = Vec::new();
         let mut lia_values = Vec::new();

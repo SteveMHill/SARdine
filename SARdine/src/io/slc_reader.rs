@@ -2,7 +2,6 @@ use crate::types::{
     AcquisitionMode, BoundingBox, CoordinateSystem, Polarization, SarError, 
     SarImage, SarMetadata, SarResult, OrbitStatus, OrbitData, BurstOrbitData, SubSwath, GeoTransform
 };
-use crate::io::annotation::{AnnotationData, AnnotationRoot};
 use crate::constants::physical::SPEED_OF_LIGHT_M_S;
 use crate::core::calibrate::CalibrationCoefficients;
 use crate::core::deburst::DeburstConfig;
@@ -171,8 +170,7 @@ impl SlcReader {
                 
                 for i in 0..archive.len() {
                     let file = archive.by_index(i)
-                        .map_err(|e| SarError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        .map_err(|e| SarError::Io(std::io::Error::other(
                             format!("Failed to access file {}: {}", i, e),
                         )))?;
                     files.push(file.name().to_string());
@@ -182,14 +180,14 @@ impl SlcReader {
             },
             ProductFormat::Safe => {
                 let mut files = Vec::new();
-                self.list_safe_files_recursive(&self.product_path, "", &mut files)?;
+                Self::list_safe_files_recursive(&self.product_path, "", &mut files)?;
                 Ok(files)
             }
         }
     }
 
     /// Recursively list files in SAFE directory structure
-    fn list_safe_files_recursive(&self, dir: &Path, prefix: &str, files: &mut Vec<String>) -> SarResult<()> {
+    fn list_safe_files_recursive(dir: &Path, prefix: &str, files: &mut Vec<String>) -> SarResult<()> {
         let entries = std::fs::read_dir(dir)
             .map_err(|e| SarError::Io(e))?;
 
@@ -206,7 +204,7 @@ impl SlcReader {
             };
 
             if path.is_dir() {
-                self.list_safe_files_recursive(&path, &relative_path, files)?;
+                Self::list_safe_files_recursive(&path, &relative_path, files)?;
             } else {
                 files.push(relative_path);
             }
@@ -221,8 +219,7 @@ impl SlcReader {
             ProductFormat::Zip => {
                 let archive = self.open_archive()?;
                 let mut file = archive.by_name(file_path)
-                    .map_err(|e| SarError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    .map_err(|e| SarError::Io(std::io::Error::other(
                         format!("Failed to read {}: {}", file_path, e),
                     )))?;
 
@@ -308,7 +305,8 @@ impl SlcReader {
     /// - ESA S1-IF-ASD-PL-0007: "Sentinel-1 Annotation Format Specification"
     /// - ESA S1-TN-MDA-52-7440: "Sentinel-1 TOPSAR Mode"
     fn parse_annotation_xml_comprehensive(xml_content: &str, pol: Polarization, product_path: &Path) -> SarResult<SarMetadata> {
-        log::info!("Parsing annotation XML with comprehensive real metadata extraction");
+        println!("🔍 DEBUG: parse_annotation_xml_comprehensive called");
+        log::info!("Parsing annotation XML with comprehensive XML parser");
         
         // Extract product ID from path 
         let product_id = product_path
@@ -318,8 +316,28 @@ impl SlcReader {
             .replace(".SAFE", "")
             .replace(".zip", "");
 
-        // Use the detailed annotation parser for real data extraction
-        let mut sub_swaths = HashMap::new();
+        // Use the new comprehensive annotation parser
+        let annotation = crate::io::annotation::AnnotationParser::parse_annotation(xml_content)
+            .map_err(|_| SarError::Processing("Failed to parse annotation XML - cannot extract required parameters".to_string()))?;
+        
+        // Extract pixel spacing FIRST - CRITICAL: NO FALLBACKS ALLOWED
+        let range_pixel_spacing = annotation.image_annotation
+            .as_ref()
+            .and_then(|img| img.image_information.as_ref())
+            .and_then(|info| info.range_pixel_spacing)
+            .ok_or_else(|| SarError::Processing("Range pixel spacing not found in annotation XML - required for scientific accuracy".to_string()))?;
+        let azimuth_pixel_spacing = annotation.image_annotation
+            .as_ref()
+            .and_then(|img| img.image_information.as_ref())
+            .and_then(|info| info.azimuth_pixel_spacing)
+            .ok_or_else(|| SarError::Processing("Azimuth pixel spacing not found in annotation XML - required for scientific accuracy".to_string()))?;
+            
+        // Extract sub-swaths using the detailed parser
+    let _sub_swaths = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
+            .unwrap_or_else(|_| HashMap::new());
+            
+        // Extract real bounding box from geolocation grid
+        println!("🔍 DEBUG: About to extract bounding box");
         let mut bounding_box = BoundingBox {
             min_lon: -180.0,
             max_lon: 180.0,
@@ -327,49 +345,69 @@ impl SlcReader {
             max_lat: 90.0,
         };
         
-        // CRITICAL: Extract real pixel spacing from annotation - NO fallbacks for research use
-        let range_pixel_spacing = Self::extract_real_value_f64(xml_content, "rangePixelSpacing")
-            .ok_or_else(|| SarError::Processing(
-                "❌ SCIENTIFIC ERROR: Range pixel spacing not found in annotation XML! \
-                Real Sentinel-1 annotation required - no synthetic fallbacks allowed for research-grade processing.".to_string()
-            ))?;
+        if let Some(geolocation_grid) = &annotation.geolocation_grid {
+            println!("🔍 DEBUG: Geolocation grid found");
+            if let Some(grid_points) = &geolocation_grid.geolocation_grid_point_list {
+                println!("🔍 DEBUG: Grid point list found");
+                if let Some(points) = &grid_points.geolocation_grid_points {
+                    println!("🔍 DEBUG: Found {} geolocation points", points.len());
+                    let mut lons = Vec::new();
+                    let mut lats = Vec::new();
+                    
+                    for point in points {
+                        lons.push(point.longitude);
+                        lats.push(point.latitude);
+                    }
+                
+                    if !lons.is_empty() && !lats.is_empty() {
+                        bounding_box.min_lon = lons.iter().cloned().fold(f64::INFINITY, f64::min);
+                        bounding_box.max_lon = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        bounding_box.min_lat = lats.iter().cloned().fold(f64::INFINITY, f64::min);
+                        bounding_box.max_lat = lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        println!("🔍 DEBUG: Bounding box calculated: [{:.3}, {:.3}, {:.3}, {:.3}]", 
+                                bounding_box.min_lon, bounding_box.min_lat, bounding_box.max_lon, bounding_box.max_lat);
+                    } else {
+                        println!("🔍 DEBUG: No lat/lon data in points");
+                    }
+                } else {
+                    println!("🔍 DEBUG: No geolocation_grid_points in list");
+                }
+            } else {
+                println!("🔍 DEBUG: No geolocation_grid_point_list in grid");
+            }
+        } else {
+            println!("🔍 DEBUG: No geolocation_grid in annotation");
+        }
 
-        let azimuth_pixel_spacing = Self::extract_real_value_f64(xml_content, "azimuthPixelSpacing")
-            .ok_or_else(|| SarError::Processing(
-                "❌ SCIENTIFIC ERROR: Azimuth pixel spacing not found in annotation XML! \
-                Real Sentinel-1 annotation required - no synthetic fallbacks allowed for research-grade processing.".to_string()
-            ))?;
+        // Extract real timing parameters from image annotation (no defaults)
+        let slant_range_time = annotation.image_annotation
+            .as_ref()
+            .and_then(|img| img.image_information.as_ref())
+            .and_then(|info| info.slant_range_time)
+            .ok_or_else(|| SarError::Processing("Slant range time not found in annotation XML - required".to_string()))?;
 
-        // Extract real timing parameters
-        let slant_range_time = Self::extract_real_value_f64(xml_content, "slantRangeTime")
-            .unwrap_or_else(|| {
-                log::warn!("Could not extract real slant range time, using default");
-                0.005331 // Typical S1 IW value as fallback
-            });
+        let range_sampling_rate = annotation.general_annotation
+            .as_ref()
+            .and_then(|gen| gen.product_information.as_ref())
+            .map(|prod| prod.range_sampling_rate)
+            .ok_or_else(|| SarError::Processing("Range sampling rate not found in annotation XML - required".to_string()))?;
 
-        let range_sampling_rate = Self::extract_real_value_f64(xml_content, "rangeSamplingRate")
-            .unwrap_or_else(|| {
-                log::warn!("Could not extract real range sampling rate, using default");
-                64345238.0 // Typical S1 IW value as fallback
-            });
+        let prf = annotation.image_annotation
+            .as_ref()
+            .and_then(|img| img.image_information.as_ref())
+            .and_then(|info| info.azimuth_frequency)
+            .ok_or_else(|| SarError::Processing("Azimuth PRF (azimuthFrequency) not found in annotation XML - required".to_string()))?;
 
-        let prf = Self::extract_real_value_f64(xml_content, "azimuthFrequency")
-            .or_else(|| Self::extract_real_value_f64(xml_content, "prf"))
-            .ok_or_else(|| SarError::Processing(
-                "❌ SCIENTIFIC ERROR: PRF not found in annotation XML! \
-                Real Sentinel-1 annotation required - no synthetic fallbacks allowed for research-grade processing.".to_string()
-            ))?;
-
-        // Extract radar frequency (should be C-band: ~5.405 GHz)
-        let radar_frequency = Self::extract_real_value_f64(xml_content, "radarFrequency")
-            .unwrap_or_else(|| {
-                log::info!("Using standard C-band frequency (physical constant)");
-                5.405e9 // C-band center frequency - physical constant, not extracted parameter
-            });
+        // Extract radar frequency (C-band ~5.405 GHz) - must be present
+        let radar_frequency = annotation.general_annotation
+            .as_ref()
+            .and_then(|gen| gen.product_information.as_ref())
+            .map(|prod| prod.radar_frequency)
+            .ok_or_else(|| SarError::Processing("Radar frequency not found in annotation XML - required for wavelength".to_string()))?;
 
         let wavelength = SPEED_OF_LIGHT_M_S / radar_frequency;
 
-        log::info!("REAL extracted parameters:");
+        log::info!("Successfully extracted parameters with comprehensive parser:");
         log::info!("  - Range pixel spacing: {:.4} m", range_pixel_spacing);
         log::info!("  - Azimuth pixel spacing: {:.4} m", azimuth_pixel_spacing);
         log::info!("  - Slant range time: {:.6} s", slant_range_time);
@@ -378,73 +416,70 @@ impl SlcReader {
         log::info!("  - Radar frequency: {:.3} GHz", radar_frequency / 1e9);
         log::info!("  - Wavelength: {:.4} m", wavelength);
 
-        // Try to parse with the full annotation parser for subswaths and bounding box
-        if let Ok(annotation) = crate::io::annotation::AnnotationParser::parse_annotation(xml_content) {
-            // Extract sub-swaths using the detailed parser
-            sub_swaths = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
-                .unwrap_or_else(|e| {
-                    log::warn!("Failed to extract subswaths: {}", e);
-                    HashMap::new()
-                });
-            
-            // Extract real bounding box from geolocation grid
-            if let Ok(real_bbox) = crate::io::annotation::AnnotationParser::extract_bounding_box(&annotation) {
-                bounding_box = real_bbox.clone();
-                log::info!("Extracted real bounding box: [{:.3}, {:.3}, {:.3}, {:.3}]",
-                          real_bbox.min_lon, real_bbox.min_lat, real_bbox.max_lon, real_bbox.max_lat);
-            }
-        }
+        // Extract other required metadata
+        let mission = if product_id.starts_with("S1A") { "Sentinel-1A".to_string() } 
+                     else if product_id.starts_with("S1B") { "Sentinel-1B".to_string() }
+                     else { "Sentinel-1".to_string() };
         
-        // If detailed XML parsing failed, try direct regex extraction of coordinates
-        if bounding_box.min_lon == -180.0 && bounding_box.max_lon == 180.0 {
-            if let Ok(extracted_bbox) = Self::extract_bounding_box_regex(xml_content) {
-                bounding_box = extracted_bbox.clone();
-                log::info!("Extracted bounding box via regex: [{:.3}, {:.3}, {:.3}, {:.3}]",
-                          extracted_bbox.min_lon, extracted_bbox.min_lat, extracted_bbox.max_lon, extracted_bbox.max_lat);
-            }
-        }
+        let platform = mission.clone();
+        let acquisition_mode = AcquisitionMode::IW; // Interferometric Wide swath mode
 
-        // Extract mission information
-        let mission = Self::extract_value(&xml_content, "missionId")
-            .unwrap_or_else(|| "Sentinel-1".to_string());
-
-        let platform = if product_id.starts_with("S1A") {
-            "Sentinel-1A".to_string()
-        } else if product_id.starts_with("S1B") {
-            "Sentinel-1B".to_string()
+        // Extract timing from ADS header (no synthetic fallbacks)
+        let (start_time, stop_time) = if let Some(ads_header) = &annotation.ads_header {
+            let start_time = ads_header.start_time.as_deref()
+                .ok_or_else(|| SarError::Processing("Start time missing in ADS header".to_string()))?;
+            let stop_time = ads_header.stop_time.as_deref()
+                .ok_or_else(|| SarError::Processing("Stop time missing in ADS header".to_string()))?;
+            (Self::parse_time_flexible(start_time)?, Self::parse_time_flexible(stop_time)?)
         } else {
-            mission.clone()
+            return Err(SarError::Processing("ADS header with start/stop time is required".to_string()));
         };
 
-        // Extract acquisition mode
-        let mode_str = Self::extract_value(&xml_content, "mode").unwrap_or_else(|| "IW".to_string());
-        let acquisition_mode = match mode_str.as_str() {
-            "IW" => AcquisitionMode::IW,
-            "EW" => AcquisitionMode::EW,
-            "SM" => AcquisitionMode::SM,
-            "WV" => AcquisitionMode::WV,
-            _ => {
-                log::warn!("Unknown acquisition mode '{}', defaulting to IW", mode_str);
-                AcquisitionMode::IW
+        // Extract sub-swaths using the detailed parser
+        let sub_swaths = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to extract subswaths: {}", e);
+                HashMap::new()
+            });
+            
+        // Extract real bounding box from geolocation grid using comprehensive parser
+        println!("🔍 DEBUG: About to extract bounding box");
+        let bounding_box = match crate::io::annotation::AnnotationParser::extract_bounding_box(&annotation) {
+            Ok(real_bbox) => {
+                println!("🔍 DEBUG: Bounding box extraction SUCCESS: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                        real_bbox.min_lon, real_bbox.min_lat, real_bbox.max_lon, real_bbox.max_lat);
+                log::info!("Extracted real bounding box: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                          real_bbox.min_lon, real_bbox.min_lat, real_bbox.max_lon, real_bbox.max_lat);
+                real_bbox
+            },
+            Err(e) => {
+                println!("🔍 DEBUG: Bounding box extraction FAILED: {}", e);
+                log::warn!("Failed to extract bounding box from annotation: {}", e);
+                return Err(SarError::XmlParsing(
+                    "Failed to extract valid bounding box from annotation XML with structured parser. No fallback parsers allowed as requested.".to_string()
+                ));
             }
         };
-        
-        // Use more flexible time parsing with fallback
-        let start_time_str = Self::extract_value(&xml_content, "startTime")
-            .or_else(|| Self::extract_value(&xml_content, "acquisitionStartTime"))
-            .or_else(|| Self::extract_value(&xml_content, "productFirstLineUtcTime"))
-            .unwrap_or_else(|| "2020-01-03T17:08:15.000000Z".to_string());
-        
-        let stop_time_str = Self::extract_value(&xml_content, "stopTime")
-            .or_else(|| Self::extract_value(&xml_content, "acquisitionStopTime"))
-            .or_else(|| Self::extract_value(&xml_content, "productLastLineUtcTime"))
-            .unwrap_or_else(|| "2020-01-03T17:08:42.000000Z".to_string());
-
-        // Try to parse time, with fallback for different formats
-        let start_time = Self::parse_time_flexible(&start_time_str)?;
-        let stop_time = Self::parse_time_flexible(&stop_time_str)?;
 
         // Create metadata structure with REAL extracted values
+        
+        // SCIENTIFIC FIX: Extract orbit data from annotation for velocity calculations
+        let orbit_data = if let Some(orbit_list) = &annotation.orbit_list {
+            if !orbit_list.is_empty() {
+                log::info!("Extracted {} orbit state vectors for velocity calculations", orbit_list.len());
+                Some(OrbitData {
+                    state_vectors: orbit_list.clone(),
+                    reference_time: start_time,
+                })
+            } else {
+                log::warn!("No orbit state vectors found in annotation");
+                None
+            }
+        } else {
+            log::warn!("No orbit data found in annotation");
+            None
+        };
+        
         Ok(SarMetadata {
             product_id,
             mission,
@@ -457,14 +492,83 @@ impl SlcReader {
             bounding_box,
             coordinate_system: CoordinateSystem::Radar,
             sub_swaths,
-            orbit_data: None,
+            orbit_data,  // SCIENTIFIC FIX: Now properly populated from annotation
             range_looks: 1,
             azimuth_looks: 1,
             pixel_spacing: (range_pixel_spacing, azimuth_pixel_spacing), // REAL extracted values
         })
     }
+    fn extract_coordinates_from_geolocation_grid(xml: &str) -> Option<(f64, f64, f64, f64)> {
+        println!("🔍 DEBUG: extract_coordinates_from_geolocation_grid called");
+        
+        // Find the geolocationGrid section
+        if let Some(grid_start) = xml.find("<geolocationGrid>") {
+            if let Some(grid_end) = xml[grid_start..].find("</geolocationGrid>") {
+                let grid_section = &xml[grid_start..grid_start + grid_end];
+                println!("🔍 DEBUG: Found geolocationGrid section, length: {}", grid_section.len());
+                
+                // Extract all latitude and longitude values
+                let mut latitudes = Vec::new();
+                let mut longitudes = Vec::new();
+                
+                // Find all geolocationGridPoint entries
+                let mut search_pos = 0;
+                while let Some(point_start) = grid_section[search_pos..].find("<geolocationGridPoint>") {
+                    let abs_point_start = search_pos + point_start;
+                    if let Some(point_end) = grid_section[abs_point_start..].find("</geolocationGridPoint>") {
+                        let point_section = &grid_section[abs_point_start..abs_point_start + point_end];
+                        
+                        // Extract latitude
+                        if let Some(lat_start) = point_section.find("<latitude>") {
+                            if let Some(lat_end) = point_section[lat_start..].find("</latitude>") {
+                                let lat_text = &point_section[lat_start + 10..lat_start + lat_end];
+                                if let Ok(lat_val) = lat_text.trim().parse::<f64>() {
+                                    latitudes.push(lat_val);
+                                }
+                            }
+                        }
+                        
+                        // Extract longitude  
+                        if let Some(lon_start) = point_section.find("<longitude>") {
+                            if let Some(lon_end) = point_section[lon_start..].find("</longitude>") {
+                                let lon_text = &point_section[lon_start + 11..lon_start + lon_end];
+                                if let Ok(lon_val) = lon_text.trim().parse::<f64>() {
+                                    longitudes.push(lon_val);
+                                }
+                            }
+                        }
+                        
+                        search_pos = abs_point_start + point_end;
+                    } else {
+                        break;
+                    }
+                }
+                
+                println!("🔍 DEBUG: Extracted {} latitudes, {} longitudes", latitudes.len(), longitudes.len());
+                
+                if !latitudes.is_empty() && !longitudes.is_empty() {
+                    let min_lat = latitudes.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                    let max_lat = latitudes.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                    let min_lon = longitudes.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                    let max_lon = longitudes.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                    
+                    println!("🔍 DEBUG: Calculated bounding box: lat=({:.6}, {:.6}), lon=({:.6}, {:.6})", 
+                             min_lat, max_lat, min_lon, max_lon);
+                    
+                    return Some((min_lat, max_lat, min_lon, max_lon));
+                } else {
+                    println!("🔍 DEBUG: No valid coordinates found in geolocation grid");
+                }
+            } else {
+                println!("🔍 DEBUG: No closing </geolocationGrid> tag found");
+            }
+        } else {
+            println!("🔍 DEBUG: No <geolocationGrid> section found");
+        }
+        
+        None
+    }
 
-    /// Extract real numerical values from XML with proper error handling
     fn extract_real_value_f64(xml: &str, tag: &str) -> Option<f64> {
         Self::extract_value(xml, tag)
             .and_then(|s| {
@@ -488,6 +592,7 @@ impl SlcReader {
     }
 
     /// Parse annotation XML content with sub-swath extraction
+    #[allow(dead_code)]
     fn parse_annotation_xml(xml_content: &str, pol: Polarization) -> SarResult<SarMetadata> {
         // First try to parse with the full annotation parser - REQUIRED for pixel spacing
         let annotation = crate::io::annotation::AnnotationParser::parse_annotation(xml_content)
@@ -496,11 +601,13 @@ impl SlcReader {
         // Extract pixel spacing FIRST - CRITICAL: NO FALLBACKS ALLOWED
         let range_pixel_spacing = annotation.image_annotation
             .as_ref()
-            .and_then(|img| Some(img.image_information.range_pixel_spacing))
+            .and_then(|img| img.image_information.as_ref())
+            .and_then(|info| info.range_pixel_spacing)
             .ok_or_else(|| SarError::Processing("Range pixel spacing not found in annotation XML - required for scientific accuracy".to_string()))?;
         let azimuth_pixel_spacing = annotation.image_annotation
             .as_ref()
-            .and_then(|img| Some(img.image_information.azimuth_pixel_spacing))
+            .and_then(|img| img.image_information.as_ref())
+            .and_then(|info| info.azimuth_pixel_spacing)
             .ok_or_else(|| SarError::Processing("Azimuth pixel spacing not found in annotation XML - required for scientific accuracy".to_string()))?;
             
         // Extract sub-swaths using the detailed parser
@@ -515,39 +622,83 @@ impl SlcReader {
             max_lat: 90.0,
         };
         
-        if let Ok(real_bbox) = crate::io::annotation::AnnotationParser::extract_bounding_box(&annotation) {
-            bounding_box = real_bbox;
-        }
-        
-        // If XML parsing failed for bbox, try direct regex extraction of coordinates
-        if bounding_box.min_lon == -180.0 && bounding_box.max_lon == 180.0 {
-            if let Ok(extracted_bbox) = Self::extract_bounding_box_regex(xml_content) {
-                bounding_box = extracted_bbox;
+        match crate::io::annotation::AnnotationParser::extract_bounding_box(&annotation) {
+            Ok(real_bbox) => {
+                log::info!("✅ Successfully extracted bounding box: [{:.6}, {:.6}, {:.6}, {:.6}]", 
+                          real_bbox.min_lon, real_bbox.min_lat, real_bbox.max_lon, real_bbox.max_lat);
+                bounding_box = real_bbox;
+            },
+            Err(e) => {
+                log::error!("❌ Failed to extract bounding box from annotation: {}", e);
+                log::error!("❌ This indicates a problem with the geolocation grid parsing or access");
             }
         }
         
+        // If XML parsing failed for bbox, return error - NO FALLBACKS
+        if bounding_box.min_lon == -180.0 && bounding_box.max_lon == 180.0 {
+            return Err(SarError::Metadata(
+                "Failed to extract bounding box from annotation XML. \
+                Real Sentinel-1 annotation with valid geolocation grid required - no fallback parsing allowed.".to_string()
+            ));
+        }
+        
         // Extract basic information using string parsing (fallback approach)
-        let product_id = Self::extract_value(&xml_content, "missionId")
+    let product_id = Self::extract_value(xml_content, "missionId")
             .unwrap_or_else(|| "S1A_UNKNOWN".to_string());
         
-        // Use more flexible time parsing with fallback
-        let start_time_str = Self::extract_value(&xml_content, "startTime")
-            .or_else(|| Self::extract_value(&xml_content, "acquisitionStartTime"))
-            .unwrap_or_else(|| "2020-01-03T17:08:15.000000Z".to_string());
+        // Use more flexible time parsing - MANDATORY
+        let start_time_str = Self::extract_value(xml_content, "startTime")
+            .or_else(|| Self::extract_value(xml_content, "acquisitionStartTime"))
+            .ok_or_else(|| SarError::Processing(
+                "❌ SCIENTIFIC ERROR: Start time not found in annotation XML! \
+                Real Sentinel-1 annotation required - no synthetic fallbacks allowed.".to_string()
+            ))?;
         
-        let stop_time_str = Self::extract_value(&xml_content, "stopTime")
-            .or_else(|| Self::extract_value(&xml_content, "acquisitionStopTime"))
-            .unwrap_or_else(|| "2020-01-03T17:08:42.000000Z".to_string());
+        let stop_time_str = Self::extract_value(xml_content, "stopTime")
+            .or_else(|| Self::extract_value(xml_content, "acquisitionStopTime"))
+            .ok_or_else(|| SarError::Processing(
+                "❌ SCIENTIFIC ERROR: Stop time not found in annotation XML! \
+                Real Sentinel-1 annotation required - no synthetic fallbacks allowed.".to_string()
+            ))?;
 
         // Try to parse time, with fallback for different formats
         let start_time = Self::parse_time_flexible(&start_time_str)?;
         let stop_time = Self::parse_time_flexible(&stop_time_str)?;
 
+        // Extract platform (Sentinel-1A or Sentinel-1B) from product ID
+        let platform = if product_id.starts_with("S1A_") {
+            "Sentinel-1A".to_string()
+        } else if product_id.starts_with("S1B_") {
+            "Sentinel-1B".to_string()
+        } else {
+            return Err(SarError::InvalidInput(
+                format!("Cannot determine platform from product ID: {}", product_id)
+            ));
+        };
+        
         // Create metadata structure with sub-swaths and real bounding box
+        
+        // SCIENTIFIC FIX: Extract orbit data from annotation for velocity calculations
+        let orbit_data = if let Some(orbit_list) = &annotation.orbit_list {
+            if !orbit_list.is_empty() {
+                log::info!("Extracted {} orbit state vectors for velocity calculations", orbit_list.len());
+                Some(OrbitData {
+                    state_vectors: orbit_list.clone(),
+                    reference_time: start_time,
+                })
+            } else {
+                log::warn!("No orbit state vectors found in annotation");
+                None
+            }
+        } else {
+            log::warn!("No orbit data found in annotation");
+            None
+        };
+        
         Ok(SarMetadata {
             product_id,
             mission: "Sentinel-1".to_string(),
-            platform: "Sentinel-1A".to_string(), // TODO: detect A/B from filename
+            platform,
             instrument: "C-SAR".to_string(),
             acquisition_mode: AcquisitionMode::IW,
             polarizations: vec![pol],
@@ -556,60 +707,12 @@ impl SlcReader {
             bounding_box,  // Use extracted bounding box
             coordinate_system: CoordinateSystem::Radar,
             sub_swaths,
-            orbit_data: None,
+            orbit_data,  // SCIENTIFIC FIX: Now properly populated from annotation
             range_looks: 1,
             azimuth_looks: 1,
             // CRITICAL: Use extracted pixel spacing - NO HARDCODED VALUES
             pixel_spacing: (range_pixel_spacing, azimuth_pixel_spacing)
         })
-    }
-
-    /// Extract bounding box using regex parsing (fallback method)
-    fn extract_bounding_box_regex(xml_content: &str) -> SarResult<BoundingBox> {
-        // Find all latitude and longitude values in geolocationGridPoint elements
-        let mut latitudes = Vec::new();
-        let mut longitudes = Vec::new();
-        
-        // Use split to find latitude values
-        let sections: Vec<&str> = xml_content.split("<geolocationGridPoint>").skip(1).take(20).collect();
-        
-        for section in sections {
-            if let Some(lat_start) = section.find("<latitude>") {
-                if let Some(lat_end) = section.find("</latitude>") {
-                    let lat_str = &section[lat_start + 10..lat_end];
-                    if let Ok(lat) = lat_str.parse::<f64>() {
-                        latitudes.push(lat);
-                    }
-                }
-            }
-            
-            if let Some(lon_start) = section.find("<longitude>") {
-                if let Some(lon_end) = section.find("</longitude>") {
-                    let lon_str = &section[lon_start + 11..lon_end];
-                    if let Ok(lon) = lon_str.parse::<f64>() {
-                        longitudes.push(lon);
-                    }
-                }
-            }
-        }
-        
-        if !latitudes.is_empty() && !longitudes.is_empty() {
-            let min_lat = latitudes.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            let max_lat = latitudes.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            let min_lon = longitudes.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            let max_lon = longitudes.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            
-            Ok(BoundingBox {
-                min_lon,
-                max_lon,
-                min_lat,
-                max_lat,
-            })
-        } else {
-            Err(SarError::Metadata(
-                "No coordinate data found in geolocation grid".to_string(),
-            ))
-        }
     }
 
     /// Extract comprehensive metadata using regex parsing
@@ -640,6 +743,19 @@ impl SlcReader {
             if let Some(value) = Self::extract_value(xml_content, field) {
                 metadata.insert(field.to_string(), value);
             }
+        }
+        
+        // CRITICAL: Extract coordinate bounds using the working simple extraction method
+        println!("🔍 DEBUG: extract_comprehensive_metadata attempting coordinate extraction");
+        if let Some((min_lat, max_lat, min_lon, max_lon)) = Self::extract_coordinates_from_geolocation_grid(xml_content) {
+            metadata.insert("min_latitude".to_string(), min_lat.to_string());
+            metadata.insert("max_latitude".to_string(), max_lat.to_string());
+            metadata.insert("min_longitude".to_string(), min_lon.to_string());
+            metadata.insert("max_longitude".to_string(), max_lon.to_string());
+            println!("🔍 DEBUG: Added coordinates to comprehensive metadata: lat=({:.6}, {:.6}), lon=({:.6}, {:.6})", 
+                     min_lat, max_lat, min_lon, max_lon);
+        } else {
+            println!("🔍 DEBUG: Failed to extract coordinates in comprehensive metadata");
         }
         
         // Extract average incidence angle from geolocation grid
@@ -677,14 +793,21 @@ impl SlcReader {
 
     /// Flexible time parsing that handles multiple formats
     fn parse_time_flexible(time_str: &str) -> SarResult<DateTime<Utc>> {
+        println!("🔍 DEBUG: Attempting to parse time: '{}'", time_str);
+        
         // Try different time formats
         if let Ok(time) = DateTime::parse_from_rfc3339(time_str) {
             return Ok(time.with_timezone(&Utc));
         }
         
-        // Try format without microseconds
-        if let Ok(time) = DateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S%.fZ") {
+        // Try format with microseconds and Z suffix
+        if let Ok(time) = DateTime::parse_from_str(&format!("{}Z", time_str), "%Y-%m-%dT%H:%M:%S%.fZ") {
             return Ok(time.with_timezone(&Utc));
+        }
+        
+        // Try format without Z suffix but assume UTC
+        if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S%.f") {
+            return Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc));
         }
         
         // Try format with explicit UTC
@@ -692,11 +815,20 @@ impl SlcReader {
             return Ok(time.with_timezone(&Utc));
         }
         
-        // Fallback to a default time
-        log::warn!("Could not parse time '{}', using default", time_str);
-        Ok(DateTime::parse_from_rfc3339("2020-01-03T17:08:15.000000Z")
-            .unwrap()
-            .with_timezone(&Utc))
+        // Try parsing without microseconds
+        if let Ok(time) = DateTime::parse_from_str(&format!("{}Z", time_str), "%Y-%m-%dT%H:%M:%SZ") {
+            return Ok(time.with_timezone(&Utc));
+        }
+        
+        // Try naive datetime without microseconds
+        if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S") {
+            return Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc));
+        }
+        
+        // Return error if no valid time format found
+        Err(SarError::InvalidFormat(
+            format!("Could not parse time '{}' - no valid time format recognized. Real Sentinel-1 annotation required.", time_str)
+        ))
     }
 
     /// Simple XML value extraction helper
@@ -795,8 +927,7 @@ impl SlcReader {
                 // Extract the TIFF file to a temporary location for ZIP format
                 let archive = self.open_archive()?;
                 let mut zip_file = archive.by_name(measurement_file)
-                    .map_err(|e| SarError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    .map_err(|e| SarError::Io(std::io::Error::other(
                         format!("Failed to access {}: {}", measurement_file, e),
                     )))?;
 
@@ -813,8 +944,7 @@ impl SlcReader {
 
                 // Read with GDAL from temporary file
                 gdal::Dataset::open(temp_file.path())
-                    .map_err(|e| SarError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    .map_err(|e| SarError::Io(std::io::Error::other(
                         format!("Failed to open TIFF with GDAL: {}", e),
                     )))?
             },
@@ -822,8 +952,7 @@ impl SlcReader {
                 // Read directly from SAFE directory structure
                 let full_path = self.product_path.join(measurement_file);
                 gdal::Dataset::open(full_path)
-                    .map_err(|e| SarError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    .map_err(|e| SarError::Io(std::io::Error::other(
                         format!("Failed to open TIFF with GDAL: {}", e),
                     )))?
             }
@@ -841,8 +970,7 @@ impl SlcReader {
         let slc_data = if band_count == 1 {
             // Single band containing complex data (Sentinel-1 SLC format: CInt16)
             let band = dataset.rasterband(1)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                     format!("Failed to get band 1: {}", e),
                 )))?;
 
@@ -851,8 +979,7 @@ impl SlcReader {
             
             // Sentinel-1 SLC uses complex 16-bit integers (CInt16)
             let complex_data = band.read_as::<i16>(window, window_size, (width * 2, height), None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                     format!("Failed to read complex CInt16 data: {}", e),
                 )))?;
 
@@ -863,14 +990,12 @@ impl SlcReader {
         } else if band_count >= 2 {
             // Separate I and Q bands (less common for Sentinel-1)
             let band1 = dataset.rasterband(1)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                     format!("Failed to get band 1: {}", e),
                 )))?;
 
             let band2 = dataset.rasterband(2)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                     format!("Failed to get band 2: {}", e),
                 )))?;
 
@@ -879,14 +1004,12 @@ impl SlcReader {
             let buffer_size = (width, height);
             
             let i_data = band1.read_as::<f32>(window, window_size, buffer_size, None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                     format!("Failed to read I data: {}", e),
                 )))?;
 
             let q_data = band2.read_as::<f32>(window, window_size, buffer_size, None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                     format!("Failed to read Q data: {}", e),
                 )))?;
 
@@ -933,8 +1056,7 @@ impl SlcReader {
         // Extract the TIFF file to a temporary location
         let archive = self.open_archive()?;
         let mut zip_file = archive.by_name(measurement_file)
-            .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to access {}: {}", measurement_file, e),
             )))?;
 
@@ -952,8 +1074,7 @@ impl SlcReader {
         // Read with GDAL
         let gdal_start = std::time::Instant::now();
         let dataset = gdal::Dataset::open(temp_file.path())
-            .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to open TIFF with GDAL: {}", e),
             )))?;
 
@@ -967,8 +1088,7 @@ impl SlcReader {
         let slc_data = if band_count == 1 {
             // Single band containing complex data (Sentinel-1 SLC format: CInt16)
             let band = dataset.rasterband(1)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to get band 1: {}", e),
             )))?;
 
@@ -977,8 +1097,7 @@ impl SlcReader {
             
             // Sentinel-1 SLC uses complex 16-bit integers (CInt16)
             let complex_data = band.read_as::<i16>(window, window_size, (width * 2, height), None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to read complex CInt16 data: {}", e),
             )))?;
 
@@ -989,14 +1108,12 @@ impl SlcReader {
         } else if band_count >= 2 {
             // Separate I and Q bands (less common for Sentinel-1)
             let band1 = dataset.rasterband(1)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to get band 1: {}", e),
             )))?;
 
             let band2 = dataset.rasterband(2)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to get band 2: {}", e),
             )))?;
 
@@ -1005,14 +1122,12 @@ impl SlcReader {
             let buffer_size = (width, height);
             
             let i_data = band1.read_as::<f32>(window, window_size, buffer_size, None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to read I data: {}", e),
             )))?;
 
             let q_data = band2.read_as::<f32>(window, window_size, buffer_size, None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to read Q data: {}", e),
             )))?;
 
@@ -1058,11 +1173,12 @@ impl SlcReader {
         // Read directly from ZIP into memory
         let buffer = {
             let archive = self.open_archive()?;
-            let mut zip_file = archive.by_name(measurement_file)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to access {}: {}", measurement_file, e),
-                )))?;
+            let mut zip_file = archive
+                .by_name(measurement_file)
+                .map_err(|e| SarError::Io(std::io::Error::other(format!(
+                    "Failed to access {}: {}",
+                    measurement_file, e
+                ))))?;
 
             // Read entire file into memory buffer
             let mut buffer = Vec::new();
@@ -1096,11 +1212,12 @@ impl SlcReader {
         }
         
         // Open with GDAL from memory
-        let dataset = gdal::Dataset::open(&vsi_path)
-            .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to open TIFF from memory: {}", e),
-            )))?;
+        let dataset = gdal::Dataset::open(&vsi_path).map_err(|e| {
+            SarError::Io(std::io::Error::other(format!(
+                "Failed to open TIFF from memory: {}",
+                e
+            )))
+        })?;
 
         let result = self.read_slc_from_dataset(dataset, pol);
         
@@ -1127,11 +1244,12 @@ impl SlcReader {
         // Handle different band configurations
         let slc_data = if band_count == 1 {
             // Single band containing complex data (Sentinel-1 SLC format: CInt16)
-            let band = dataset.rasterband(1)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to get band 1: {}", e),
-                )))?;
+            let band = dataset.rasterband(1).map_err(|e| {
+                SarError::Io(std::io::Error::other(format!(
+                    "Failed to get band 1: {}",
+                    e
+                )))
+            })?;
 
             // Check data type
             let data_type = band.band_type();
@@ -1143,11 +1261,14 @@ impl SlcReader {
             
             // Sentinel-1 SLC uses complex 16-bit integers (CInt16)
             // GDAL represents this as interleaved 16-bit signed integers: [real, imag, real, imag, ...]
-            let complex_data = band.read_as::<i16>(window, window_size, (width * 2, height), None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to read complex CInt16 data: {}", e),
-                )))?;
+            let complex_data = band
+                .read_as::<i16>(window, window_size, (width * 2, height), None)
+                .map_err(|e| {
+                    SarError::Io(std::io::Error::other(format!(
+                        "Failed to read complex CInt16 data: {}",
+                        e
+                    )))
+                })?;
 
             log::debug!("Read {} complex values as interleaved i16", complex_data.data.len() / 2);
 
@@ -1155,34 +1276,42 @@ impl SlcReader {
             Self::convert_cint16_to_complex(complex_data, width, height)?
         } else if band_count >= 2 {
             // Separate I and Q bands (less common for Sentinel-1)
-            let band1 = dataset.rasterband(1)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to get band 1: {}", e),
-                )))?;
+            let band1 = dataset.rasterband(1).map_err(|e| {
+                SarError::Io(std::io::Error::other(format!(
+                    "Failed to get band 1: {}",
+                    e
+                )))
+            })?;
 
-            let band2 = dataset.rasterband(2)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to get band 2: {}", e),
-                )))?;
+            let band2 = dataset.rasterband(2).map_err(|e| {
+                SarError::Io(std::io::Error::other(format!(
+                    "Failed to get band 2: {}",
+                    e
+                )))
+            })?;
 
             let window = (0, 0);
             let window_size = (width, height);
             let buffer_size = (width, height);
             
             // Read I and Q bands sequentially (GDAL is not thread-safe)
-            let i_data = band1.read_as::<f32>(window, window_size, buffer_size, None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to read I data: {}", e),
-                )))?;
+            let i_data = band1
+                .read_as::<f32>(window, window_size, buffer_size, None)
+                .map_err(|e| {
+                    SarError::Io(std::io::Error::other(format!(
+                        "Failed to read I data: {}",
+                        e
+                    )))
+                })?;
 
-            let q_data = band2.read_as::<f32>(window, window_size, buffer_size, None)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to read Q data: {}", e),
-                )))?;
+            let q_data = band2
+                .read_as::<f32>(window, window_size, buffer_size, None)
+                .map_err(|e| {
+                    SarError::Io(std::io::Error::other(format!(
+                        "Failed to read Q data: {}",
+                        e
+                    )))
+                })?;
 
             // Convert to complex SLC data
             Self::convert_to_complex_parallel(i_data, q_data, width, height)?
@@ -1572,8 +1701,7 @@ impl SlcReader {
         // Extract TIFF to get dimensions
         let archive = self.open_archive()?;
         let mut zip_file = archive.by_name(measurement_file)
-            .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to access {}: {}", measurement_file, e),
             )))?;
         
@@ -1588,8 +1716,7 @@ impl SlcReader {
         
         // Open with GDAL to get dimensions
         let dataset = gdal::Dataset::open(temp_file.path())
-            .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|e| SarError::Io(std::io::Error::other(
                 format!("Failed to open TIFF with GDAL: {}", e),
             )))?;
         
@@ -1649,57 +1776,31 @@ impl SlcReader {
         &mut self,
         pol: Polarization,
         azimuth_line: usize,
-        range_sample: usize,
-        orbit_cache_dir: Option<&Path>,
+    _range_sample: usize,
+    _orbit_cache_dir: Option<&Path>,
     ) -> SarResult<f64> {
-        let (position, velocity) = self.get_satellite_position_at_pixel(
-            pol, azimuth_line, range_sample, orbit_cache_dir
-        )?;
-        
-        // For now, use a simplified look direction calculation
-        // In a full implementation, this would use the range geometry and target position
-        // Here we approximate the look direction as perpendicular to velocity
-        let velocity_mag = (velocity[0].powi(2) + velocity[1].powi(2) + velocity[2].powi(2)).sqrt();
-        let _velocity_unit = [
-            velocity[0] / velocity_mag,
-            velocity[1] / velocity_mag,
-            velocity[2] / velocity_mag,
-        ];
-        
-        // Simplified look direction (perpendicular to velocity, towards Earth)
-        let earth_center = [0.0, 0.0, 0.0];
-        let to_earth = [
-            earth_center[0] - position[0],
-            earth_center[1] - position[1],
-            earth_center[2] - position[2],
-        ];
-        let to_earth_mag = (to_earth[0].powi(2) + to_earth[1].powi(2) + to_earth[2].powi(2)).sqrt();
-        let look_direction = [
-            to_earth[0] / to_earth_mag,
-            to_earth[1] / to_earth_mag,
-            to_earth[2] / to_earth_mag,
-        ];
-        
-        // Extract wavelength from annotation XML (MANDATORY - no hardcoded values)
-        let wavelength = match self.get_annotation_for_polarization(pol) {
-            Ok(annotation) => {
-                annotation.extract_radar_wavelength()
-                    .map_err(|e| SarError::Processing(format!("Cannot extract wavelength for Doppler calculation: {}", e)))?
-            }
-            Err(_) => {
-                return Err(SarError::MissingParameter(
-                    "Annotation not available - cannot calculate wavelength for Doppler".to_string()
-                ));
-            }
-        };
-        
-        let doppler = crate::io::orbit::OrbitReader::calculate_doppler_centroid(
-            velocity, look_direction, wavelength
-        );
-        
-        log::debug!("Doppler at pixel [{}, {}]: {:.2} Hz", azimuth_line, range_sample, doppler);
-        
-        Ok(doppler)
+        // Use real Doppler centroid model from annotation (dcEstimate.dataDcPolynomial)
+        // Map azimuth_line to time since product start using azimuth_time_interval derived from PRF or annotation
+        let annotation_root = self.get_annotation_for_polarization(pol)?;
+    let _sar_meta = self.read_annotation(pol)?;
+
+        // Determine azimuth time interval (s/line)
+        let az_time_interval = if let Some(image) = &annotation_root.image_annotation {
+            if let Some(info) = &image.image_information {
+                if let Some(dt) = info.azimuth_time_interval { dt }
+                else {
+                    // Compute from PRF if available: time per line ~ 1/PRF
+                    if let Some(prf) = info.azimuth_frequency { 1.0 / prf } else { return Err(SarError::Metadata("Missing azimuthTimeInterval/PRF in annotation".to_string())); }
+                }
+            } else { return Err(SarError::Metadata("Missing imageInformation in annotation".to_string())); }
+        } else { return Err(SarError::Metadata("Missing imageAnnotation in annotation".to_string())); };
+
+        // Time since start in seconds
+        let az_time_since_start = azimuth_line as f64 * az_time_interval;
+
+        let doppler_hz = annotation_root.evaluate_doppler_centroid(az_time_since_start)?;
+        log::debug!("Doppler (dcPolynomial) at line {} (t={:.6}s): {:.2} Hz", azimuth_line, az_time_since_start, doppler_hz);
+        Ok(doppler_hz)
     }
 
     /// Extract IW sub-swaths information from annotation files
@@ -1713,87 +1814,27 @@ impl SlcReader {
             .clone();
 
         let archive = self.open_archive()?;
-        let mut file = archive.by_name(&annotation_file)
-            .map_err(|e| SarError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to read {}: {}", annotation_file, e),
-            )))?;
+        let mut file = archive
+            .by_name(&annotation_file)
+            .map_err(|e| SarError::Io(std::io::Error::other(format!(
+                "Failed to read {}: {}",
+                annotation_file, e
+            ))))?;
 
         let mut xml_content = String::new();
         file.read_to_string(&mut xml_content)?;
 
-        // First, try the detailed annotation parser
-        if let Ok(annotation) = crate::io::annotation::AnnotationParser::parse_annotation(&xml_content) {
-            if let Ok(subswaths) = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation) {
-                return Ok(subswaths);
-            }
-        }
-
-        // Fallback: Parse using simple string extraction for IW sub-swaths
-        Self::extract_iw_subswaths_fallback(&xml_content, &annotation_file)
-    }
-
-    /// Fallback method to extract IW sub-swaths using simple string parsing
-    fn extract_iw_subswaths_fallback(xml_content: &str, file_path: &str) -> SarResult<HashMap<String, SubSwath>> {
-        let mut subswaths = HashMap::new();
-        
-        // Extract swath ID from filename (e.g., "iw1", "iw2", "iw3")
-        let swath_id = if let Some(captures) = regex::Regex::new(r"-(iw\d+)-")
-            .unwrap()
-            .captures(file_path) {
-            captures.get(1).unwrap().as_str().to_uppercase()
-        } else {
-            "IW1".to_string() // Default fallback
-        };
-        
-        // Extract basic parameters using simple string parsing
-        let range_samples = Self::extract_numeric_value(&xml_content, "numberOfSamples")
-            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: numberOfSamples not found in annotation XML! Real Sentinel-1 annotation required.".to_string()))? as usize;
-        
-        let azimuth_samples = Self::extract_numeric_value(&xml_content, "numberOfLines")
-            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: numberOfLines not found in annotation XML! Real Sentinel-1 annotation required.".to_string()))? as usize;
-        
-        let range_pixel_spacing = Self::extract_numeric_value(&xml_content, "rangePixelSpacing")
-            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Range pixel spacing not found in annotation XML! Real Sentinel-1 annotation required.".to_string()))?;
-        
-        let azimuth_pixel_spacing = Self::extract_numeric_value(&xml_content, "azimuthPixelSpacing")
-            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Azimuth pixel spacing not found in annotation XML! Real Sentinel-1 annotation required.".to_string()))?;
-        
-        let slant_range_time = Self::extract_numeric_value(&xml_content, "slantRangeTime")
-            .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Slant range time not found in annotation XML! Real Sentinel-1 annotation required.".to_string()))?;
-        
-        // Count bursts by counting <burst> elements
-        let burst_count = xml_content.matches("<burst>").count();
-        let burst_count = if burst_count > 0 { burst_count } else { 9 }; // Typical IW burst count
-        
-        let subswath = SubSwath {
-            id: swath_id.clone(),
-            burst_count,
-            range_samples,
-            azimuth_samples,
-            range_pixel_spacing,
-            azimuth_pixel_spacing,
-            slant_range_time,
-            burst_duration: 2.758277, // Standard IW burst duration
-        };
-        
-        subswaths.insert(swath_id, subswath);
-        
+        // Parse using the detailed annotation parser only (no string fallback)
+        let annotation = crate::io::annotation::AnnotationParser::parse_annotation(&xml_content)
+            .map_err(|e| SarError::XmlParsing(format!("Failed to parse annotation XML {}: {}", annotation_file, e)))?;
+        let subswaths = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
+            .map_err(|e| SarError::Processing(format!("Failed to extract IW sub-swaths from {}: {}", annotation_file, e)))?;
         Ok(subswaths)
     }
+
+    // Removed fallback string-based IW subswath extraction to enforce scientific parser only.
     
-    /// Extract numeric value from XML using simple string parsing
-    fn extract_numeric_value(xml_content: &str, tag_name: &str) -> Option<f64> {
-        let pattern = format!("<{}>(.*?)</{}>", tag_name, tag_name);
-        if let Ok(regex) = regex::Regex::new(&pattern) {
-            if let Some(captures) = regex.captures(xml_content) {
-                if let Some(value_match) = captures.get(1) {
-                    return value_match.as_str().trim().parse::<f64>().ok();
-                }
-            }
-        }
-        None
-    }
+    // Deprecated: string-based numeric extraction removed for scientific rigor
 
     /// Find ALL annotation files for all IW subswaths (not just one per polarization)
     pub fn find_all_iw_annotation_files(&mut self) -> SarResult<HashMap<Polarization, Vec<String>>> {
@@ -1816,7 +1857,7 @@ impl SlcReader {
                 };
                 
                 if let Some(polarization) = pol {
-                    annotations.entry(polarization).or_insert_with(Vec::new).push(file);
+                    annotations.entry(polarization).or_default().push(file);
                 }
             }
         }
@@ -1843,30 +1884,27 @@ impl SlcReader {
                 format!("No annotation files found for polarization {}", pol)
             ))?;
 
-        let mut all_subswaths = HashMap::new();
+    let mut all_subswaths = HashMap::new();
         
         for annotation_file in annotation_files {
             log::debug!("Processing annotation file: {}", annotation_file);
             
             let archive = self.open_archive()?;
-            let mut file = archive.by_name(annotation_file)
-                .map_err(|e| SarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to read {}: {}", annotation_file, e),
-                )))?;
+            let mut file = archive
+                .by_name(annotation_file)
+                .map_err(|e| SarError::Io(std::io::Error::other(format!(
+                    "Failed to read {}: {}",
+                    annotation_file, e
+                ))))?;
 
             let mut xml_content = String::new();
             file.read_to_string(&mut xml_content)?;
 
             // Extract the IW subswath from this annotation file
-            let subswaths = if let Ok(annotation) = crate::io::annotation::AnnotationParser::parse_annotation(&xml_content) {
-                // Try the detailed annotation parser first
-                crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
-                    .unwrap_or_else(|_| Self::extract_iw_subswaths_fallback(&xml_content, annotation_file).unwrap_or_default())
-            } else {
-                // Fallback: Parse using simple string extraction
-                Self::extract_iw_subswaths_fallback(&xml_content, annotation_file)?
-            };
+            let annotation = crate::io::annotation::AnnotationParser::parse_annotation(&xml_content)
+                .map_err(|e| SarError::XmlParsing(format!("Failed to parse {}: {}", annotation_file, e)))?;
+            let subswaths = crate::io::annotation::AnnotationParser::extract_subswaths(&annotation)
+                .map_err(|e| SarError::Processing(format!("Failed to extract IW sub-swaths from {}: {}", annotation_file, e)))?;
             
             // Add all extracted subswaths to our collection
             for (swath_id, subswath) in subswaths {
@@ -1882,7 +1920,7 @@ impl SlcReader {
         let all_annotations = self.find_all_iw_annotation_files()?;
         let mut all_subswaths = HashMap::new();
         
-        for (pol, _) in all_annotations {
+    for pol in all_annotations.keys().cloned() {
             match self.extract_all_iw_subswaths(pol) {
                 Ok(subswaths) => {
                     log::info!("Extracted {} subswaths for polarization {}", subswaths.len(), pol);
@@ -1895,6 +1933,11 @@ impl SlcReader {
         }
         
         Ok(all_subswaths)
+    }
+
+    /// Get subswath names as a vector of strings
+    pub fn subswath_names(metadata: &SarMetadata) -> Vec<String> {
+        metadata.sub_swaths.keys().cloned().collect()
     }
 
     /// Check if this is an IW mode SLC product
@@ -1940,7 +1983,9 @@ impl SlcReader {
         log::info!("Extracted {} bursts for deburst processing", burst_info.len());
         
         // Create deburst processor
-        let processor = DeburstProcessor::new(burst_info);
+        // TODO: Extract actual satellite velocity from annotation for scientific accuracy
+        let satellite_velocity = 7500.0; // Approximate Sentinel-1 velocity - should be calculated from orbit
+        let processor = DeburstProcessor::new(burst_info, satellite_velocity);
         
         // Configure deburst processing
         let config = DeburstConfig {
@@ -1989,7 +2034,9 @@ impl SlcReader {
         log::info!("Extracted {} bursts with TOPSAR parameters for deburst processing", burst_info.len());
         
         // Create deburst processor
-        let processor = DeburstProcessor::new(burst_info);
+        // TODO: Extract actual satellite velocity from annotation for scientific accuracy
+        let satellite_velocity = 7500.0; // Approximate Sentinel-1 velocity - should be calculated from orbit
+        let processor = DeburstProcessor::new(burst_info, satellite_velocity);
         
         // Perform deburst with custom configuration
         let deburst_data = processor.deburst(&slc_data, &config)?;
@@ -2161,6 +2208,19 @@ impl SlcReader {
         metadata.insert("min_latitude".to_string(), sar_metadata.bounding_box.min_lat.to_string());
         metadata.insert("max_latitude".to_string(), sar_metadata.bounding_box.max_lat.to_string());
         
+        // Check if coordinates are valid - fail if not
+        if (sar_metadata.bounding_box.min_lat == 0.0 && sar_metadata.bounding_box.max_lat == 0.0) ||
+           (sar_metadata.bounding_box.min_lat == -90.0 && sar_metadata.bounding_box.max_lat == 90.0 && 
+            sar_metadata.bounding_box.min_lon == -180.0 && sar_metadata.bounding_box.max_lon == 180.0) ||
+           (sar_metadata.bounding_box.min_lon == 0.0 && sar_metadata.bounding_box.max_lon == 0.0) {
+            log::error!("Failed to extract valid coordinate data from annotation XML");
+            metadata.insert("coordinate_extraction_status".to_string(), "FAILED_NO_FALLBACK".to_string());
+        } else {
+            log::info!("Structured extraction succeeded with coordinates: [{:.6}, {:.6}, {:.6}, {:.6}]",
+                      sar_metadata.bounding_box.min_lon, sar_metadata.bounding_box.min_lat, 
+                      sar_metadata.bounding_box.max_lon, sar_metadata.bounding_box.max_lat);
+        }
+        
         // Processing information
         metadata.insert("coordinate_system".to_string(), format!("{:?}", sar_metadata.coordinate_system));
         metadata.insert("range_looks".to_string(), sar_metadata.range_looks.to_string());
@@ -2242,20 +2302,24 @@ impl SlcReader {
         metadata.insert("processing_level".to_string(), "1".to_string()); // Sentinel-1 SLC is Level-1
         metadata.insert("processor_version".to_string(), "SARdine v0.2.0".to_string());
 
-        // Extract center coordinates from bounding box
-        let center_lat = (sar_metadata.bounding_box.min_lat + sar_metadata.bounding_box.max_lat) / 2.0;
-        let center_lon = (sar_metadata.bounding_box.min_lon + sar_metadata.bounding_box.max_lon) / 2.0;
-        log::info!("Calculated center coordinates: lat={}, lon={}", center_lat, center_lon);
-        metadata.insert("center_lat".to_string(), center_lat.to_string());
-        metadata.insert("center_lon".to_string(), center_lon.to_string());
+        // Extract center coordinates from bounding box (only if not already calculated by regex extraction)
+        if !metadata.contains_key("center_lat") {
+            let center_lat = (sar_metadata.bounding_box.min_lat + sar_metadata.bounding_box.max_lat) / 2.0;
+            let center_lon = (sar_metadata.bounding_box.min_lon + sar_metadata.bounding_box.max_lon) / 2.0;
+            log::info!("Calculated center coordinates from structured bounding box: lat={}, lon={}", center_lat, center_lon);
+            metadata.insert("center_lat".to_string(), center_lat.to_string());
+            metadata.insert("center_lon".to_string(), center_lon.to_string());
+        } else {
+            log::info!("Center coordinates already calculated by regex extraction, keeping those values");
+        }
 
         // DEBUGGING: Add a simple test field to verify this code runs
         metadata.insert("test_enhancement_reached".to_string(), "YES".to_string());
 
         // Extract subswath information
-        let subswaths: Vec<String> = sar_metadata.sub_swaths.iter()
-            .map(|(name, _)| name.clone())
-            .collect();
+            let subswaths: Vec<String> = sar_metadata.sub_swaths.keys()
+                .cloned()
+                .collect();
         if !subswaths.is_empty() {
             metadata.insert("subswaths".to_string(), subswaths.join(","));
         }

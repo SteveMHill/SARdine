@@ -7,6 +7,9 @@ use std::io::Read;
 /// Digital Elevation Model reader
 pub struct DemReader;
 
+/// Orbit state vector represented as position (px, py, pz) and velocity (vx, vy, vz)
+type OrbitStateVector = (f64, f64, f64, f64, f64, f64);
+
 impl DemReader {
     /// Read DEM data for a specific bounding box
     pub fn read_dem<P: AsRef<Path>>(
@@ -29,7 +32,7 @@ impl DemReader {
 
         if is_hgt_file {
             // Debug output suppressed
-            return Self::read_srtm_hgt_file_safe(dem_path, Some(bbox)).map(|(dem, transform)| (dem, transform));
+            return Self::read_srtm_hgt_file_safe(dem_path, Some(bbox));
         }
 
         // Debug output suppressed
@@ -217,8 +220,8 @@ impl DemReader {
             let lat_part = &tile[0..3]; // First 3 characters (e.g., "N50", "S45")
             lat_part.to_string()
         } else {
-            // Fallback for malformed tile names
-            "N00".to_string()
+            // SCIENTIFIC MODE: Malformed tile names are not allowed
+            return "INVALID_TILE".to_string();
         }
     }
     
@@ -227,19 +230,13 @@ impl DemReader {
         // SRTM files are organized by continent on USGS servers
         // This is a simplified mapping - in practice, you'd need a more detailed lookup
         if tile.starts_with('N') {
-            if tile.contains("W") {
-                "North_America"  // North America
-            } else {
-                "Eurasia"        // Europe/Asia
-            }
+            if tile.contains("W") { "North_America" } else { "Eurasia" }
+        } else if tile.contains("W") {
+            "South_America"
+        } else if tile.contains("E") && (tile.starts_with("S0") || tile.starts_with("S1")) {
+            "Africa"
         } else {
-            if tile.contains("W") {
-                "South_America"  // South America
-            } else if tile.contains("E") && (tile.starts_with("S0") || tile.starts_with("S1")) {
-                "Africa"         // Africa
-            } else {
-                "Australia"      // Australia/Oceania
-            }
+            "Australia"
         }
     }
 
@@ -485,7 +482,7 @@ impl DemReader {
                     }
                 }
             },
-            Err(e) => {
+            Err(_e) => {
                 log::info!("No existing DEM files found. Attempting to download SRTM tiles...");
                 // Only download if no existing files found
                 match Self::download_srtm_tiles(bbox, &srtm_cache_dir) {
@@ -517,37 +514,33 @@ impl DemReader {
         // Debug output suppressed
         
         // Look in the main cache directory
-        if let Ok(entries) = std::fs::read_dir(cache_dir) {
-            let mut count = 0;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                count += 1;
-                if let Some(extension) = path.extension() {
-                    if extension == "hgt" || extension == "tif" || extension == "tiff" {
-                        // Check if this DEM file overlaps with the requested bbox
-                        let path_str = path.to_string_lossy().to_string();
-                        if Self::dem_file_overlaps_bbox(&path_str, bbox)? {
-                            dem_files.push(path_str.clone());
+            if let Ok(entries) = std::fs::read_dir(cache_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(extension) = path.extension() {
+                        if extension == "hgt" || extension == "tif" || extension == "tiff" {
+                            // Check if this DEM file overlaps with the requested bbox
+                            let path_str = path.to_string_lossy().to_string();
+                            if Self::dem_file_overlaps_bbox(&path_str, bbox)? {
+                                dem_files.push(path_str);
+                            }
                         }
                     }
                 }
-            }
         }
         
         // Also look in the srtm_tiles subdirectory (common convention)
         let srtm_tiles_dir = format!("{}/srtm_tiles", cache_dir);
         if std::path::Path::new(&srtm_tiles_dir).exists() {
             if let Ok(entries) = std::fs::read_dir(&srtm_tiles_dir) {
-                let mut count = 0;
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    count += 1;
                     if let Some(extension) = path.extension() {
                         if extension == "hgt" || extension == "tif" || extension == "tiff" {
                             // Check if this DEM file overlaps with the requested bbox
                             let path_str = path.to_string_lossy().to_string();
                             if Self::dem_file_overlaps_bbox(&path_str, bbox)? {
-                                dem_files.push(path_str.clone());
+                                dem_files.push(path_str);
                             }
                         }
                     }
@@ -584,7 +577,7 @@ impl DemReader {
     fn create_dem_mosaic(
         tile_files: &[String],
         bbox: &BoundingBox,
-        target_resolution: f64,
+        _target_resolution: f64,
     ) -> SarResult<(Array2<f32>, GeoTransform)> {
         log::info!("Creating DEM mosaic from {} tiles", tile_files.len());
         // Debug output suppressed
@@ -673,10 +666,58 @@ impl DemReader {
             return Ok(tile_data.into_iter().next().unwrap());
         }
         
-        // For now, just use the first valid tile as a fallback
-        // A proper implementation would mosaic all tiles together
-        log::warn!("Using first valid tile as mosaic fallback. Proper mosaicking not yet implemented.");
-        Ok(tile_data.into_iter().next().unwrap())
+        // SCIENTIFIC MODE: Implement proper DEM mosaicking for multiple tiles
+        log::info!("🧩 Creating scientifically valid DEM mosaic from {} tiles", tile_data.len());
+        
+        // Determine output mosaic parameters using consistent resolution
+        let pixel_size = tile_data[0].1.pixel_width; // Use first tile's resolution
+        let mosaic_width = ((overall_max_lon - overall_min_lon) / pixel_size).ceil() as usize;
+        let mosaic_height = ((overall_max_lat - overall_min_lat) / pixel_size.abs()).ceil() as usize;
+        
+        log::info!("📊 Mosaic dimensions: {}x{} ({}°x{}°)", 
+                   mosaic_width, mosaic_height, 
+                   overall_max_lon - overall_min_lon, 
+                   overall_max_lat - overall_min_lat);
+        
+        // Create output mosaic array
+        let mut mosaic = Array2::from_elem((mosaic_height, mosaic_width), -32768.0f32);
+        
+        // Mosaic transform
+        let mosaic_transform = GeoTransform {
+            top_left_x: overall_min_lon,
+            top_left_y: overall_max_lat,
+            pixel_width: pixel_size,
+            pixel_height: -pixel_size.abs(), // Negative for north-up images
+            rotation_x: 0.0,
+            rotation_y: 0.0,
+        };
+        
+        // Copy data from each tile into the mosaic
+        for (tile_dem, tile_transform) in &tile_data {
+            let (tile_height, tile_width) = tile_dem.dim();
+            
+            // Calculate tile position in mosaic coordinates
+            let tile_start_x = ((tile_transform.top_left_x - overall_min_lon) / pixel_size).round() as usize;
+            let tile_start_y = ((overall_max_lat - tile_transform.top_left_y) / pixel_size.abs()).round() as usize;
+            
+            // Copy tile data to mosaic with bounds checking
+            for i in 0..tile_height {
+                for j in 0..tile_width {
+                    let mosaic_y = tile_start_y + i;
+                    let mosaic_x = tile_start_x + j;
+                    
+                    if mosaic_y < mosaic_height && mosaic_x < mosaic_width {
+                        let tile_value = tile_dem[[i, j]];
+                        if tile_value != -32768.0 { // Valid elevation data
+                            mosaic[[mosaic_y, mosaic_x]] = tile_value;
+                        }
+                    }
+                }
+            }
+        }
+        
+        log::info!("✅ Scientific DEM mosaicking completed successfully");
+        Ok((mosaic, mosaic_transform))
     }
 
     /// Resample DEM to target grid using bilinear interpolation
@@ -1189,7 +1230,7 @@ impl DemReader {
         sar_image: &Array2<f32>,              // Calibrated sigma0 data
         sar_bbox: &BoundingBox,               // SAR scene bounding box
         sar_geo_transform: &GeoTransform,     // SAR geotransform
-        orbit_data: &crate::types::OrbitData, // Satellite orbit information
+        _orbit_data: &crate::types::OrbitData, // Satellite orbit information
         cache_dir: &str,                      // DEM cache directory
         output_resolution: f64,               // Target resolution in meters
     ) -> SarResult<(Array2<f32>, Array2<bool>)> {
@@ -1273,7 +1314,7 @@ impl DemReader {
         
         // Step 7: Compute local incidence angles (simplified for now)
         log::info!("📡 Step 7: Computing local incidence angles");
-        let look_vector = (0.0f32, 0.7071f32, 0.7071f32); // Simplified look vector
+    let look_vector = (0.0f32, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2); // Simplified look vector
         let local_incidence_angles = Self::compute_precise_local_incidence_angles(
             &surface_normals,
             &look_vector
@@ -1289,13 +1330,15 @@ impl DemReader {
         // Use the new advanced masking system
         use crate::core::advanced_masking::{AdvancedMaskingProcessor, AdvancedMaskingConfig, MaskingMethod};
         
-        let mut masking_config = AdvancedMaskingConfig::default();
-        masking_config.method = MaskingMethod::Comprehensive;
-        masking_config.enable_layover_shadow = true;
-        masking_config.enable_water_detection = true;
-        masking_config.enable_noise_detection = true;
-        masking_config.enable_edge_detection = true;
-        masking_config.confidence_level = 0.90; // High confidence for scientific applications
+        let mut masking_config = AdvancedMaskingConfig {
+            method: MaskingMethod::Comprehensive,
+            enable_layover_shadow: true,
+            enable_water_detection: true,
+            enable_noise_detection: true,
+            enable_edge_detection: true,
+            confidence_level: 0.90, // High confidence for scientific applications
+            ..Default::default()
+        };
         
         // Configure terrain-specific parameters
         masking_config.layover_shadow_params.min_incidence_deg = 10.0;
@@ -1513,7 +1556,7 @@ impl DemReader {
         if width < 3 || height < 3 {
             log::warn!("DEM too small ({}x{}), creating minimal valid DEM", width, height);
             let min_size = 10;
-            let mut minimal_dem = Array2::from_elem((min_size, min_size), 0.0f32);
+            let minimal_dem = Array2::from_elem((min_size, min_size), 0.0f32);
             let adjusted_transform = GeoTransform {
                 top_left_x: geo_transform[0],
                 top_left_y: geo_transform[3], 
@@ -1630,7 +1673,7 @@ impl DemReader {
         // Calculate transform for the tile
         let pixel_size = 1.0 / safe_size as f64; // Approximate degree per pixel
         
-        let mut transform = GeoTransform {
+        let transform = GeoTransform {
             top_left_x: lon as f64,
             pixel_width: pixel_size,
             rotation_x: 0.0,
@@ -1878,7 +1921,7 @@ impl DemReader {
     fn solve_range_doppler_equations(
         dem_ecef: &Array3<f64>,
         orbit_data: &crate::types::OrbitData,
-        wavelength: f64,
+        _wavelength: f64,
     ) -> SarResult<Array2<(f64, f64)>> {
         let (height, width) = (dem_ecef.shape()[1], dem_ecef.shape()[2]);
         let mut geocoded_coords = Array2::from_elem((height, width), (0.0, 0.0));
@@ -2046,7 +2089,8 @@ impl DemReader {
     }
 
     /// Parse orbit state vectors from annotation XML
-    fn parse_orbit_state_vectors(orbit_data: &str) -> SarResult<Vec<(f64, f64, f64, f64, f64, f64)>> {
+    #[allow(dead_code)]
+    fn parse_orbit_state_vectors(orbit_data: &str) -> SarResult<Vec<OrbitStateVector>> {
         let mut state_vectors = Vec::new();
         
         // Parse orbit state vectors from XML

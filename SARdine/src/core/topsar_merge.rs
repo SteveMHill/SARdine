@@ -35,9 +35,10 @@ pub struct MergeParameters {
 }
 
 /// Blending methods for overlap regions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum BlendingMethod {
     /// Linear blending with distance weighting
+    #[default]
     Linear,
     /// Gaussian weighted blending
     Gaussian { sigma: f32 },
@@ -591,17 +592,13 @@ impl TopsarMerge {
         if !pixel_value.is_finite() {
             return 0.0;
         }
-        
-        // Quality based on reasonable backscatter range
-        let quality = if pixel_value > 0.0001 && pixel_value < 10.0 {
+        if pixel_value > 0.0001 && pixel_value < 10.0 {
             1.0
         } else if pixel_value > 0.0 && pixel_value < 100.0 {
             0.7
         } else {
             0.3
-        };
-        
-        quality
+        }
     }
 
     /// Enhanced overlap blending with quality control
@@ -687,7 +684,7 @@ impl TopsarMerge {
                         
                         // Calculate output position
                         let (out_rg1, _) = self.calculate_enhanced_placement_offset(
-                            &self.subswaths.iter().find(|s| s.id == overlap.swath1_id).unwrap()
+                            self.subswaths.iter().find(|s| s.id == overlap.swath1_id).unwrap()
                         )?;
                         
                         let out_rg = out_rg1 + rg1;
@@ -779,9 +776,7 @@ impl TopsarMerge {
                 let ratio = val2 / val1;
                 let adaptive_weight = if ratio > 0.5 && ratio < 2.0 {
                     weight
-                } else {
-                    if val1 > val2 { 0.2 } else { 0.8 }
-                };
+                } else if val1 > val2 { 0.2 } else { 0.8 };
                 Ok(val1 * (1.0 - adaptive_weight) + val2 * adaptive_weight)
             }
         }
@@ -790,10 +785,9 @@ impl TopsarMerge {
     /// Assess quality of blended pixel
     fn assess_blending_quality(&self, val1: f32, val2: f32, blended: f32) -> f32 {
         // Quality based on consistency between input values and blend result
-        let consistency = if val1 > 0.0 && val2 > 0.0 {
+        if val1 > 0.0 && val2 > 0.0 {
             let ratio = val2 / val1;
             let blend_ratio = blended / ((val1 + val2) / 2.0);
-            
             if ratio > 0.3 && ratio < 3.0 && blend_ratio > 0.7 && blend_ratio < 1.3 {
                 1.0
             } else if ratio > 0.1 && ratio < 10.0 {
@@ -803,9 +797,7 @@ impl TopsarMerge {
             }
         } else {
             0.0
-        };
-        
-        consistency
+        }
     }
 
     /// Blend complex overlap with phase preservation
@@ -861,7 +853,7 @@ impl TopsarMerge {
                         
                         // Calculate output position
                         let (out_rg1, _) = self.calculate_enhanced_placement_offset(
-                            &self.subswaths.iter().find(|s| s.id == overlap.swath1_id).unwrap()
+                            self.subswaths.iter().find(|s| s.id == overlap.swath1_id).unwrap()
                         )?;
                         
                         let out_rg = out_rg1 + rg1;
@@ -1103,11 +1095,50 @@ pub fn merge_iw_subswaths(
     merger.merge_subswaths(&intensity_data, preserve_complex, complex_data.as_ref())
 }
 
+impl Default for MergeParameters {
+    fn default() -> Self {
+        Self {
+            blending_method: BlendingMethod::Linear,
+            preserve_phase: true,
+            optimize_overlaps: true,
+            enable_parallel: true,
+            chunk_size: 4096,
+            feather_width: 16,
+        }
+    }
+}
+
+// Default is now derived on the enum with #[default]
+
+impl Default for QualityControl {
+    fn default() -> Self {
+        Self {
+            enable_validation: true,
+            max_phase_discontinuity: 0.5,
+            min_valid_pixel_ratio: 0.8,
+            optimize_seamlines: true,
+            radiometric_tolerance: 0.1,
+        }
+    }
+}
+
+impl Default for QualityResults {
+    fn default() -> Self {
+        Self {
+            overall_quality: 0.0,
+            phase_preservation: None,
+            radiometric_consistency: 0.0,
+            overlap_qualities: Vec::new(),
+            validation_passed: false,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+// Tests moved to end of file to avoid clippy::items-after-test-module
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
-    use num_complex::Complex32;
 
     #[test]
     fn test_topsar_merge_creation() {
@@ -1177,49 +1208,5 @@ mod tests {
         assert_eq!(overlap.swath2_id, "IW2");
         assert!(overlap.swath1_range_start > 0);
         assert!(overlap.swath2_range_end > 0);
-    }
-}
-
-impl Default for MergeParameters {
-    fn default() -> Self {
-        Self {
-            blending_method: BlendingMethod::Linear,
-            preserve_phase: true,
-            optimize_overlaps: true,
-            enable_parallel: true,
-            chunk_size: 4096,
-            feather_width: 16,
-        }
-    }
-}
-
-impl Default for BlendingMethod {
-    fn default() -> Self {
-        BlendingMethod::Linear
-    }
-}
-
-impl Default for QualityControl {
-    fn default() -> Self {
-        Self {
-            enable_validation: true,
-            max_phase_discontinuity: 0.5,
-            min_valid_pixel_ratio: 0.8,
-            optimize_seamlines: true,
-            radiometric_tolerance: 0.1,
-        }
-    }
-}
-
-impl Default for QualityResults {
-    fn default() -> Self {
-        Self {
-            overall_quality: 0.0,
-            phase_preservation: None,
-            radiometric_consistency: 0.0,
-            overlap_qualities: Vec::new(),
-            validation_passed: false,
-            warnings: Vec::new(),
-        }
     }
 }

@@ -290,7 +290,7 @@ impl IwMergeProcessor {
                     };
                     
                     // Accumulate weighted sample
-                    output[[out_row, out_col]] = output[[out_row, out_col]] + normalized_value * blend_weight;
+                    output[[out_row, out_col]] += normalized_value * blend_weight;
                     weights[[out_row, out_col]] += blend_weight;
                 }
             }
@@ -300,7 +300,7 @@ impl IwMergeProcessor {
     }
     
     /// Calculate blending weight for overlap regions
-    fn calculate_blend_weight(&self, swath_info: &SubSwathInfo, sample: usize, range_coord: f64) -> f32 {
+    fn calculate_blend_weight(&self, swath_info: &SubSwathInfo, sample: usize, _range_coord: f64) -> f32 {
         if !self.config.blend_overlaps {
             return 1.0;
         }
@@ -336,7 +336,7 @@ impl IwMergeProcessor {
             for j in 0..samples {
                 let weight = weights[[i, j]];
                 if weight > 0.0 {
-                    image[[i, j]] = image[[i, j]] / weight;
+                    image[[i, j]] /= weight;
                     normalized_pixels += 1;
                 }
             }

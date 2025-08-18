@@ -3,7 +3,7 @@
 pub mod slc_reader;
 pub mod orbit;
 pub mod dem;
-pub mod annotation;
+pub mod annotation;  // Comprehensive XML parser with regex-based approach
 
 pub use slc_reader::SlcReader;
 pub use orbit::OrbitReader;

@@ -5,7 +5,6 @@
 
 use crate::types::{SarResult, SarError};
 use crate::constants::physical::SPEED_OF_LIGHT_M_S;
-use std::collections::HashSet;
 
 /// SAR parameter validation ranges based on scientific literature
 pub struct ValidationRanges {
@@ -67,6 +66,32 @@ impl ParameterValidator {
         }
         
         Ok(())
+    }
+
+    /// Validate wavelength with frequency context. If wavelength matches c/f closely, skip hardcoded-value check.
+    pub fn validate_wavelength_with_frequency(
+        &self,
+        frequency: f64,
+        wavelength: f64,
+        source: &str,
+    ) -> SarResult<()> {
+        // Range check first
+        if wavelength < self.ranges.wavelength_range.0 || wavelength > self.ranges.wavelength_range.1 {
+            return Err(SarError::InvalidParameter(format!(
+                "Wavelength {:.6}m from {} is outside valid SAR range [{:.3}-{:.3}]m",
+                wavelength, source, self.ranges.wavelength_range.0, self.ranges.wavelength_range.1
+            )));
+        }
+
+        // If wavelength is consistent with frequency, allow it even if it equals a commonly seen number
+        let expected = SPEED_OF_LIGHT_M_S / frequency;
+        let rel_err = ((wavelength - expected).abs()) / expected;
+        if rel_err <= 1e-9 {
+            return Ok(());
+        }
+
+        // Otherwise, fall back to standard wavelength validation (including hardcoded detection)
+        self.validate_wavelength(wavelength, source)
     }
     
     /// Validate pixel spacing parameters
@@ -138,8 +163,8 @@ impl ParameterValidator {
         prf: f64,
         source: &str
     ) -> SarResult<()> {
-        // Validate individual parameters
-        self.validate_wavelength(wavelength, source)?;
+    // Validate individual parameters (wavelength with frequency context)
+    self.validate_wavelength_with_frequency(frequency, wavelength, source)?;
         self.validate_pixel_spacing(range_spacing, azimuth_spacing, source)?;
         
         // Validate frequency
@@ -158,56 +183,15 @@ impl ParameterValidator {
             )));
         }
         
-        // Validate consistency between frequency and wavelength
-        self.validate_frequency_wavelength_consistency(frequency, wavelength)?;
+    // Validate consistency between frequency and wavelength
+    self.validate_frequency_wavelength_consistency(frequency, wavelength)?;
         
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_hardcoded_wavelength_detection() {
-        let validator = ParameterValidator::new();
-        
-        // Should detect hardcoded wavelength values
-        assert!(validator.validate_wavelength(0.055, "test").is_err());
-        assert!(validator.validate_wavelength(0.0555, "test").is_err());
-        assert!(validator.validate_wavelength(0.055465763, "test").is_err());
-    }
-    
-    #[test]
-    fn test_hardcoded_spacing_detection() {
-        let validator = ParameterValidator::new();
-        
-        // Should detect hardcoded spacing values
-        assert!(validator.validate_pixel_spacing(2.3, 10.0, "test").is_err());
-        assert!(validator.validate_pixel_spacing(2.329562, 10.0, "test").is_err());
-        assert!(validator.validate_pixel_spacing(10.0, 14.0, "test").is_err());
-        assert!(validator.validate_pixel_spacing(10.0, 14.059906, "test").is_err());
-    }
-    
-    #[test]
-    fn test_valid_parameters() {
-        let validator = ParameterValidator::new();
-        
-        // Valid C-band parameters (frequency: 5.405 GHz)
-        let frequency = 5.405e9;
-        let wavelength = SPEED_OF_LIGHT_M_S / frequency; // ~0.055465763m
-        
-        // Should accept valid parameters that don't match hardcoded values
-        assert!(validator.validate_all_parameters(
-            frequency,
-            wavelength,
-            2.5, // Slightly different from hardcoded 2.3
-            13.8, // Slightly different from hardcoded 14.0
-            1000.0,
-            "annotation XML"
-        ).is_ok());
-    }
+impl Default for ParameterValidator {
+    fn default() -> Self { Self::new() }
 }
 
 /// Scientific wavelength validation
@@ -318,4 +302,49 @@ pub fn detect_suspicious_constants(values: &[f64]) -> Vec<String> {
     }
     
     warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_hardcoded_wavelength_detection() {
+        let validator = ParameterValidator::new();
+        
+        // Should detect hardcoded wavelength values
+        assert!(validator.validate_wavelength(0.055, "test").is_err());
+        assert!(validator.validate_wavelength(0.0555, "test").is_err());
+        assert!(validator.validate_wavelength(0.055465763, "test").is_err());
+    }
+    
+    #[test]
+    fn test_hardcoded_spacing_detection() {
+        let validator = ParameterValidator::new();
+        
+        // Should detect hardcoded spacing values
+        assert!(validator.validate_pixel_spacing(2.3, 10.0, "test").is_err());
+        assert!(validator.validate_pixel_spacing(2.329562, 10.0, "test").is_err());
+        assert!(validator.validate_pixel_spacing(10.0, 14.0, "test").is_err());
+        assert!(validator.validate_pixel_spacing(10.0, 14.059906, "test").is_err());
+    }
+    
+    #[test]
+    fn test_valid_parameters() {
+        let validator = ParameterValidator::new();
+        
+        // Valid C-band parameters (frequency: 5.405 GHz)
+        let frequency = 5.405e9;
+        let wavelength = SPEED_OF_LIGHT_M_S / frequency; // ~0.055465763m
+        
+        // Should accept valid parameters that don't match hardcoded values
+        assert!(validator.validate_all_parameters(
+            frequency,
+            wavelength,
+            2.5, // Slightly different from hardcoded 2.3
+            13.8, // Slightly different from hardcoded 14.0
+            1000.0,
+            "annotation XML"
+        ).is_ok());
+    }
 }

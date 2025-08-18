@@ -1,5 +1,5 @@
 use crate::types::{SarError, SarImage, SarRealImage, SarResult};
-use ndarray::{Array2, Zip, Axis, s};
+use ndarray::{Array2, Zip, Axis};
 use rayon::prelude::*;
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -17,19 +17,26 @@ pub fn parse_calibration_from_xml(xml_content: &str) -> SarResult<CalibrationCoe
     // State tracking for parsing
     let mut in_ads_header = false;
     let mut in_calibration_vector = false;
-    let mut in_calibration_vector_list = false;
+    let mut _in_calibration_vector_list = false;
     let mut current_vector: Option<CalibrationVector> = None;
     let mut current_tag = String::new();
+    #[allow(unused_assignments)]
     let mut text_content = String::new();
     
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 current_tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                text_content.clear(); // Clear text content for new element
+                
+                // Debug: Log when we start a line element
+                if current_tag == "line" {
+                    log::debug!("Starting line element, cleared text_content");
+                }
                 
                 match current_tag.as_str() {
                     "adsHeader" => in_ads_header = true,
-                    "calibrationVectorList" => in_calibration_vector_list = true,
+                    "calibrationVectorList" => _in_calibration_vector_list = true,
                     "calibrationVector" => {
                         in_calibration_vector = true;
                         current_vector = Some(CalibrationVector {
@@ -48,36 +55,47 @@ pub fn parse_calibration_from_xml(xml_content: &str) -> SarResult<CalibrationCoe
             Ok(Event::End(ref e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 
-                match tag_name.as_str() {
-                    "adsHeader" => in_ads_header = false,
-                    "calibrationVectorList" => in_calibration_vector_list = false,
-                    "calibrationVector" => {
-                        if let Some(vector) = current_vector.take() {
-                            calibration.vectors.push(vector);
-                        }
-                        in_calibration_vector = false;
-                    }
-                    _ => {}
-                }
-                current_tag.clear();
-            }
-            Ok(Event::Text(ref e)) => {
-                text_content = e.unescape().unwrap().to_string();
-                
+                // Process accumulated text content for the ending element
                 if in_ads_header {
-                    match current_tag.as_str() {
-                        "polarisation" => calibration.polarization = text_content.clone(),
-                        "swath" => calibration.swath = text_content.clone(),
-                        "startTime" => calibration.product_first_line_utc_time = text_content.clone(),
-                        "stopTime" => calibration.product_last_line_utc_time = text_content.clone(),
+                    match tag_name.as_str() {
+                        "polarisation" => calibration.polarization = text_content.trim().to_string(),
+                        "swath" => calibration.swath = text_content.trim().to_string(),
+                        "startTime" => calibration.product_first_line_utc_time = text_content.trim().to_string(),
+                        "stopTime" => calibration.product_last_line_utc_time = text_content.trim().to_string(),
                         _ => {}
                     }
                 } else if in_calibration_vector {
                     if let Some(ref mut vector) = current_vector {
-                        match current_tag.as_str() {
-                            "azimuthTime" => vector.azimuth_time = text_content.clone(),
+                        match tag_name.as_str() {
+                            "azimuthTime" => vector.azimuth_time = text_content.trim().to_string(),
                             "line" => {
-                                vector.line = text_content.parse().unwrap_or(0);
+                                // Trim whitespace and parse line number
+                                let cleaned_text = text_content.trim();
+                                eprintln!("🔍 Processing line element: raw='{}', trimmed='{}' (len={})", text_content, cleaned_text, cleaned_text.len());
+                                if !cleaned_text.is_empty() {
+                                    match cleaned_text.parse::<i32>() {
+                                        Ok(line_num) => {
+                                            // Handle negative line numbers by converting to valid range
+                                            let line_index = if line_num < 0 {
+                                                eprintln!("⚠️  Negative line number {} converted to 0", line_num);
+                                                0
+                                            } else {
+                                                line_num as usize
+                                            };
+                                            vector.line = line_index;
+                                            eprintln!("✅ Successfully parsed line number: {} -> {}", line_num, line_index);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("❌ PARSE ERROR: Failed to parse '{}' as integer: {}", cleaned_text, e);
+                                            eprintln!("❌ Raw text bytes: {:?}", text_content.as_bytes());
+                                            eprintln!("❌ Cleaned text bytes: {:?}", cleaned_text.as_bytes());
+                                            return Err(SarError::Processing(format!("Failed to parse line number '{}' (raw: '{}'): {}", cleaned_text, text_content, e)));
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("❌ EMPTY ERROR: Empty line number text content: raw='{}', trimmed='{}'", text_content, cleaned_text);
+                                    return Err(SarError::Processing(format!("Empty line number text content: raw='{}', trimmed='{}'", text_content, cleaned_text)));
+                                }
                             }
                             "pixel" => {
                                 // Parse space-separated pixel indices
@@ -118,6 +136,30 @@ pub fn parse_calibration_from_xml(xml_content: &str) -> SarResult<CalibrationCoe
                         }
                     }
                 }
+                
+                match tag_name.as_str() {
+                    "adsHeader" => in_ads_header = false,
+                    "calibrationVectorList" => _in_calibration_vector_list = false,
+                    "calibrationVector" => {
+                        if let Some(vector) = current_vector.take() {
+                            calibration.vectors.push(vector);
+                        }
+                        in_calibration_vector = false;
+                    }
+                    _ => {}
+                }
+                current_tag.clear();
+                text_content.clear(); // Clear text content after processing element
+            }
+            Ok(Event::Text(ref e)) => {
+                let new_text = e.unescape().unwrap().to_string();
+                // Accumulate text content (XML can split text across multiple events)
+                text_content.push_str(&new_text);
+                
+                // Debug: Log text accumulation for line elements
+                if current_tag == "line" {
+                    log::debug!("Line element text: '{}', accumulated: '{}'", new_text, text_content);
+                }
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -142,7 +184,7 @@ pub fn parse_calibration_from_xml(xml_content: &str) -> SarResult<CalibrationCoe
 #[derive(Debug, Clone)]
 pub struct CalibrationVector {
     pub azimuth_time: String,
-    pub line: usize,
+    pub line: usize,  // Keep as usize for array indexing
     pub pixels: Vec<usize>,
     pub sigma_nought: Vec<f32>,
     pub beta_nought: Vec<f32>,
@@ -538,6 +580,10 @@ impl CalibrationCoefficients {
             Ok(values[before_idx] * (1.0 - weight) + values[after_idx] * weight)
         }
     }
+}
+
+impl Default for CalibrationCoefficients {
+    fn default() -> Self { Self::new() }
 }
 
 /// Radiometric calibration processor

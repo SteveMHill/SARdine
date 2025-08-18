@@ -66,8 +66,8 @@ def process_sentinel1_optimized(slc_zip_path: str,
         step_start = time.time()
         # In real workflow, you'd call:
         # iw_result = sardine.iw_split_with_real_data(slc_zip_path, polarization, subswath)
-        # For demo, create synthetic data
-        sar_data = create_realistic_sar_data()
+        # Load real SAR data for scientific validation
+        sar_data = load_real_sar_data()
         step_times['split'] = time.time() - step_start
         print(f"✅ Completed in {step_times['split']:.2f}s")
         
@@ -178,20 +178,24 @@ def process_sentinel1_optimized(slc_zip_path: str,
             'total_time': time.time() - total_start_time
         }
 
-def create_realistic_sar_data() -> np.ndarray:
-    """Create realistic SAR data for demonstration"""
-    rows, cols = 800, 600
-    np.random.seed(42)
+def load_real_sar_data() -> np.ndarray:
+    """Load real Sentinel-1 SAR data for testing"""
     
-    # Generate SAR-like data with realistic statistics
-    data = np.random.exponential(0.1, (rows, cols)).astype(np.float32)
+    # Check for real SAR data file
+    real_data_path = Path("../../data/S1A_IW_SLC__1SDV_20200103T170815_20200103T170842_030639_0382D5_DADE.zip")
+    if not real_data_path.exists():
+        raise FileNotFoundError(f"❌ SCIENTIFIC MODE: Real Sentinel-1 data required for testing. Expected: {real_data_path}")
     
-    # Add some spatial correlation
-    from scipy import ndimage
-    data = ndimage.gaussian_filter(data, sigma=1.0)
+    # Use sardine to load real data
+    import sardine
     
-    print(f"📊 Created realistic SAR data: {rows}x{cols}")
-    return data
+    reader = sardine.SlcReader(str(real_data_path))
+    slc_data = reader.read_slc_data("VV")
+    
+    # Convert complex to intensity in linear units
+    intensity = np.abs(slc_data)**2
+    
+    return intensity.astype(np.float32)
 
 def apply_multilooking_demo(data: np.ndarray) -> np.ndarray:
     """Apply simple multilooking for demonstration"""

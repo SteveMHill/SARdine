@@ -52,7 +52,7 @@ pub struct ProcessingMetadata {
 }
 
 /// Input data provenance tracking
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InputProvenance {
     /// SAR data provenance
     pub sar_data: SarDataProvenance,
@@ -477,16 +477,7 @@ impl MetadataManager {
 }
 
 // Default implementations for metadata structures
-impl Default for InputProvenance {
-    fn default() -> Self {
-        Self {
-            sar_data: SarDataProvenance::default(),
-            dem_data: DemDataProvenance::default(),
-            orbit_data: OrbitDataProvenance::default(),
-            calibration_data: CalibrationProvenance::default(),
-        }
-    }
-}
+// Default now derived for InputProvenance
 
 impl Default for SarDataProvenance {
     fn default() -> Self {

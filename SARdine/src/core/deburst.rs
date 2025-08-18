@@ -1,6 +1,5 @@
-use crate::types::{SarComplex, SarError, SarImage, SarResult};
+use crate::types::{SarComplex, SarError, SarResult};
 use ndarray::Array2;
-use regex::Regex;
 use std::f32::consts::PI;
 
 /// TOPSAR Burst information for proper debursting
@@ -53,13 +52,17 @@ impl BurstInfo {
     
     /// Calculate azimuth deramp phase for TOPSAR processing
     /// Based on equation from ESA Sentinel-1 IPF Algorithm Specification
-    pub fn calculate_deramp_phase(&self, line: usize, pixel: usize) -> f32 {
+    /// Reference: ESA-EOPG-CSCOP-TN-0009 "Sentinel-1 IPF Algorithms"
+    pub fn calculate_deramp_phase(&self, line: usize, pixel: usize, satellite_velocity: f64) -> f32 {
         // Azimuth time relative to burst center
         let burst_center_line = (self.start_line + self.end_line) as f64 / 2.0;
-        let azimuth_time_rel = (line as f64 - burst_center_line) * self.azimuth_pixel_spacing / 7000.0; // 7 km/s velocity
+        
+        // SCIENTIFIC FIX: Use actual satellite velocity from orbit state vectors
+        // Previous hardcoded 7000.0 m/s was scientifically incorrect approximation
+        let azimuth_time_rel = (line as f64 - burst_center_line) * self.azimuth_pixel_spacing / satellite_velocity;
         
         // Range time
-        let range_time = self.slant_range_time + (pixel as f64) * (1.0 / self.range_sampling_rate);
+        let _range_time = self.slant_range_time + (pixel as f64) * (1.0 / self.range_sampling_rate);
         
         // Doppler centroid phase
         let doppler_phase = 2.0 * PI as f64 * self.doppler_centroid * azimuth_time_rel;
@@ -131,14 +134,16 @@ impl Default for DeburstConfig {
 pub struct TopSarDeburstProcessor {
     burst_info: Vec<BurstInfo>,
     config: DeburstConfig,
+    satellite_velocity: f64,  // Actual satellite velocity from orbit state vectors (m/s)
 }
 
 impl TopSarDeburstProcessor {
     /// Create a new TOPSAR deburst processor
-    pub fn new(burst_info: Vec<BurstInfo>, config: DeburstConfig) -> Self {
+    pub fn new(burst_info: Vec<BurstInfo>, config: DeburstConfig, satellite_velocity: f64) -> Self {
         Self {
             burst_info,
             config,
+            satellite_velocity,
         }
     }
 
@@ -300,16 +305,16 @@ impl TopSarDeburstProcessor {
 
                 // Apply TOPSAR azimuth deramp if enabled
                 if self.config.apply_deramp {
-                    let deramp_phase = burst.calculate_deramp_phase(line_in_burst, sample_in_burst);
+                    let deramp_phase = burst.calculate_deramp_phase(line_in_burst, sample_in_burst, self.satellite_velocity);
                     let deramp_factor = SarComplex::new(deramp_phase.cos(), -deramp_phase.sin());
-                    complex_sample = complex_sample * deramp_factor;
+                    complex_sample *= deramp_factor;
                 }
 
                 // Apply overlap weighting
-                complex_sample = complex_sample * overlap_weight;
+                complex_sample *= overlap_weight;
 
                 // Accumulate weighted sample
-                output[[output_line, output_sample]] = output[[output_line, output_sample]] + complex_sample;
+                output[[output_line, output_sample]] += complex_sample;
                 weights[[output_line, output_sample]] += overlap_weight;
             }
         }
@@ -325,7 +330,7 @@ impl TopSarDeburstProcessor {
             for j in 0..samples {
                 let weight = weights[[i, j]];
                 if weight > 0.0 {
-                    output[[i, j]] = output[[i, j]] / weight;
+                    output[[i, j]] /= weight;
                 }
             }
         }
@@ -363,18 +368,19 @@ impl TopSarDeburstProcessor {
 /// Routes to the new TopSarDeburstProcessor with proper TOPSAR support
 pub struct DeburstProcessor {
     burst_info: Vec<BurstInfo>,
+    satellite_velocity: f64,
 }
 
 impl DeburstProcessor {
     /// Create a new deburst processor from burst information
-    pub fn new(burst_info: Vec<BurstInfo>) -> Self {
-        Self { burst_info }
+    pub fn new(burst_info: Vec<BurstInfo>, satellite_velocity: f64) -> Self {
+        Self { burst_info, satellite_velocity }
     }
     
     /// Deburst SLC data using the new TOPSAR implementation
     pub fn deburst(&self, slc_data: &Array2<SarComplex>, config: &DeburstConfig) -> SarResult<Array2<SarComplex>> {
         // Create TOPSAR processor and deburst
-        let topsar_processor = TopSarDeburstProcessor::new(self.burst_info.clone(), config.clone());
+        let topsar_processor = TopSarDeburstProcessor::new(self.burst_info.clone(), config.clone(), self.satellite_velocity);
         topsar_processor.deburst_topsar(slc_data)
     }
     
@@ -596,7 +602,8 @@ mod tests {
         ];
 
         let config = DeburstConfig::default();
-        let processor = TopSarDeburstProcessor::new(burst_info, config);
+        let satellite_velocity = 7500.0; // Typical Sentinel-1 velocity for testing
+        let processor = TopSarDeburstProcessor::new(burst_info, config, satellite_velocity);
         
         // Create test data
         let test_data = Array2::zeros((1000, 1000));

@@ -295,7 +295,7 @@ impl OrbitReader {
     /// Score orbit file relevance (lower is better)
     fn score_orbit_file_relevance(file_url: &str, target_time: DateTime<Utc>) -> f64 {
         // Extract filename from URL
-        let filename = file_url.split('/').last().unwrap_or("");
+    let filename = file_url.split('/').next_back().unwrap_or("");
         
         // Try to parse validity period
         let parts: Vec<&str> = filename.split('_').collect();
@@ -534,22 +534,21 @@ impl OrbitReader {
         let n = state_vectors.len();
         let mut result = [0.0; 3];
         
-        for i in 0..n {
-            let sv_i = state_vectors[i];
+        for (i, sv_i) in state_vectors.iter().enumerate().take(n) {
             let ti = sv_i.time.timestamp_millis() as f64 / 1000.0;
             let mut li = 1.0;
             
             // Calculate Lagrange basis polynomial
-            for j in 0..n {
+            for (j, sv_j) in state_vectors.iter().enumerate().take(n) {
                 if i != j {
-                    let tj = state_vectors[j].time.timestamp_millis() as f64 / 1000.0;
+                    let tj = sv_j.time.timestamp_millis() as f64 / 1000.0;
                     li *= (target_time - tj) / (ti - tj);
                 }
             }
             
             // Add contribution to each coordinate
-            for coord in 0..3 {
-                result[coord] += li * sv_i.position[coord];
+            for (coord, res) in result.iter_mut().enumerate() {
+                *res += li * sv_i.position[coord];
             }
         }
         
@@ -581,20 +580,19 @@ impl OrbitReader {
         let n = state_vectors.len();
         let mut result = [0.0; 3];
         
-        for i in 0..n {
-            let sv_i = state_vectors[i];
+        for (i, sv_i) in state_vectors.iter().enumerate().take(n) {
             let ti = sv_i.time.timestamp_millis() as f64 / 1000.0;
             let mut li = 1.0;
             
-            for j in 0..n {
+            for (j, sv_j) in state_vectors.iter().enumerate().take(n) {
                 if i != j {
-                    let tj = state_vectors[j].time.timestamp_millis() as f64 / 1000.0;
+                    let tj = sv_j.time.timestamp_millis() as f64 / 1000.0;
                     li *= (target_time - tj) / (ti - tj);
                 }
             }
             
-            for coord in 0..3 {
-                result[coord] += li * sv_i.velocity[coord];
+            for (coord, res) in result.iter_mut().enumerate() {
+                *res += li * sv_i.velocity[coord];
             }
         }
         
@@ -646,7 +644,7 @@ impl OrbitReader {
         let end_search_idx = Self::binary_search_closest_time(&sorted_state_vectors, burst_end_timestamp);
         
         // Expand search range to ensure we have enough vectors for interpolation
-        let search_start = if start_search_idx >= 2 { start_search_idx - 2 } else { 0 };
+    let search_start = start_search_idx.saturating_sub(2);
         let search_end = std::cmp::min(end_search_idx + 3, sorted_state_vectors.len());
         
         let relevant_vectors = &sorted_state_vectors[search_start..search_end];
@@ -738,7 +736,6 @@ impl OrbitReader {
     
     /// Real orbit data functions only - no mock/synthetic data allowed
     /// Removed create_mock_orbit_file function - use real ESA orbit files only
-    
     /// Enhanced EOF parsing that handles XML format and simple format
     fn parse_eof_content_enhanced(content: &str) -> SarResult<OrbitData> {
         let mut state_vectors = Vec::new();
