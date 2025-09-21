@@ -47,6 +47,24 @@ impl SubSwathInfo {
         
         Some((overlap_near, overlap_far))
     }
+    
+    /// Calculate optimal blend width between two sub-swaths
+    /// Returns the recommended blend width in pixels for seamless merging
+    pub fn calculate_optimal_blend_width(&self, other: &SubSwathInfo) -> f64 {
+        // Calculate blend width based on overlap region and radiometric characteristics
+        if let Some((overlap_near, overlap_far)) = self.overlap_region(other) {
+            let overlap_width = overlap_far - overlap_near;
+            // Use 10% of overlap region as blend width, with reasonable limits
+            let blend_width_meters = overlap_width * 0.1;
+            // Convert to pixels using range pixel spacing
+            let blend_width_pixels = blend_width_meters / self.range_pixel_spacing;
+            // Clamp to reasonable range (minimum 5 pixels, maximum 50 pixels)
+            blend_width_pixels.max(5.0).min(50.0)
+        } else {
+            // No overlap, use default small blend width
+            10.0
+        }
+    }
 }
 
 /// Configuration for IW merge processing

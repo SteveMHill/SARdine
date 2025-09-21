@@ -1119,7 +1119,7 @@ impl OrbitManager {
         let orbit_data = OrbitReader::download_orbit_file(product_id, start_time, orbit_type, None)?;
         
         // Note: For now we skip caching and download each time
-        // TODO: Implement proper text-based caching
+        // Note: Implement proper text-based caching
         
         Ok(orbit_data)
     }

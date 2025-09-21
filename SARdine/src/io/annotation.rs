@@ -929,14 +929,14 @@ pub struct BurstData {
 /// Parse Sentinel-1 annotation XML using SIMPLE regex approach 
 /// NO MORE COMPLEX DESERIALIZERS - just extract what we need!
 pub fn parse_annotation_xml(xml_content: &str) -> Result<ProductRoot, Box<dyn std::error::Error>> {
-    // Call the simple parser that actually works
-    AnnotationParser::parse_annotation(xml_content).map_err(|e| e.into())
+    // Use quick-xml serde parser for robust, type-safe XML parsing
+    quick_xml::de::from_str::<ProductRoot>(xml_content).map_err(|e| e.into())
 }
 
 // Legacy alias for the main parsing function
 pub fn parse_annotation(xml_content: &str) -> SarResult<ProductRoot> {
-    // Use the simple parser directly
-    AnnotationParser::parse_annotation(xml_content)
+    // Use the unified serde-based parser
+    parse_annotation_xml(xml_content).map_err(|e| SarError::XmlParsing(e.to_string()))
 }
 
 // ============================================================================
@@ -1262,7 +1262,6 @@ impl AnnotationParser {
     /// Parse annotation XML with COMPREHENSIVE, ROBUST regex approach 
     /// Extracts ALL important metadata fields using simple patterns
     pub fn parse_annotation(xml_content: &str) -> SarResult<ProductRoot> {
-        println!("🔥 COMPREHENSIVE PARSER CALLED - XML length: {}", xml_content.len());
         log::info!("Starting COMPREHENSIVE XML parsing with regex approach...");
         
         // Simple, bulletproof extraction functions using regex
@@ -1287,8 +1286,6 @@ impl AnnotationParser {
         // ============================================================================
         // COMPREHENSIVE METADATA EXTRACTION
         // ============================================================================
-        
-        println!("🔥 Extracting comprehensive metadata...");
         
         // === BASIC PRODUCT INFORMATION ===
         let mission_id = extract_value(xml_content, "missionId");
@@ -1346,7 +1343,6 @@ impl AnnotationParser {
         // COMPREHENSIVE GEOLOCATION EXTRACTION
         // ============================================================================
         
-        println!("🔥 Extracting comprehensive geolocation data...");
         let mut geoloc_points = Vec::new();
         
         // Extract ALL geolocation point data with comprehensive fields
@@ -1398,7 +1394,6 @@ impl AnnotationParser {
         // DOPPLER CENTROID EXTRACTION 
         // ============================================================================
         
-        println!("🔥 Extracting Doppler centroid data...");
         let mut dc_estimates = Vec::new();
         
         // Extract Doppler centroid estimates
@@ -1438,7 +1433,6 @@ impl AnnotationParser {
         // ANTENNA PATTERN EXTRACTION
         // ============================================================================
         
-        println!("🔥 Extracting antenna pattern data...");
         let mut antenna_pattern_values = Vec::new();
         
         // Extract antenna pattern information
@@ -1536,15 +1530,15 @@ impl AnnotationParser {
             }
         }
         
-        println!("�🔥 COMPREHENSIVE EXTRACTION COMPLETE:");
-        println!("  - {} geolocation points", geoloc_points.len());
-        println!("  - {} Doppler estimates", dc_estimates.len());
-        println!("  - {} antenna patterns", antenna_pattern_values.len());
-        println!("  - {} orbit state vectors", orbit_list.len());
-        println!("  - Range pixel spacing: {:?}", range_pixel_spacing);
-        println!("  - Azimuth pixel spacing: {:?}", azimuth_pixel_spacing);
-        println!("  - Mission: {:?}", mission_id);
-        println!("  - Mode: {:?}", mode);
+        log::info!("COMPREHENSIVE EXTRACTION COMPLETE:");
+        log::info!("  - {} geolocation points", geoloc_points.len());
+        log::info!("  - {} Doppler estimates", dc_estimates.len());
+        log::info!("  - {} antenna patterns", antenna_pattern_values.len());
+        log::info!("  - {} orbit state vectors", orbit_list.len());
+        log::info!("  - Range pixel spacing: {:?}", range_pixel_spacing);
+        log::info!("  - Azimuth pixel spacing: {:?}", azimuth_pixel_spacing);
+        log::info!("  - Mission: {:?}", mission_id);
+        log::info!("  - Mode: {:?}", mode);
         
         log::info!("✅ Comprehensive XML parser extracted complete metadata successfully");
         
@@ -1644,7 +1638,6 @@ impl AnnotationParser {
             
             // === GEOLOCATION GRID ===
             geolocation_grid: if !geoloc_points.is_empty() {
-                println!("🔥 DEBUG: Creating comprehensive geolocation grid with {} points", geoloc_points.len());
                 Some(GeolocationGrid {
                     geolocation_grid_point_list: Some(GeolocationGridPointList {
                         count: Some(geoloc_points.len() as u32),
@@ -1652,7 +1645,6 @@ impl AnnotationParser {
                     })
                 })
             } else { 
-                println!("🔥 DEBUG: No geolocation points - setting grid to None");
                 None 
             },
             
@@ -1748,6 +1740,11 @@ impl AnnotationParser {
                                             .unwrap_or(0),
                                         range_samples: image_info.number_of_samples.unwrap_or(0) as usize,
                                         azimuth_samples: image_info.number_of_lines.unwrap_or(0) as usize,
+                                        // Global coordinate fields - will be set properly during processing
+                                        first_line_global: 0,
+                                        last_line_global: image_info.number_of_lines.unwrap_or(0) as usize,
+                                        first_sample_global: 0,
+                                        last_sample_global: image_info.number_of_samples.unwrap_or(0) as usize,
                                         range_pixel_spacing: image_info.range_pixel_spacing.unwrap_or(2.33),
                                         azimuth_pixel_spacing: image_info.azimuth_pixel_spacing.unwrap_or(13.96),
                                         slant_range_time: image_info.slant_range_time.unwrap_or(5.33e-3),

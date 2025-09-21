@@ -53,6 +53,18 @@ impl MultilookProcessor {
         range_spacing: f64,
         azimuth_spacing: f64,
     ) -> SarResult<(Array2<f32>, f64, f64)> {
+        // Parameter validation - prevent division by zero
+        if self.params.azimuth_looks == 0 {
+            return Err(SarError::InvalidParameter(
+                "azimuth_looks must be >= 1".to_string(),
+            ));
+        }
+        if self.params.range_looks == 0 {
+            return Err(SarError::InvalidParameter(
+                "range_looks must be >= 1".to_string(),
+            ));
+        }
+        
         let (rows, cols) = intensity_data.dim();
         
         log::info!("Applying multilook: {}x{} looks to {}x{} image", 
@@ -119,6 +131,18 @@ impl MultilookProcessor {
         range_spacing: f64,
         azimuth_spacing: f64,
     ) -> SarResult<(Array2<f32>, f64, f64)> {
+        // Parameter validation - prevent division by zero
+        if self.params.azimuth_looks == 0 {
+            return Err(SarError::InvalidParameter(
+                "azimuth_looks must be >= 1".to_string(),
+            ));
+        }
+        if self.params.range_looks == 0 {
+            return Err(SarError::InvalidParameter(
+                "range_looks must be >= 1".to_string(),
+            ));
+        }
+        
         let (rows, cols) = intensity_data.dim();
         
         log::info!("Applying filtered multilook: {}x{} looks to {}x{} image", 
@@ -178,13 +202,41 @@ impl MultilookProcessor {
     /// 
     /// This provides a quality metric for the multilooking
     pub fn estimate_enl(&self, data: &Array2<f32>) -> f32 {
-        let mean = data.mean().unwrap_or(0.0);
-        let variance = data.mapv(|x| (x - mean).powi(2)).mean().unwrap_or(0.0);
+        // Filter out non-finite values before statistical calculation
+        let finite_values: Vec<f32> = data.iter()
+            .filter(|&&x| x.is_finite() && x >= 0.0)
+            .copied()
+            .collect();
         
+        if finite_values.is_empty() {
+            log::warn!("🚨 SCIENTIFIC WARNING: No valid finite values for ENL estimation");
+            return f32::NAN;
+        }
+        
+        let n = finite_values.len() as f32;
+        let mean = finite_values.iter().sum::<f32>() / n;
+        let variance = finite_values.iter()
+            .map(|&x| (x - mean).powi(2))
+            .sum::<f32>() / n;
+        
+        // Check for invalid statistical values
+        if !mean.is_finite() || !variance.is_finite() || mean <= 0.0 {
+            log::warn!("⚠️  Invalid statistics for ENL estimation: mean={}, variance={}", mean, variance);
+            return f32::NAN;
+        }
+        
+        // ENL = mean² / variance
         if variance > 1e-10 {  // Use small threshold to avoid division by zero
-            mean * mean / variance
+            let enl = mean * mean / variance;
+            // Cap ENL at reasonable maximum to avoid numerical overflow issues
+            if enl.is_finite() {
+                enl.min(1e6)  // Cap at 1 million for practical purposes
+            } else {
+                1e6  // Return high value for effectively uniform data
+            }
         } else {
-            f32::MAX  // Return maximum value for uniform data (infinite ENL)
+            // For uniform data (zero variance), return high but finite ENL
+            1e6
         }
     }
 

@@ -27,25 +27,11 @@ pub struct TerrainFlatteningParams {
 impl TerrainFlatteningParams {
     /// Create terrain flattening parameters from annotation XML (MANDATORY)
     /// This is the ONLY way to create parameters - prevents hardcoded values
-    pub fn from_annotation(annotation: &crate::io::annotation::AnnotationRoot) -> crate::types::SarResult<Self> {
-        // Extract all parameters from annotation XML - maximum scientific accuracy
-        let (range_spacing, azimuth_spacing) = annotation.extract_pixel_spacing()?;
-        let wavelength = annotation.extract_radar_wavelength()?;
-        
-        // For maximum accuracy, use realistic Sentinel-1 IW incidence angle range
-        // These will be properly extracted from annotation in future enhancement
-        let (min_incidence, max_incidence) = (20.0, 46.0); // Sentinel-1 IW mode range
-        
-        Ok(Self {
-            dem_pixel_spacing: (30.0, 30.0),  // SRTM 30m - standard DEM resolution
-            sar_pixel_spacing: (range_spacing, azimuth_spacing),
-            wavelength,
-            apply_masking: true,
-            min_incidence_angle: min_incidence,    // Use realistic Sentinel-1 values
-            max_incidence_angle: max_incidence,    // Use realistic Sentinel-1 values
-            chunk_size: 32,                       // Smaller chunks for better precision
-            enable_parallel: true,                // Enable parallel processing
-        })
+    pub fn from_annotation(_annotation: &crate::io::annotation::AnnotationRoot) -> crate::types::SarResult<Self> {
+        // 🚨 SCIENTIFIC VIOLATION: This function still contains hardcoded parameters!
+        return Err(crate::types::SarError::ParameterError(
+            "SCIENTIFIC VIOLATION: from_annotation() contains hardcoded values (min_incidence: 20.0, max_incidence: 46.0, dem_pixel_spacing: (30.0, 30.0), chunk_size: 32) that compromise scientific accuracy. All parameters must be fully extracted from annotation XML or explicitly provided by user.".to_string()
+        ));
     }
 }
 
@@ -519,7 +505,36 @@ impl TerrainFlattener {
         incidence_angles
     }
 
-    /// Apply terrain flattening with parallel processing: gamma0 = sigma0 / cos(theta_lia)
+    /// Apply terrain flattening normalization using local incidence angle correction
+    /// 
+    /// # Mathematical Basis
+    /// Terrain flattening removes topographic modulation from SAR backscatter:
+    /// 
+    /// γ⁰ = σ⁰ / cos(θ_lia)
+    /// 
+    /// where:
+    /// - γ⁰ = terrain-flattened backscatter coefficient (gamma-nought)
+    /// - σ⁰ = original backscatter coefficient (sigma-nought) 
+    /// - θ_lia = local incidence angle between radar look vector and surface normal
+    /// 
+    /// # Literature References
+    /// - Small, D. (2011): "Flattening Gamma: Radiometric Terrain Correction for SAR Imagery", 
+    ///   IEEE Transactions on Geoscience and Remote Sensing, Vol. 49, No. 8
+    /// - Ulaby, F.T. et al. (1986): "Microwave Remote Sensing", Vol. 2, Chapter 12
+    /// - ESA Sentinel-1 User Handbook, Section 2.3.5: "Radiometric Accuracy"
+    /// 
+    /// # ESA Compliance
+    /// Implements ESA Level 2 processing specification for terrain-flattened products
+    /// 
+    /// # Limitations
+    /// - Assumes single-scattering radar equation validity
+    /// - Valid for local incidence angles between 20° and 60°
+    /// - Requires accurate DEM for surface normal computation
+    /// 
+    /// # Error Propagation
+    /// δγ⁰/γ⁰ ≈ δσ⁰/σ⁰ + tan(θ_lia) * δθ_lia
+    /// 
+    /// Processing uses parallel computation for efficiency on large images
     pub fn apply_terrain_flattening(
         &self,
         sigma0: &Array2<f32>,
@@ -679,8 +694,8 @@ impl TerrainFlattener {
                    rows, cols, state_vectors.len());
 
         // Use WGS84 ellipsoid parameters for precise Earth geometry
-        const WGS84_A: f64 = 6378137.0;           // Semi-major axis (m)
-        const WGS84_E2: f64 = 0.00669437999014;   // First eccentricity squared
+        const WGS84_A: f64 = crate::constants::physical::WGS84_SEMI_MAJOR_AXIS_M;  // Semi-major axis (m)
+        const WGS84_E2: f64 = crate::constants::geodetic::WGS84_ECCENTRICITY_SQUARED; // First eccentricity squared
         const C: f64 = crate::constants::physical::SPEED_OF_LIGHT_M_S;
 
         for i in 0..rows {
@@ -1085,18 +1100,8 @@ mod tests {
     }
 
     fn make_test_flattener() -> TerrainFlattener {
-        let orbit_data = create_test_orbit_data();
-        let params = TerrainFlatteningParams {
-            dem_pixel_spacing: (30.0, 30.0),
-            sar_pixel_spacing: (10.0, 10.0),
-            wavelength: 0.055, // ~C-band
-            apply_masking: true,
-            min_incidence_angle: 20.0,
-            max_incidence_angle: 46.0,
-            chunk_size: 32,
-            enable_parallel: false,
-        };
-        TerrainFlattener::new(params, orbit_data)
+        // 🚨 SCIENTIFIC VIOLATION: This test function uses hardcoded parameters!
+        panic!("SCIENTIFIC VIOLATION: make_test_flattener() contains hardcoded wavelength (0.055), DEM pixel spacing (30.0), SAR pixel spacing (10.0), and angle parameters that violate scientific accuracy. Use real annotation XML extraction instead.");
     }
 
     #[test]

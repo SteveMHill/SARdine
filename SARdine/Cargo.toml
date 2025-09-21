@@ -1,6 +1,6 @@
 [package]
 name = "sardine"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Steven Hill <steven@example.com>"]
 description = "A Fast, Modular Sentinel-1 Backscatter Processor"
@@ -13,18 +13,23 @@ categories = ["science", "algorithms"]
 name = "sardine"
 crate-type = ["cdylib", "lib"]
 
+[[bin]]
+name = "test_speckle_improvements"
+path = "test_speckle_improvements.rs"
+
 [dependencies]
 # Python bindings
 pyo3 = { version = "0.20", features = ["extension-module"] }
 numpy = "0.20"
 
 # Core numerical computing
-ndarray = { version = "0.15", features = ["rayon"] }
+ndarray = { version = "0.15", features = ["rayon", "blas"] }
 num-complex = "0.4"
 num-traits = "0.2"
 
-# Performance optimizations
+# Performance optimizations  
 num_cpus = "1.0"          # Better thread detection
+wide = { version = "0.7", optional = true }              # SIMD operations
 
 # I/O and data handling
 gdal = { version = "0.16", features = ["array"] }
@@ -47,6 +52,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 thiserror = "1.0"
 log = "0.4"
+env_logger = "0.10"  # For test logging
 rayon = "1.7"  # Parallel processing
 dirs = "5.0"   # Platform-specific directories
 
@@ -54,16 +60,25 @@ dirs = "5.0"   # Platform-specific directories
 rustfft = "6.1"
 approx = "0.5"
 regex = "1.11.1"
+rand = "0.8"  # For test data generation
+
+# Optional GPU acceleration
+wgpu = { version = "0.19", optional = true }
+bytemuck = { version = "1.0", optional = true }
 
 [dev-dependencies]
 approx = "0.5"
 tempfile = "3.8"
 env_logger = "0.10"
+rand = "0.8"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "simd"]
 parallel = []
-gpu = []
+simd = ["wide"]
+gpu = ["wgpu", "bytemuck"]
+optimized = ["parallel", "simd", "blas"]
+blas = ["ndarray/blas"]
 
 [profile.release]
 opt-level = 3

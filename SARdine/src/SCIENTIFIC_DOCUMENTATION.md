@@ -34,11 +34,11 @@
 
 **Description:** Conversion to backscatter coefficient (σ⁰, γ⁰, β⁰)
 
-**Scientific Reference:** ESA Radiometric Calibration of SAR Data (Rosich & Meadows)
+**Scientific Reference:** ESA S1-TN-MDA-52-7448: "Sentinel-1 Radiometric Calibration"
 
-**Mathematical Equation:** `σ⁰ = |DN|² / (A² * sin(θ_inc))`
+**Mathematical Equation:** `σ⁰ = |DN|² × LUT` (linear multiplication)
 
-**Implementation:** LUT-based calibration with incidence angle correction
+**Implementation:** LUT-based calibration with bilinear interpolation
 
 **Required Parameters:** calibration_lut, incidence_angle, range_spreading_loss
 

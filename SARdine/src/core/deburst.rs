@@ -1,6 +1,7 @@
 use crate::types::{SarComplex, SarError, SarResult};
 use ndarray::Array2;
 use std::f32::consts::PI;
+use num_complex::Complex;
 
 /// TOPSAR Burst information for proper debursting
 /// Based on ESA Sentinel-1 Level 1 Detailed Algorithm Definition
@@ -443,7 +444,7 @@ impl DeburstProcessor {
         let range_sampling_rate = Self::extract_parameter(annotation_data, "<rangeSamplingRate>", "</rangeSamplingRate>")
             .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Range sampling rate not found in annotation XML! Real Sentinel-1 parameters required - no fallbacks allowed.".to_string()))?;
         
-        // CRITICAL: Extract real pixel spacing from annotation - NO hardcoded fallbacks for research use
+        // Important: Extract real pixel spacing from annotation - NO hardcoded fallbacks for research use
         let range_pixel_spacing = Self::extract_parameter(annotation_data, "<rangePixelSpacing>", "</rangePixelSpacing>")
             .ok_or_else(|| SarError::Processing("❌ SCIENTIFIC ERROR: Range pixel spacing not found in annotation XML! Real Sentinel-1 annotation required - no synthetic fallbacks allowed for research-grade processing.".to_string()))?;
         let azimuth_pixel_spacing = Self::extract_parameter(annotation_data, "<azimuthPixelSpacing>", "</azimuthPixelSpacing>")
@@ -611,4 +612,398 @@ mod tests {
         let result = processor.deburst_topsar(&test_data);
         assert!(result.is_ok());
     }
+}
+
+/// Extract subswath data from a Sentinel-1 ZIP file
+/// This function reads the SLC data for a specific subswath and polarization
+pub fn extract_subswath_from_zip(
+    zip_path: &str,
+    subswath: &str,
+    polarization: &str,
+) -> SarResult<Array2<f32>> {
+    log::info!("📡 Extracting subswath {} {} from {}", subswath, polarization, zip_path);
+
+    // Open the ZIP file
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| SarError::Processing(format!("Failed to open ZIP file: {}", e)))?;
+
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| SarError::Processing(format!("Failed to read ZIP archive: {}", e)))?;
+
+    // Find the appropriate measurement file for the subswath and polarization
+    // Extract subswath number (e.g., "IW1" -> "1")
+    let subswath_num = subswath.strip_prefix("IW").unwrap_or(subswath);
+    let measurement_pattern = format!("s1a-iw{}-slc-{}-", subswath_num.to_lowercase(), polarization.to_lowercase());
+
+    let mut measurement_file = None;
+    log::info!("Looking for files with pattern: '{}' in measurement/ directory", measurement_pattern);
+
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)
+            .map_err(|e| SarError::Processing(format!("Failed to read ZIP entry: {}", e)))?;
+
+        let name = file.name();
+        log::debug!("Checking file: {}", name);
+
+        if name.contains(&measurement_pattern) && name.ends_with(".tiff") && name.contains("measurement/") {
+            measurement_file = Some(i);
+            log::info!("Found measurement file: {}", name);
+            break;
+        }
+    }
+
+    if measurement_file.is_none() {
+        return Err(SarError::Processing(format!(
+            "No measurement file found for subswath {} and polarization {}",
+            subswath, polarization
+        )));
+    }
+
+    // Extract TIFF to temporary file for GDAL reading
+    let mut zip_file = archive.by_index(measurement_file.unwrap())
+        .map_err(|e| SarError::Processing(format!("Failed to access measurement file: {}", e)))?;
+
+    // Create temporary file
+    let mut temp_file = tempfile::NamedTempFile::new()
+        .map_err(|e| SarError::Processing(format!("Failed to create temp file: {}", e)))?;
+
+    // Copy TIFF data to temp file
+    std::io::copy(&mut zip_file, &mut temp_file)
+        .map_err(|e| SarError::Processing(format!("Failed to extract TIFF to temp file: {}", e)))?;
+
+    log::info!("TIFF extracted to temporary file for GDAL processing");
+
+    // Use GDAL to read the TIFF file
+    let dataset = gdal::Dataset::open(temp_file.path())
+        .map_err(|e| SarError::Processing(format!("Failed to open TIFF with GDAL: {}", e)))?;
+
+    // Get raster dimensions
+    let raster_size = dataset.raster_size();
+    let (width, height) = (raster_size.0, raster_size.1);
+    let band_count = dataset.raster_count();
+
+    log::info!("TIFF dimensions: {} x {}, bands: {}", width, height, band_count);
+
+    // Handle different band configurations (Sentinel-1 SLC format)
+    let intensity_data = if band_count == 1 {
+        // Single band containing complex data (Sentinel-1 SLC format: CInt16)
+        let band = dataset.rasterband(1)
+            .map_err(|e| SarError::Processing(format!("Failed to get band 1: {}", e)))?;
+
+        let window = (0, 0);
+        let window_size = (width, height);
+
+        // Read complex 16-bit integers (CInt16 format)
+        let complex_data = band.read_as::<i16>(window, window_size, (width * 2, height), None)
+            .map_err(|e| SarError::Processing(format!("Failed to read complex CInt16 data: {}", e)))?;
+
+        log::debug!("Read {} complex values as interleaved i16", complex_data.data.len() / 2);
+
+        // Convert interleaved i16 data to intensity (magnitude squared) f32 array
+        convert_cint16_to_intensity(complex_data, width, height)?
+    } else if band_count >= 2 {
+        // Separate I and Q bands (less common for Sentinel-1)
+        let band1 = dataset.rasterband(1)
+            .map_err(|e| SarError::Processing(format!("Failed to get band 1: {}", e)))?;
+
+        let band2 = dataset.rasterband(2)
+            .map_err(|e| SarError::Processing(format!("Failed to get band 2: {}", e)))?;
+
+        let window = (0, 0);
+        let window_size = (width, height);
+        let buffer_size = (width, height);
+
+        let i_data = band1.read_as::<f32>(window, window_size, buffer_size, None)
+            .map_err(|e| SarError::Processing(format!("Failed to read I data: {}", e)))?;
+
+        let q_data = band2.read_as::<f32>(window, window_size, buffer_size, None)
+            .map_err(|e| SarError::Processing(format!("Failed to read Q data: {}", e)))?;
+
+        // Convert to intensity data
+        convert_iq_to_intensity(i_data, q_data, width, height)?
+    } else {
+        return Err(SarError::Processing(format!("Unexpected number of bands in TIFF: {}", band_count)));
+    };
+
+    log::info!("✅ Successfully extracted real SAR subswath data: {}x{} pixels", width, height);
+    log::info!("Data range: {:.6} to {:.6}", intensity_data.iter().fold(f32::INFINITY, |a, &b| a.min(b)), intensity_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)));
+
+    Ok(intensity_data)
+}
+
+/// Convert CInt16 interleaved data to intensity (magnitude squared)
+fn convert_cint16_to_intensity(complex_data: gdal::raster::Buffer<i16>, width: usize, height: usize) -> SarResult<Array2<f32>> {
+    let mut intensity_array = Array2::zeros((height, width));
+    let total_pixels = width * height;
+
+    // Data is interleaved as [real, imag, real, imag, ...]
+    if complex_data.data.len() < total_pixels * 2 {
+        return Err(SarError::Processing(format!("Insufficient data: expected {} i16 values, got {}",
+                                                total_pixels * 2, complex_data.data.len())));
+    }
+
+    // Convert i16 complex data to f32 intensity values
+    for row in 0..height {
+        for col in 0..width {
+            let pixel_idx = row * width + col;
+            let data_idx = pixel_idx * 2;
+
+            // Extract real and imaginary parts as i16, convert to f32
+            let real_i16 = complex_data.data[data_idx];
+            let imag_i16 = complex_data.data[data_idx + 1];
+
+            // Convert to f32
+            let real_f32 = real_i16 as f32;
+            let imag_f32 = imag_i16 as f32;
+
+            // Calculate intensity (magnitude squared)
+            let intensity = real_f32 * real_f32 + imag_f32 * imag_f32;
+            intensity_array[[row, col]] = intensity;
+        }
+    }
+
+    // Log some statistics
+    let sample_intensity = intensity_array[[0, 0]];
+    log::debug!("First pixel intensity: {:.6}", sample_intensity);
+
+    // Check data variance
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    let sample_size = std::cmp::min(1000, total_pixels);
+
+    for i in 0..sample_size {
+        let row = i / width;
+        let col = i % width;
+        if row < height {
+            let val = intensity_array[[row, col]];
+            sum += val;
+            sum_sq += val * val;
+        }
+    }
+
+    let mean = sum / sample_size as f32;
+    let variance = (sum_sq / sample_size as f32) - (mean * mean);
+    log::debug!("Sample statistics (first {} pixels): mean={:.6}, variance={:.6}",
+               sample_size, mean, variance);
+
+    Ok(intensity_array)
+}
+
+/// Convert I/Q data to intensity (magnitude squared)
+fn convert_iq_to_intensity(i_data: gdal::raster::Buffer<f32>, q_data: gdal::raster::Buffer<f32>, width: usize, height: usize) -> SarResult<Array2<f32>> {
+    let mut intensity_array = Array2::zeros((height, width));
+
+    // Convert buffer data to intensity
+    for i in 0..height {
+        for j in 0..width {
+            let idx = i * width + j;
+            if idx < i_data.data.len() && idx < q_data.data.len() {
+                let real = i_data.data[idx];
+                let imag = q_data.data[idx];
+                let intensity = real * real + imag * imag;
+                intensity_array[[i, j]] = intensity;
+            }
+        }
+    }
+
+    Ok(intensity_array)
+}
+
+/// Extract complex SLC data (preserving I/Q values) from ZIP file for proper radiometric calibration
+pub fn extract_subswath_complex_from_zip(
+    zip_path: &str,
+    subswath: &str,
+    polarization: &str,
+) -> SarResult<ndarray::Array2<num_complex::Complex<f32>>> {
+    
+    log::info!("📡 Extracting COMPLEX subswath {} {} from {}", subswath, polarization, zip_path);
+
+    // Check if input is a ZIP file or SAFE directory
+    let input_path = std::path::Path::new(zip_path);
+    let is_zip = input_path.is_file() && input_path.extension() == Some(std::ffi::OsStr::new("zip"));
+    let is_safe = input_path.is_dir() && (
+        input_path.file_name()
+            .map(|name| name.to_string_lossy().contains(".SAFE"))
+            .unwrap_or_else(|| {
+                log::warn!("⚠️  Could not determine filename for path validation - checking manifest.safe instead");
+                false
+            }) ||
+        input_path.join("manifest.safe").exists()
+    );
+    
+    if !is_zip && !is_safe {
+        return Err(SarError::Processing(format!(
+            "Input must be either a ZIP file or SAFE directory: {}", zip_path
+        )));
+    }
+    
+    if is_safe {
+        // For SAFE directories, delegate to SlcReader which has full SAFE support
+        log::info!("Detected SAFE directory, using SlcReader for complex data extraction");
+        return extract_subswath_complex_from_safe(zip_path, subswath, polarization);
+    }
+
+    // Original ZIP file processing continues below
+    // Open the ZIP file
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| SarError::Processing(format!("Failed to open ZIP file: {}", e)))?;
+
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| SarError::Processing(format!("Failed to read ZIP archive: {}", e)))?;
+
+    // Find the appropriate measurement file for the subswath and polarization
+    let subswath_num = subswath.strip_prefix("IW").unwrap_or(subswath);
+    let measurement_pattern = format!("s1a-iw{}-slc-{}-", subswath_num.to_lowercase(), polarization.to_lowercase());
+
+    let mut measurement_file = None;
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)
+            .map_err(|e| SarError::Processing(format!("Failed to read ZIP entry: {}", e)))?;
+
+        let name = file.name();
+        if name.contains(&measurement_pattern) && name.ends_with(".tiff") && name.contains("measurement/") {
+            measurement_file = Some(i);
+            log::info!("Found measurement file: {}", name);
+            break;
+        }
+    }
+
+    if measurement_file.is_none() {
+        return Err(SarError::Processing(format!(
+            "No measurement file found for subswath {} and polarization {}",
+            subswath, polarization
+        )));
+    }
+
+    // Extract TIFF to temporary file for GDAL reading
+    let mut zip_file = archive.by_index(measurement_file.unwrap())
+        .map_err(|e| SarError::Processing(format!("Failed to access measurement file: {}", e)))?;
+
+    let mut temp_file = tempfile::NamedTempFile::new()
+        .map_err(|e| SarError::Processing(format!("Failed to create temp file: {}", e)))?;
+
+    std::io::copy(&mut zip_file, &mut temp_file)
+        .map_err(|e| SarError::Processing(format!("Failed to extract TIFF to temp file: {}", e)))?;
+
+    // Use GDAL to read the TIFF file
+    let dataset = gdal::Dataset::open(temp_file.path())
+        .map_err(|e| SarError::Processing(format!("Failed to open TIFF with GDAL: {}", e)))?;
+
+    let raster_size = dataset.raster_size();
+    let (width, height) = (raster_size.0, raster_size.1);
+    let band_count = dataset.raster_count();
+
+    log::info!("TIFF dimensions: {} x {}, bands: {}", width, height, band_count);
+
+    // Handle complex SLC data
+    if band_count == 1 {
+        let band = dataset.rasterband(1)
+            .map_err(|e| SarError::Processing(format!("Failed to get band 1: {}", e)))?;
+
+        let window = (0, 0);
+        let window_size = (width, height);
+
+        // Read complex 16-bit integers (CInt16 format)
+        let complex_data = band.read_as::<i16>(window, window_size, (width * 2, height), None)
+            .map_err(|e| SarError::Processing(format!("Failed to read complex CInt16 data: {}", e)))?;
+
+        // Convert to Complex<f32> array (preserve I/Q values)
+        convert_cint16_to_complex(complex_data, width, height)
+    } else {
+        Err(SarError::Processing(format!("Complex extraction not supported for {} bands", band_count)))
+    }
+}
+
+/// Convert CInt16 interleaved data to Complex<f32> (preserving I/Q values)
+fn convert_cint16_to_complex(
+    complex_data: gdal::raster::Buffer<i16>, 
+    width: usize, 
+    height: usize
+) -> SarResult<ndarray::Array2<num_complex::Complex<f32>>> {
+    
+    let mut complex_array = ndarray::Array2::zeros((height, width));
+    let total_pixels = width * height;
+
+    // Data is interleaved as [real, imag, real, imag, ...]
+    if complex_data.data.len() < total_pixels * 2 {
+        return Err(SarError::Processing(format!("Insufficient data: expected {} i16 values, got {}",
+                                                total_pixels * 2, complex_data.data.len())));
+    }
+
+    // Convert i16 complex data to Complex<f32> values
+    for row in 0..height {
+        for col in 0..width {
+            let pixel_idx = row * width + col;
+            let data_idx = pixel_idx * 2;
+
+            // Extract real and imaginary parts as i16, convert to f32
+            let real_i16 = complex_data.data[data_idx];
+            let imag_i16 = complex_data.data[data_idx + 1];
+
+            // Convert to f32 and create complex number
+            let real_f32 = real_i16 as f32;
+            let imag_f32 = imag_i16 as f32;
+
+            complex_array[[row, col]] = Complex::new(real_f32, imag_f32);
+        }
+    }
+
+    log::info!("✅ Successfully extracted COMPLEX SLC data: {}x{} pixels", width, height);
+    
+    Ok(complex_array)
+}
+
+/// Extract complex SLC data (preserving I/Q values) from ZIP or SAFE directory for proper radiometric calibration
+pub fn extract_subswath_complex_data(
+    product_path: &str,
+    subswath: &str,
+    polarization: &str,
+) -> SarResult<ndarray::Array2<num_complex::Complex<f32>>> {
+    // Delegate to the ZIP/SAFE-aware function
+    extract_subswath_complex_from_zip(product_path, subswath, polarization)
+}
+
+/// Helper function to extract complex SLC data from SAFE directory
+fn extract_subswath_complex_from_safe(
+    safe_path: &str,
+    _subswath: &str,
+    polarization: &str,
+) -> SarResult<ndarray::Array2<num_complex::Complex<f32>>> {
+    use crate::io::slc_reader::SlcReader;
+    use crate::types::Polarization;
+    
+    log::info!("Extracting complex SLC data from SAFE directory: {}", safe_path);
+
+    // Parse polarization
+    let pol = match polarization.to_uppercase().as_str() {
+        "VV" => Polarization::VV,
+        "VH" => Polarization::VH,
+        "HV" => Polarization::HV,
+        "HH" => Polarization::HH,
+        _ => return Err(SarError::Processing(format!("Invalid polarization: {}", polarization))),
+    };
+
+    // Create SlcReader for SAFE directory
+    let mut reader = SlcReader::new(safe_path)
+        .map_err(|e| SarError::Processing(format!("Failed to create SLC reader: {}", e)))?;
+
+    // Read SLC data for the specified polarization
+    let sar_image = reader.read_slc_data(pol)
+        .map_err(|e| SarError::Processing(format!("Failed to read SLC data: {}", e)))?;
+
+    log::info!("Successfully read SLC data with dimensions: {}x{}", sar_image.nrows(), sar_image.ncols());
+    
+    // Convert from Complex64 to Complex<f32> and ensure it's complex data
+    let complex_array = sar_image.mapv(|val| Complex::new(val.re as f32, val.im as f32));
+
+    // Verify this is actually complex data
+    let has_imaginary = complex_array.iter().any(|&val| val.im.abs() > 1e-10);
+    if !has_imaginary {
+        log::warn!("SLC data appears to have no imaginary component - may be intensity data");
+    }
+
+    log::info!("✅ Successfully extracted COMPLEX SLC data from SAFE: {}x{} pixels", 
+               complex_array.nrows(), complex_array.ncols());
+    
+    Ok(complex_array)
 }

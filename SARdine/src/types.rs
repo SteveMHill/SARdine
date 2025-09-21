@@ -67,8 +67,19 @@ pub enum AcquisitionMode {
 pub struct SubSwath {
     pub id: String,                    // IW1, IW2, IW3
     pub burst_count: usize,
+    
+    // Local sub-swath dimensions
     pub range_samples: usize,
     pub azimuth_samples: usize,
+    
+    // Global coordinate reference frame preservation
+    // These maintain the full-image coordinates for proper LUT mapping
+    pub first_line_global: usize,      // First line in full-image coordinates
+    pub last_line_global: usize,       // Last line in full-image coordinates
+    pub first_sample_global: usize,    // First sample in full-image coordinates  
+    pub last_sample_global: usize,     // Last sample in full-image coordinates
+    
+    // Physical parameters
     pub range_pixel_spacing: f64,      // meters
     pub azimuth_pixel_spacing: f64,    // meters
     pub slant_range_time: f64,         // seconds
@@ -132,6 +143,12 @@ pub struct SarMetadata {
     pub start_time: DateTime<Utc>,
     pub stop_time: DateTime<Utc>,
     
+    // Radar parameters (extracted from annotation XML)
+    pub radar_frequency: Option<f64>, // Hz - must be extracted from annotation, never hardcoded
+    pub wavelength: Option<f64>,      // meters - must be extracted from annotation
+    pub slant_range_time: Option<f64>, // seconds - critical for terrain correction
+    pub prf: Option<f64>,             // Hz - pulse repetition frequency, critical for terrain correction
+    
     // Geometry
     pub bounding_box: BoundingBox,
     pub coordinate_system: CoordinateSystem,
@@ -167,11 +184,26 @@ pub enum SarError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
     
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+    
+    #[error("Parameter error: {0}")]
+    ParameterError(String),
+    
     #[error("Processing error: {0}")]
     Processing(String),
     
+    #[error("Data processing error: {0}")]
+    DataProcessingError(String),
+    
     #[error("Metadata error: {0}")]
     Metadata(String),
+    
+    #[error("Invalid metadata: {0}")]
+    InvalidMetadata(String),
+    
+    #[error("Missing calibration data: {0}")]
+    MissingCalibrationData(String),
     
     #[error("GDAL error: {0}")]
     Gdal(#[from] gdal::errors::GdalError),
@@ -182,8 +214,8 @@ pub enum SarError {
     #[error("Missing required parameter: {0}")]
     MissingParameter(String),
     
-    #[error("Invalid parameter value: {0}")]
-    InvalidParameter(String),
+    #[error("Missing metadata: {0}")]
+    MissingMetadata(String),
     
     #[error("Not implemented: {0}")]
     NotImplemented(String),
@@ -344,9 +376,13 @@ pub struct MaskingWorkflow {
     pub noise_mask: bool,
     pub coherence_threshold: Option<f64>,
     pub intensity_threshold: Option<f64>,
+    /// Local incidence angle cosine threshold (dimensionless, 0-1)
     pub lia_threshold: f64,
+    /// DEM validity threshold in meters
     pub dem_threshold: f64,
+    /// Minimum gamma0 threshold in power units (linear scale, not dB)
     pub gamma0_min: f32,
+    /// Maximum gamma0 threshold in power units (linear scale, not dB)
     pub gamma0_max: f32,
 }
 
@@ -359,10 +395,12 @@ impl Default for MaskingWorkflow {
             noise_mask: false,
             coherence_threshold: Some(0.3),
             intensity_threshold: None,
-            lia_threshold: 0.1,
+            lia_threshold: 0.6,  // Fixed: Changed from 0.1 (cos 84°) to 0.6 (cos 53°) for reasonable SAR geometry
             dem_threshold: -100.0,
-            gamma0_min: -50.0,
-            gamma0_max: 10.0,
+            // POWER DOMAIN THRESHOLDS: Masking now operates in power units for better precision
+            // Made more liberal to preserve more data by default
+            gamma0_min: 1e-6,    // Equivalent to -60 dB: 10^(-60/10) = 1e-6 (very liberal minimum)
+            gamma0_max: 100000.0, // Equivalent to 50 dB: 10^(50/10) = 100000 (very liberal maximum)
         }
     }
 }

@@ -28,8 +28,8 @@ def get_sar_info(zip_path, polarization="VV"):
     """Get basic information about a Sentinel-1 SLC product"""
     try:
         import sardine
-        reader = sardine.SlcReader(str(zip_path))
-        metadata = reader.get_metadata(polarization)
+        reader = sardine.SlcReader.new_with_full_cache(str(zip_path))
+        metadata = reader.get_cached_metadata()
         
         return {
             "product_type": metadata.get("product_type", "Unknown"),

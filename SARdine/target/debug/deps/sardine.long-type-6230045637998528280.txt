@@ -1,2 +1,0 @@
-Result<Vec<StateVector>, _>
-Result<Result<Vec<StateVector>, _>, pyo3::PyErr>

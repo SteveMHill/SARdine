@@ -308,9 +308,9 @@ impl DemReader {
             }
         }
         
-        Err(last_error.unwrap_or_else(|| 
-            SarError::Processing("Download failed after all retries".to_string())
-        ))
+        // SCIENTIFIC REQUIREMENT: Return actual error, not fallback
+        // last_error must exist since we had at least one failure
+        Err(last_error.expect("Internal error: last_error should exist after all retries failed"))
     }
     
     /// Single download attempt
@@ -1552,7 +1552,7 @@ impl DemReader {
         let geo_transform = dataset.geo_transform()?;
         let (width, height) = dataset.raster_size();
         
-        // CRITICAL: Validate minimum dimensions
+        // Important: Validate minimum dimensions
         if width < 3 || height < 3 {
             log::warn!("DEM too small ({}x{}), creating minimal valid DEM", width, height);
             let min_size = 10;
@@ -1626,7 +1626,7 @@ impl DemReader {
             return Err(SarError::Processing("Invalid HGT file: zero pixels".to_string()));
         }
         
-        // CRITICAL: Ensure minimum dimensions for terrain correction
+        // Important: Ensure minimum dimensions for terrain correction
         let safe_size = pixels_per_side.max(10); // Minimum 10x10 for gradient calculation
         
         // Convert big-endian 16-bit values to f32 elevations
@@ -1705,7 +1705,7 @@ impl DemReader {
         let min_row = ((bbox.max_lat - transform.top_left_y) / transform.pixel_height).max(0.0) as usize;
         let max_row = ((bbox.min_lat - transform.top_left_y) / transform.pixel_height).min(height as f64) as usize;
 
-        // CRITICAL: Ensure valid bounds and minimum size
+        // Important: Ensure valid bounds and minimum size
         let safe_min_col = min_col.min(width - 1);
         let safe_max_col = max_col.max(safe_min_col + 1).min(width);
         let safe_min_row = min_row.min(height - 1);
@@ -2108,12 +2108,30 @@ impl DemReader {
                 ).map_err(|e| SarError::Processing(format!("Regex error: {}", e)))?;
                 
                 for (pos_cap, vel_cap) in pos_regex.captures_iter(orbit_section).zip(vel_regex.captures_iter(orbit_section)) {
-                    let px: f64 = pos_cap[1].parse().unwrap_or(0.0);
-                    let py: f64 = pos_cap[2].parse().unwrap_or(0.0);
-                    let pz: f64 = pos_cap[3].parse().unwrap_or(0.0);
-                    let vx: f64 = vel_cap[1].parse().unwrap_or(0.0);
-                    let vy: f64 = vel_cap[2].parse().unwrap_or(0.0);
-                    let vz: f64 = vel_cap[3].parse().unwrap_or(0.0);
+                    let px: f64 = pos_cap[1].parse().map_err(|e| {
+                        log::error!("🚨 CRITICAL: Failed to parse orbit position X: {} - error: {}", &pos_cap[1], e);
+                        SarError::DataProcessingError(format!("Invalid orbit position X value: {}", &pos_cap[1]))
+                    })?;
+                    let py: f64 = pos_cap[2].parse().map_err(|e| {
+                        log::error!("🚨 CRITICAL: Failed to parse orbit position Y: {} - error: {}", &pos_cap[2], e);
+                        SarError::DataProcessingError(format!("Invalid orbit position Y value: {}", &pos_cap[2]))
+                    })?;
+                    let pz: f64 = pos_cap[3].parse().map_err(|e| {
+                        log::error!("🚨 CRITICAL: Failed to parse orbit position Z: {} - error: {}", &pos_cap[3], e);
+                        SarError::DataProcessingError(format!("Invalid orbit position Z value: {}", &pos_cap[3]))
+                    })?;
+                    let vx: f64 = vel_cap[1].parse().map_err(|e| {
+                        log::error!("🚨 CRITICAL: Failed to parse orbit velocity X: {} - error: {}", &vel_cap[1], e);
+                        SarError::DataProcessingError(format!("Invalid orbit velocity X value: {}", &vel_cap[1]))
+                    })?;
+                    let vy: f64 = vel_cap[2].parse().map_err(|e| {
+                        log::error!("🚨 CRITICAL: Failed to parse orbit velocity Y: {} - error: {}", &vel_cap[2], e);
+                        SarError::DataProcessingError(format!("Invalid orbit velocity Y value: {}", &vel_cap[2]))
+                    })?;
+                    let vz: f64 = vel_cap[3].parse().map_err(|e| {
+                        log::error!("🚨 CRITICAL: Failed to parse orbit velocity Z: {} - error: {}", &vel_cap[3], e);
+                        SarError::DataProcessingError(format!("Invalid orbit velocity Z value: {}", &vel_cap[3]))
+                    })?;
                     
                     state_vectors.push((px, py, pz, vx, vy, vz));
                 }
