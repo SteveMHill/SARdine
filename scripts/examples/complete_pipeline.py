@@ -48,7 +48,8 @@ def complete_sar_pipeline(input_file, output_dir="./complete_output"):
         sensing_time = datetime.strptime(start_time_str, '%Y%m%dT%H%M%S')
         start_time_rfc3339 = sensing_time.isoformat() + 'Z'
         
-        orbit_result = sardine.apply_precise_orbit_file(product_id, start_time_rfc3339, '/tmp/orbit_cache')
+    orbit_cache = f"{output_dir}/orbit_cache"
+    orbit_result = sardine.apply_precise_orbit_file(product_id, start_time_rfc3339, orbit_cache)
         step_time = time.time() - step_start
         print(f"✅ Complete in {step_time:.2f}s")
         print(f"   📡 Type: {orbit_result['result']['orbit_type']}")
@@ -98,7 +99,7 @@ def complete_sar_pipeline(input_file, output_dir="./complete_output"):
         step_start = time.time()
         try:
             # Try different calibration approaches
-            cal_result = sardine.radiometric_calibration_with_zip(input_file, 'VV', 'sigma0', [])
+            cal_result = sardine.radiometric_calibration(input_file, 'VV', 'sigma0', [])
             print(f"   ✅ Sigma0 calibration completed")
             results['step5_calibration'] = cal_result
         except Exception as e:
@@ -160,7 +161,7 @@ def complete_sar_pipeline(input_file, output_dir="./complete_output"):
         step_start = time.time()
         try:
             geocode_result = sardine.apply_terrain_correction_with_real_orbits(
-                input_file, 'VV', "", '/tmp/orbit_cache', 30.0
+                input_file, 'VV', "", orbit_cache, 30.0
             )
             print(f"   ✅ Geocoding to UTM projection")
             results['step9_geocoding'] = geocode_result

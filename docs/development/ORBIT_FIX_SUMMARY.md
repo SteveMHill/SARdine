@@ -67,6 +67,18 @@ The Rust backend already had complete orbit functionality:
 ✅ **RFC3339 timestamp format generated properly**
 ✅ **Integration maintains scientific quality standards**
 
+## Orbit Cache Handling (Updated)
+
+- Avoid hardcoded paths like `/tmp/orbit_cache`.
+- Prefer an explicit cache dir argument when calling `apply_precise_orbit_file`.
+- Set environment variable `SARDINE_ORBIT_CACHE` for Rust-side orbit usage (e.g., deburst velocity derivation).
+- The Python backscatter pipeline defaults to an output-local cache: `<output_dir>/orbit_cache`.
+
+Example:
+```bash
+export SARDINE_ORBIT_CACHE="/home/user/.cache/sardine/orbits"
+```
+
 ## Result
 
 The "Invalid start time format: input contains invalid characters" error has been **completely resolved**. The orbit file download and processing will now work correctly with the existing Rust backend functionality.

@@ -81,7 +81,7 @@ def process_sentinel1_optimized(slc_zip_path: str,
         # Step 4: Radiometric calibration
         print("\n⚡ Step 4: Radiometric calibration")
         step_start = time.time()
-        # In real workflow: sardine.radiometric_calibration_with_zip(...)
+        # In real workflow: sardine.radiometric_calibration(...)
         calibrated_data = sar_data  # Use as-is for demo
         step_times['calibration'] = time.time() - step_start
         print(f"✅ Completed in {step_times['calibration']:.2f}s")
@@ -189,7 +189,7 @@ def load_real_sar_data() -> np.ndarray:
     # Use sardine to load real data
     import sardine
     
-    reader = sardine.SlcReader(str(real_data_path))
+    reader = sardine.SlcReader.new_with_full_cache(str(real_data_path))
     slc_data = reader.read_slc_data("VV")
     
     # Convert complex to intensity in linear units

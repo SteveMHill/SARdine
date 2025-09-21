@@ -72,3 +72,22 @@ Thumbs.db
 dem_cache/
 orbit_cache/
 srtm_tiles/
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Python virtual environments
+venv/
+env/
+.env
+
+# macOS system files
+__MACOSX/
+.DS_Store
+
+# Debug and temporary files
+debug_*
+test_*
+*_debug*
+*_test*

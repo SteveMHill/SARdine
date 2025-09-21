@@ -49,7 +49,8 @@ def working_sar_pipeline(input_file, output_dir="./working_output"):
         sensing_time = datetime.strptime(start_time_str, '%Y%m%dT%H%M%S')
         start_time_rfc3339 = sensing_time.isoformat() + 'Z'
         
-        orbit_result = sardine.apply_precise_orbit_file(product_id, start_time_rfc3339, '/tmp/orbit_cache')
+    orbit_cache = f"{output_dir}/orbit_cache"
+    orbit_result = sardine.apply_precise_orbit_file(product_id, start_time_rfc3339, orbit_cache)
         step_time = time.time() - step_start
         print(f"✅ Complete in {step_time:.2f}s")
         print(f"   📡 Type: {orbit_result['result']['orbit_type']}")
@@ -107,7 +108,7 @@ def working_sar_pipeline(input_file, output_dir="./working_output"):
         # Check what other processing functions are available
         available_functions = []
         function_tests = {
-            'radiometric_calibration': 'sardine.radiometric_calibration_with_zip',
+            'radiometric_calibration': 'sardine.radiometric_calibration',
             'multilooking': 'sardine.apply_multilooking', 
             'speckle_filtering': 'sardine.apply_speckle_filter',
             'terrain_correction': 'sardine.apply_terrain_correction_with_real_orbits',
@@ -137,7 +138,7 @@ def working_sar_pipeline(input_file, output_dir="./working_output"):
         # For calibration - check required parameters
         try:
             # This will fail but tell us what parameters are needed
-            help_result = sardine.radiometric_calibration_with_zip.__doc__
+            help_result = sardine.radiometric_calibration.__doc__
             param_analysis['calibration'] = "Requires: zip_path, polarization, calibration_type, slc_data"
         except Exception as e:
             param_analysis['calibration'] = str(e)

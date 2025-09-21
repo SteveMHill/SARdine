@@ -38,7 +38,7 @@ import sardine
 # Step 1-9: Standard processing steps (unchanged)
 slc_data = sardine.iw_split_with_real_data(zip_path, polarization, subswath)
 debursted = sardine.deburst_topsar(zip_path, subswath, polarization)
-calibrated = sardine.radiometric_calibration_with_zip(zip_path, subswath, polarization, "sigma0", debursted)
+calibrated = sardine.radiometric_calibration(product_path, subswath, polarization, "sigma0", debursted)
 merged = sardine.merge_iw_subswaths_from_zip(iw1, iw2, iw3, zip_path, polarization)
 multilooked = sardine.apply_multilooking(merged, range_looks, azimuth_looks, range_spacing, azimuth_spacing)
 filtered = sardine.apply_speckle_filter_optimized(multilooked, "lee", window_size=7)

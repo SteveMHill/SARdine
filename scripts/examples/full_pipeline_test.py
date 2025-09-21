@@ -42,10 +42,10 @@ def load_real_sar_data() -> Tuple[np.ndarray, Dict[str, Any]]:
     # Use sardine to load real data
     import sardine
     
-    # Read product info and metadata
+    # Read product info and metadata using cached reader for optimal performance
     info = sardine.get_product_info(str(real_data_path))
-    reader = sardine.SlcReader(str(real_data_path))
-    metadata = reader.get_metadata()
+    reader = sardine.SlcReader.new_with_full_cache(str(real_data_path))
+    metadata = reader.get_cached_metadata()
     
     # Read real SLC data for VV polarization
     slc_data = reader.read_slc_data("VV")

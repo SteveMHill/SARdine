@@ -49,10 +49,12 @@ def test_orbit_processing():
         print(f"   RFC3339 time: {start_time_rfc3339}")
         
         # Test orbit processing
+        cache_dir = './cli_test_output/orbit_cache'
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
         orbit_result = sardine.apply_precise_orbit_file(
-            product_id, 
-            start_time_rfc3339, 
-            '/tmp/orbit_cache'
+            product_id,
+            start_time_rfc3339,
+            cache_dir,
         )
         
         print(f"   ✅ Orbit processing successful!")

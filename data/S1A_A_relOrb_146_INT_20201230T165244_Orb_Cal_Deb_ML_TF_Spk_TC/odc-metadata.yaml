@@ -1,0 +1,41 @@
+---
+# Dataset
+$schema: https://schemas.opendatacube.org/dataset
+id: 4ef6a069-7956-4b58-8566-a217b7f1daef
+
+label: S1A_A_relOrb_146_INT_20201230T165244_Orb_Cal_Deb_ML_TF_Spk_TC
+product:
+  name: sentinel1_intensity
+
+crs: epsg:4326
+geometry:
+  type: Polygon
+  coordinates: [[[11.22940250944134, 52.86627260492712], [15.488494934508815, 52.86627260492712],
+      [15.488494934508815, 54.87831917829802], [11.22940250944134, 54.87831917829802],
+      [11.22940250944134, 52.86627260492712]]]
+grids:
+  default:
+    shape: [11199, 23706]
+    transform: [0.0001796630568239043, 0.0, 11.22940250944134, 0.0, -0.0001796630568239043,
+      54.87831917829802, 0.0, 0.0, 1.0]
+
+properties:
+  datetime: 2020-12-30 16:52:44Z
+  eo:platform: s1
+  odc:file_format: GeoTIFF
+  odc:processing_datetime: 2023-07-28 13:37:33.346792Z
+  odc:product: sentinel1_intensity
+  odc:product_family: int
+  sat:orbit_state: ascending
+  sat:relative_orbit: 146
+
+measurements:
+  vh:
+    path: VH.tif
+  vv:
+    path: VV.tif
+
+accessories: {}
+
+lineage: {}
+...
