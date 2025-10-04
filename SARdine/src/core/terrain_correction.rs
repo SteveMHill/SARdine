@@ -2333,7 +2333,7 @@ impl TerrainCorrector {
 
         // CRITICAL FIX: Newton-Raphson returns orbit-relative time (relative to orbit_data.reference_time)
         // We need to convert this to absolute UTC time for interpolation
-        let orbit_ref_epoch = datetime_to_seconds(orbit_data.reference_time);
+        let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
         let absolute_azimuth_time = azimuth_time_rel_orbit + orbit_ref_epoch;
 
         debug_assert!(absolute_azimuth_time.is_finite(), "Absolute azimuth time must be finite");
@@ -2649,7 +2649,7 @@ impl TerrainCorrector {
 
         // Initial guess: find closest approach orbit state
     // NOTE: All times inside solver now relative to ORBIT REFERENCE epoch (not product start)
-    let orbit_ref_epoch = datetime_to_seconds(orbit_data.reference_time);
+    let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
     
     // CRITICAL FIX: Initialize best_time to middle of product acquisition, not 0
     // This ensures we start searching near the actual imaging time
@@ -2670,7 +2670,7 @@ impl TerrainCorrector {
                 // CRITICAL FIX: Convert absolute time to relative time from ORBIT REFERENCE
                 // This fixes the azimuth time origin bug where orbit reference time was
                 // being used instead of product start time, causing massive out-of-bounds pixel indices
-                let absolute_time = datetime_to_seconds(state_vector.time);
+                let absolute_time = crate::types::datetime_to_utc_seconds(state_vector.time);
                 best_time = absolute_time - orbit_ref_epoch; // relative to orbit reference
             }
         }
@@ -2679,12 +2679,12 @@ impl TerrainCorrector {
         let min_orbit_time = orbit_data
             .state_vectors
             .first()
-            .map(|sv| datetime_to_seconds(sv.time) - orbit_ref_epoch + 10.0)
+            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch + 10.0)
             .unwrap_or(best_time - 300.0);
         let max_orbit_time = orbit_data
             .state_vectors
             .last()
-            .map(|sv| datetime_to_seconds(sv.time) - orbit_ref_epoch - 10.0)
+            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch - 10.0)
             .unwrap_or(best_time + 300.0);
 
         // Validate seed is within orbit bounds
@@ -3372,7 +3372,7 @@ impl TerrainCorrector {
                     let along_track_offset = cross_track_component / velocity_magnitude;
 
                     // Convert state vector time to seconds since reference
-                    let time_seconds = datetime_to_seconds(orbit_state.time);
+                    let time_seconds = crate::types::datetime_to_utc_seconds(orbit_state.time);
                     let fallback_azimuth = (time_seconds * params.prf)
                         + (along_track_offset / velocity_magnitude * params.prf);
 
@@ -4649,16 +4649,16 @@ impl TerrainCorrector {
         const MIN_BRACKET_SPAN: f64 = 1e-5;
         const TARGET_DOPPLER_HZ: f64 = 1e-2;
 
-        let orbit_ref_epoch = datetime_to_seconds(orbit_data.reference_time);
+        let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
 
         let orbit_start = orbit_data
             .state_vectors
             .first()
-            .map(|sv| datetime_to_seconds(sv.time) - orbit_ref_epoch)?;
+            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch)?;
         let orbit_end = orbit_data
             .state_vectors
             .last()
-            .map(|sv| datetime_to_seconds(sv.time) - orbit_ref_epoch)?;
+            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch)?;
 
         if !orbit_start.is_finite() || !orbit_end.is_finite() || orbit_end <= orbit_start {
             log::debug!("solve_zero_doppler_secant: orbit bounds invalid");
@@ -4839,7 +4839,7 @@ impl TerrainCorrector {
         let mut range_oob = 0usize;
         let mut swath_oob = 0usize;
 
-        let orbit_ref_epoch = datetime_to_seconds(orbit_data.reference_time);
+        let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
 
         for gr in 0..grid_rows {
             for gc in 0..grid_cols {
@@ -5345,9 +5345,9 @@ impl TerrainCorrector {
         // STEP 1: Get orbit time bounds (relative to reference)
     let start_time = orbit_data.state_vectors[0].time;
     let end_time = orbit_data.state_vectors.last().unwrap().time;
-    let orbit_ref_epoch = datetime_to_seconds(orbit_data.reference_time);
-    let t_orb_start = datetime_to_seconds(start_time) - orbit_ref_epoch;
-    let t_orb_end = datetime_to_seconds(end_time) - orbit_ref_epoch;
+    let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
+    let t_orb_start = crate::types::datetime_to_utc_seconds(start_time) - orbit_ref_epoch;
+    let t_orb_end = crate::types::datetime_to_utc_seconds(end_time) - orbit_ref_epoch;
         let total_duration = t_orb_end - t_orb_start;
 
         log::debug!(
@@ -6130,7 +6130,7 @@ impl TerrainCorrector {
     fn azimuth_time_to_pixel(&self, azimuth_time_rel: f64, params: &RangeDopplerParams) -> f64 {
         // azimuth_time_rel is relative to orbit_ref_epoch (UTC time base)
         // Convert to absolute UTC time, then to time since product start
-        let orbit_ref_epoch = datetime_to_seconds(
+        let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(
             self.orbit_data.as_ref()
                 .expect("orbit data required")
                 .reference_time
@@ -6590,7 +6590,7 @@ impl TerrainCorrector {
         );
 
         // Orbit reference time
-        let orbit_ref_time = datetime_to_seconds(orbit_data.reference_time);
+        let orbit_ref_time = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
 
         // Process each output pixel
         let total_pixels = height * width;
@@ -7417,8 +7417,8 @@ mod tests {
         };
 
         // Create parameters with valid bounds
-        let orbit_ref = datetime_to_seconds(now);
-        let product_start = datetime_to_seconds(now);
+        let orbit_ref = crate::types::datetime_to_utc_seconds(now);
+        let product_start = crate::types::datetime_to_utc_seconds(now);
         let params = RangeDopplerParams {
             range_pixel_spacing: 2.3,
             azimuth_pixel_spacing: 14.0,

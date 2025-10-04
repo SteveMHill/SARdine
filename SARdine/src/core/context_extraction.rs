@@ -81,14 +81,14 @@ fn extract_timing_context(
     annotation: &AnnotationRoot,
     orbit_data: &OrbitData,
 ) -> SarResult<TimingContext> {
-    use crate::core::terrain_correction::datetime_to_seconds;
+    use crate::types::datetime_to_utc_seconds;
     
     let image_info = annotation.image_annotation.as_ref()
         .and_then(|ia| ia.image_information.as_ref())
         .ok_or_else(|| crate::types::SarError::Metadata("Missing image_information".to_string()))?;
     
     // Get orbit reference epoch
-    let orbit_ref_epoch = datetime_to_seconds(orbit_data.reference_time);
+    let orbit_ref_epoch = datetime_to_utc_seconds(orbit_data.reference_time);
     
     // Parse product start time
     let product_start_time_abs = {
