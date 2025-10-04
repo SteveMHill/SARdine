@@ -122,7 +122,7 @@ pub struct SlcReader {
     cached_metadata: Option<SarMetadata>,
 
     /// Cached annotations per polarization to eliminate XML re-parsing
-    cached_annotations: HashMap<Polarization, Vec<Arc<crate::io::annotation::AnnotationRoot>>>,
+    cached_annotations: HashMap<Polarization, Vec<Arc<crate::io::annotation::ProductRoot>>>,
 
     /// Cached calibration coefficients per polarization  
     cached_calibration: HashMap<Polarization, CalibrationCoefficients>,
@@ -304,7 +304,7 @@ impl SlcReader {
 
                 for i in 0..archive.len() {
                     let file = archive.by_index(i).map_err(|e| {
-                        SarError::Io(std::io::Error::other(format!(
+                        SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                             "Failed to access file {}: {}",
                             i, e
                         )))
@@ -358,7 +358,7 @@ impl SlcReader {
             ProductFormat::Zip => {
                 let archive = self.open_archive()?;
                 let mut file = archive.by_name(file_path).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read {}: {}",
                         file_path, e
                     )))
@@ -632,7 +632,7 @@ impl SlcReader {
     pub fn get_annotation_for_polarization(
         &mut self,
         pol: Polarization,
-    ) -> SarResult<Arc<crate::io::annotation::AnnotationRoot>> {
+    ) -> SarResult<Arc<crate::io::annotation::ProductRoot>> {
         if !self.cache_initialized {
             self.initialize_all_caches()?;
         }
@@ -653,7 +653,7 @@ impl SlcReader {
     pub fn get_all_subswath_annotations(
         &mut self,
         pol: Polarization,
-    ) -> SarResult<Vec<Arc<crate::io::annotation::AnnotationRoot>>> {
+    ) -> SarResult<Vec<Arc<crate::io::annotation::ProductRoot>>> {
         if !self.cache_initialized {
             self.initialize_all_caches()?;
         }
@@ -669,7 +669,7 @@ impl SlcReader {
     pub fn get_primary_annotation_with_coverage_check(
         &mut self,
         pol: Polarization,
-    ) -> SarResult<Arc<crate::io::annotation::AnnotationRoot>> {
+    ) -> SarResult<Arc<crate::io::annotation::ProductRoot>> {
         let all_annotations = self.get_all_subswath_annotations(pol)?;
 
         if all_annotations.is_empty() {
@@ -710,13 +710,13 @@ impl SlcReader {
     /// * `validate_consistency` - Whether to validate both parsing methods
     ///
     /// # Returns
-    /// * `Ok(AnnotationRoot)` - Parsed annotation with validation
+    /// * `Ok(ProductRoot)` - Parsed annotation with validation
     /// * `Err(SarError)` - Parsing failure or validation issues
     pub fn get_annotation_unified_validated(
         &mut self,
         pol: Polarization,
         validate_consistency: bool,
-    ) -> SarResult<crate::io::annotation::AnnotationRoot> {
+    ) -> SarResult<crate::io::annotation::ProductRoot> {
         // Get annotation files (all subswaths) and select the first for validation
         let annotations = self.find_all_annotation_files()?;
         let files = annotations.get(&pol).ok_or_else(|| {
@@ -820,7 +820,7 @@ impl SlcReader {
                 // Extract the TIFF file to a temporary location for ZIP format
                 let archive = self.open_archive()?;
                 let mut zip_file = archive.by_name(measurement_file).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to access {}: {}",
                         measurement_file, e
                     )))
@@ -837,7 +837,7 @@ impl SlcReader {
 
                 // Read with GDAL from temporary file
                 gdal::Dataset::open(temp_file.path()).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to open TIFF with GDAL: {}",
                         e
                     )))
@@ -847,7 +847,7 @@ impl SlcReader {
                 // Read directly from SAFE directory structure
                 let full_path = self.product_path.join(measurement_file);
                 gdal::Dataset::open(full_path).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to open TIFF with GDAL: {}",
                         e
                     )))
@@ -872,7 +872,7 @@ impl SlcReader {
         let slc_data = if band_count == 1 {
             // Single band containing complex data (Sentinel-1 SLC format: CInt16)
             let band = dataset.rasterband(1).map_err(|e| {
-                SarError::Io(std::io::Error::other(format!(
+                SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                     "Failed to get band 1: {}",
                     e
                 )))
@@ -898,7 +898,7 @@ impl SlcReader {
             let complex_data = band
                 .read_as::<i16>(window, window_size, (width * 2, height), None)
                 .map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read complex CInt16 data from GDAL band: {}",
                         e
                     )))
@@ -925,14 +925,14 @@ impl SlcReader {
         } else if band_count >= 2 {
             // Separate I and Q bands (less common for Sentinel-1)
             let band1 = dataset.rasterband(1).map_err(|e| {
-                SarError::Io(std::io::Error::other(format!(
+                SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                     "Failed to get band 1: {}",
                     e
                 )))
             })?;
 
             let band2 = dataset.rasterband(2).map_err(|e| {
-                SarError::Io(std::io::Error::other(format!(
+                SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                     "Failed to get band 2: {}",
                     e
                 )))
@@ -945,7 +945,7 @@ impl SlcReader {
             let i_data = band1
                 .read_as::<f32>(window, window_size, buffer_size, None)
                 .map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read I data: {}",
                         e
                     )))
@@ -954,7 +954,7 @@ impl SlcReader {
             let q_data = band2
                 .read_as::<f32>(window, window_size, buffer_size, None)
                 .map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read Q data: {}",
                         e
                     )))
@@ -1014,7 +1014,7 @@ impl SlcReader {
                 // Extract the TIFF file to a temporary location
                 let archive = self.open_archive()?;
                 let mut zip_file = archive.by_name(measurement_file).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to access {}: {}",
                         measurement_file, e
                     )))
@@ -1031,7 +1031,7 @@ impl SlcReader {
 
                 // Open with GDAL
                 let dataset = gdal::Dataset::open(temp_file.path()).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to open TIFF with GDAL: {}",
                         e
                     )))
@@ -1046,7 +1046,7 @@ impl SlcReader {
 
                 let full_path = self.product_path.join(measurement_file);
                 let dataset = gdal::Dataset::open(full_path).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to open TIFF with GDAL: {}",
                         e
                     )))
@@ -1074,7 +1074,7 @@ impl SlcReader {
         let slc_data = if band_count == 1 {
             // Single band containing complex data (Sentinel-1 SLC format: CInt16)
             let band = dataset.rasterband(1).map_err(|e| {
-                SarError::Io(std::io::Error::other(format!(
+                SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                     "Failed to get band 1: {}",
                     e
                 )))
@@ -1097,7 +1097,7 @@ impl SlcReader {
             let complex_data = band
                 .read_as::<i16>(window, window_size, (width * 2, height), None)
                 .map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read complex CInt16 data from GDAL: {}",
                         e
                     )))
@@ -1123,14 +1123,14 @@ impl SlcReader {
         } else if band_count >= 2 {
             // Separate I and Q bands (less common for Sentinel-1)
             let band1 = dataset.rasterband(1).map_err(|e| {
-                SarError::Io(std::io::Error::other(format!(
+                SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                     "Failed to get band 1: {}",
                     e
                 )))
             })?;
 
             let band2 = dataset.rasterband(2).map_err(|e| {
-                SarError::Io(std::io::Error::other(format!(
+                SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                     "Failed to get band 2: {}",
                     e
                 )))
@@ -1143,7 +1143,7 @@ impl SlcReader {
             let i_data = band1
                 .read_as::<f32>(window, window_size, buffer_size, None)
                 .map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read I data: {}",
                         e
                     )))
@@ -1152,7 +1152,7 @@ impl SlcReader {
             let q_data = band2
                 .read_as::<f32>(window, window_size, buffer_size, None)
                 .map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read Q data: {}",
                         e
                     )))
@@ -1783,7 +1783,7 @@ impl SlcReader {
                 use tempfile::NamedTempFile;
                 let archive = self.open_archive()?;
                 let mut zip_file = archive.by_name(measurement_file).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to access {}: {}",
                         measurement_file, e
                     )))
@@ -1791,7 +1791,7 @@ impl SlcReader {
                 let mut temp_file = NamedTempFile::new().map_err(SarError::Io)?;
                 std::io::copy(&mut zip_file, &mut temp_file).map_err(SarError::Io)?;
                 let dataset = gdal::Dataset::open(temp_file.path()).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to open TIFF with GDAL: {}",
                         e
                     )))
@@ -1802,7 +1802,7 @@ impl SlcReader {
             ProductFormat::Safe => {
                 let full_path = self.product_path.join(measurement_file);
                 let dataset = gdal::Dataset::open(full_path).map_err(|e| {
-                    SarError::Io(std::io::Error::other(format!(
+                    SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to open TIFF with GDAL: {}",
                         e
                     )))
@@ -2701,7 +2701,7 @@ impl SlcReader {
     /// Parse orbit information from Sentinel-1 product ID
     /// Format: S1A_IW_SLC__1SDV_20200103T170815_20200103T170842_030639_0382D5_DADE
     /// Returns: (orbit_number, relative_orbit, orbit_direction)
-    fn parse_orbit_from_product_id(product_id: &str) -> Option<(u32, u32, String)> {
+    pub(crate) fn parse_orbit_from_product_id(product_id: &str) -> Option<(u32, u32, String)> {
         let parts: Vec<&str> = product_id.split('_').collect();
         // Debug: log the product ID parsing (info -> debug to reduce noise)
         log::debug!(
@@ -3135,7 +3135,7 @@ impl SlcReader {
     pub fn get_all_cached_annotations(
         &self,
         pol: Polarization,
-    ) -> SarResult<Vec<Arc<crate::io::annotation::AnnotationRoot>>> {
+    ) -> SarResult<Vec<Arc<crate::io::annotation::ProductRoot>>> {
         self.ensure_cache_initialized()?;
 
         self.cached_annotations
@@ -3373,7 +3373,7 @@ impl SlcReader {
             .map(|v| v.len())
             .sum::<usize>();
         let annotation_size =
-            total_annotations * std::mem::size_of::<crate::io::annotation::AnnotationRoot>();
+            total_annotations * std::mem::size_of::<crate::io::annotation::ProductRoot>();
 
         let calibration_size =
             self.cached_calibration.len() * std::mem::size_of::<CalibrationCoefficients>();
@@ -3385,7 +3385,7 @@ impl SlcReader {
     fn parse_annotation_root_xml(
         &self,
         xml_content: &str,
-    ) -> SarResult<crate::io::annotation::AnnotationRoot> {
+    ) -> SarResult<crate::io::annotation::ProductRoot> {
         crate::io::annotation::parse_annotation_xml(xml_content)
             .map_err(|e| SarError::Processing(format!("Failed to parse annotation XML: {}", e)))
     }
