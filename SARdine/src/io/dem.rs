@@ -355,14 +355,15 @@ impl DemReader {
     /// Returns the path actually written if any source worked
     fn try_download_from_sources(tile: &str, output_dir: &str) -> SarResult<Option<String>> {
         // Multiple DEM data sources (in order of preference)
-        let mut sources = vec![
-            // AWS USGS SRTM 1 Arcsecond Tiles (most reliable, no auth required)
-            format!(
+        let mut sources = Vec::new();
+        
+        // AWS USGS SRTM 1 Arcsecond Tiles (most reliable, no auth required)
+        if let Some(dir) = Self::get_skadi_directory(tile) {
+            sources.push(format!(
                 "https://s3.amazonaws.com/elevation-tiles-prod/skadi/{}/{}.hgt.gz",
-                Self::get_skadi_directory(tile),
-                tile
-            ),
-        ];
+                dir, tile
+            ));
+        }
 
         // Add Copernicus DEM sources (30m and 90m resolution)
         sources.extend(Self::get_copernicus_dem_urls(tile));
@@ -407,14 +408,13 @@ impl DemReader {
 
     /// Get Skadi directory structure for AWS SRTM tiles
     /// AWS organizes SRTM tiles like: /N50/N50E012.hgt.gz
-    fn get_skadi_directory(tile: &str) -> String {
+    fn get_skadi_directory(tile: &str) -> Option<String> {
         // Extract latitude part from tile name (e.g., "N50" from "N50E012")
         if tile.len() >= 3 {
             let lat_part = &tile[0..3]; // First 3 characters (e.g., "N50", "S45")
-            lat_part.to_string()
+            Some(lat_part.to_string())
         } else {
-            // SCIENTIFIC MODE: Malformed tile names are not allowed
-            return "INVALID_TILE".to_string();
+            None // Invalid tile name, skip AWS source
         }
     }
 
@@ -593,11 +593,12 @@ impl DemReader {
     /// Extract HGT file from gzipped data (AWS SRTM format)
     fn extract_gzipped_hgt(gzip_data: &[u8], output_path: &str) -> SarResult<()> {
         use flate2::read::GzDecoder;
-        use std::io::Read;
+        use std::io::{Cursor, Read};
 
         log::debug!("Decompressing gzipped HGT file");
 
-        let mut decoder = GzDecoder::new(gzip_data);
+        let reader = Cursor::new(gzip_data);
+        let mut decoder = GzDecoder::new(reader);
         let mut decompressed = Vec::new();
 
         decoder
@@ -1990,49 +1991,40 @@ impl DemReader {
 
         // Debug output suppressed
 
-        // SRTM HGT files are 1201x1201 for 3-arc-second data (most common)
-        let expected_size = 1201 * 1201 * 2; // 16-bit values
-        if buffer.len() != expected_size {
-            log::warn!(
-                "Unexpected HGT file size: {} bytes (expected {})",
-                buffer.len(),
-                expected_size
-            );
+        // SRTM HGT files: 1201×1201 (3") or 3601×3601 (1") - detect from size
+        let samples = buffer.len() / 2;
+        let n = (samples as f64).sqrt().round() as usize;
+        
+        // Validate standard SRTM dimensions
+        match n {
+            1201 | 3601 => {
+                log::debug!("Valid SRTM tile: {}×{} pixels", n, n);
+            }
+            _ => {
+                log::warn!(
+                    "Unexpected HGT dimension: {}×{} ({} bytes) - expected 1201×1201 or 3601×3601",
+                    n, n, buffer.len()
+                );
+            }
         }
 
-        let pixels_per_side = ((buffer.len() / 2) as f64).sqrt() as usize;
-        if pixels_per_side == 0 {
+        if n == 0 {
             return Err(SarError::Processing(
                 "Invalid HGT file: zero pixels".to_string(),
             ));
         }
 
-        // Important: Ensure minimum dimensions for terrain correction
-        let safe_size = pixels_per_side.max(10); // Minimum 10x10 for gradient calculation
+        // Convert big-endian 16-bit values to f32 elevations directly (no resampling needed)
+        let mut elevation_data = Vec::with_capacity(n * n);
 
-        // Convert big-endian 16-bit values to f32 elevations
-        let mut elevation_data = Vec::with_capacity(safe_size * safe_size);
-
-        for i in 0..safe_size {
-            for j in 0..safe_size {
-                // Map to source pixel with bounds checking
-                let src_i = if pixels_per_side > safe_size {
-                    (i * pixels_per_side) / safe_size
-                } else {
-                    i.min(pixels_per_side - 1)
-                };
-                let src_j = if pixels_per_side > safe_size {
-                    (j * pixels_per_side) / safe_size
-                } else {
-                    j.min(pixels_per_side - 1)
-                };
-
-                let idx = (src_i * pixels_per_side + src_j) * 2;
+        for i in 0..n {
+            for j in 0..n {
+                let idx = (i * n + j) * 2;
 
                 if idx + 1 < buffer.len() {
                     let elevation = i16::from_be_bytes([buffer[idx], buffer[idx + 1]]) as f32;
-                    // Handle SRTM no-data values
-                    if elevation == -32768.0 {
+                    // Handle SRTM no-data values (-32768 or values <= -32768)
+                    if elevation <= -32768.0 {
                         elevation_data.push(f32::NAN);
                     } else {
                         elevation_data.push(elevation);
@@ -2043,18 +2035,15 @@ impl DemReader {
             }
         }
 
-        let mut dem_array = Array2::from_shape_vec((safe_size, safe_size), elevation_data)
+        let mut dem_array = Array2::from_shape_vec((n, n), elevation_data)
             .map_err(|e| SarError::Processing(format!("Failed to create DEM array: {}", e)))?;
-
-        // Debug output suppressed
 
         // Fill voids
         Self::fill_dem_voids(&mut dem_array, -32768.0)?;
 
         // Calculate transform for the tile
-        // SRTM tiles are sampled on the edges; spacing is 1.0/(n-1) degrees
-        let n = safe_size as f64;
-        let pixel_size = 1.0 / (n - 1.0); // Correct edge-sampled spacing
+        // SRTM tiles are edge-sampled: spacing = 1.0/(n-1) degrees
+        let pixel_size = 1.0 / ((n as f64) - 1.0); // Correct edge-sampled spacing
 
         let transform = GeoTransform {
             top_left_x: lon as f64,
@@ -2185,7 +2174,7 @@ impl DemReader {
         }
         let mut nx = Array2::zeros((h, w));
         let mut ny = Array2::zeros((h, w));
-        let mut nz = Array2::ones((h, w));
+        let mut nz = Array2::from_elem((h, w), 1.0f32);
         let dx = dx_m as f32;
         let dy = dy_m as f32;
 
