@@ -1,7 +1,15 @@
 use crate::types::{BurstOrbitData, EofHeader, OrbitData, SarError, SarResult, StateVector};
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Convert DateTime<Utc> to f64 seconds with nanosecond precision
+/// This preserves full temporal precision and avoids the precision loss from timestamp_millis()
+#[inline]
+fn datetime_to_secs_precise(dt: DateTime<Utc>) -> f64 {
+    let nanos = dt.timestamp_nanos_opt().expect("timestamp out of range") as f64;
+    nanos * 1e-9
+}
 
 /// Orbit file types available from ESA
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -319,7 +327,7 @@ impl OrbitReader {
     /// Parse time from orbit filename format (YYYYMMDDTHHMMSS)
     fn parse_orbit_filename_time(time_str: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
         NaiveDateTime::parse_from_str(time_str, "%Y%m%dT%H%M%S")
-            .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+            .map(|dt| Utc.from_utc_datetime(&dt))
     }
 
     /// Score orbit file relevance (lower is better)
@@ -497,7 +505,7 @@ impl OrbitReader {
             ));
         }
 
-        let target_timestamp = target_time.timestamp_millis() as f64 / 1000.0;
+        let target_timestamp = datetime_to_secs_precise(target_time);
         let selected_svs =
             Self::find_interpolation_vectors(&orbit.state_vectors, target_timestamp)?;
         Self::lagrange_interpolate(&selected_svs, target_timestamp)
@@ -552,7 +560,7 @@ impl OrbitReader {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let mid_timestamp = state_vectors[mid].time.timestamp_millis() as f64 / 1000.0;
+            let mid_timestamp = datetime_to_secs_precise(state_vectors[mid].time);
 
             if mid_timestamp < target_timestamp {
                 left = mid + 1;
@@ -563,11 +571,10 @@ impl OrbitReader {
 
         // Check if left-1 is closer than left
         if left > 0 {
-            let left_dist = (state_vectors[left].time.timestamp_millis() as f64 / 1000.0
+            let left_dist = (datetime_to_secs_precise(state_vectors[left].time)
                 - target_timestamp)
                 .abs();
-            let left_minus_1_dist = (state_vectors[left - 1].time.timestamp_millis() as f64
-                / 1000.0
+            let left_minus_1_dist = (datetime_to_secs_precise(state_vectors[left - 1].time)
                 - target_timestamp)
                 .abs();
 
@@ -588,13 +595,13 @@ impl OrbitReader {
         let mut result = [0.0; 3];
 
         for (i, sv_i) in state_vectors.iter().enumerate().take(n) {
-            let ti = sv_i.time.timestamp_millis() as f64 / 1000.0;
+            let ti = datetime_to_secs_precise(sv_i.time);
             let mut li = 1.0;
 
             // Calculate Lagrange basis polynomial
             for (j, sv_j) in state_vectors.iter().enumerate().take(n) {
                 if i != j {
-                    let tj = sv_j.time.timestamp_millis() as f64 / 1000.0;
+                    let tj = datetime_to_secs_precise(sv_j.time);
                     li *= (target_time - tj) / (ti - tj);
                 }
             }
@@ -620,7 +627,7 @@ impl OrbitReader {
             ));
         }
 
-        let target_timestamp = target_time.timestamp_millis() as f64 / 1000.0;
+        let target_timestamp = datetime_to_secs_precise(target_time);
         let selected_svs =
             Self::find_interpolation_vectors(&orbit.state_vectors, target_timestamp)?;
         Self::lagrange_interpolate_velocity(&selected_svs, target_timestamp)
@@ -635,12 +642,12 @@ impl OrbitReader {
         let mut result = [0.0; 3];
 
         for (i, sv_i) in state_vectors.iter().enumerate().take(n) {
-            let ti = sv_i.time.timestamp_millis() as f64 / 1000.0;
+            let ti = datetime_to_secs_precise(sv_i.time);
             let mut li = 1.0;
 
             for (j, sv_j) in state_vectors.iter().enumerate().take(n) {
                 if i != j {
-                    let tj = sv_j.time.timestamp_millis() as f64 / 1000.0;
+                    let tj = datetime_to_secs_precise(sv_j.time);
                     li *= (target_time - tj) / (ti - tj);
                 }
             }
@@ -695,7 +702,7 @@ impl OrbitReader {
         let mut azimuth_times = Vec::with_capacity(num_azimuth_lines);
 
         // Batch processing: find interpolation range once for the entire burst
-        let burst_start_timestamp = burst_start_time.timestamp_millis() as f64 / 1000.0;
+        let burst_start_timestamp = datetime_to_secs_precise(burst_start_time);
         let burst_end_timestamp =
             burst_start_timestamp + (num_azimuth_lines as f64 * azimuth_time_interval);
 
@@ -718,14 +725,15 @@ impl OrbitReader {
             sorted_state_vectors.len() as f64 / relevant_vectors.len() as f64
         );
 
+        // SCIENTIFIC FIX: Compute azimuth times in integer nanoseconds to avoid accumulation drift
+        let dt_ns_per_line = (azimuth_time_interval * 1e9).round() as i128;
         for line_idx in 0..num_azimuth_lines {
-            // Calculate azimuth time for this pixel row
+            // Calculate azimuth time for this pixel row with nanosecond precision
+            let t_ns = (line_idx as i128) * dt_ns_per_line;
             let azimuth_time = burst_start_time
-                + chrono::Duration::milliseconds(
-                    (line_idx as f64 * azimuth_time_interval * 1000.0) as i64,
-                );
+                + chrono::Duration::nanoseconds(t_ns as i64);
 
-            let target_timestamp = azimuth_time.timestamp_millis() as f64 / 1000.0;
+            let target_timestamp = datetime_to_secs_precise(azimuth_time);
 
             // Find interpolation vectors from the reduced set
             let selected_svs =
@@ -938,7 +946,7 @@ impl OrbitReader {
                                 if let Ok(naive_dt) =
                                     NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S%.f")
                                 {
-                                    let time = DateTime::from_naive_utc_and_offset(naive_dt, Utc);
+                                    let time = Utc.from_utc_datetime(&naive_dt);
                                     current_osv_data = Some((time, [0.0; 3], [0.0; 3]));
                                 }
                             }
@@ -1207,7 +1215,7 @@ impl OrbitReader {
                 NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S%.f").map_err(|e| {
                     SarError::Processing(format!("Invalid UTC time '{}': {}", time_str, e))
                 })?;
-            let time = DateTime::from_naive_utc_and_offset(time, Utc);
+            let time = Utc.from_utc_datetime(&time);
 
             // Parse position coordinates (handle "X=" prefix if present)
             let parse_coord = |s: &str, prefix: &str| -> SarResult<f64> {
@@ -1265,7 +1273,7 @@ impl OrbitReader {
 
             let parse_time = |s: &str| -> Option<DateTime<Utc>> {
                 NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%S")
-                    .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+                    .map(|dt| Utc.from_utc_datetime(&dt))
                     .ok()
             };
 
@@ -1333,7 +1341,7 @@ impl OrbitReader {
                         if let Ok(naive_dt) =
                             NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
                         {
-                            time_opt = Some(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
+                            time_opt = Some(Utc.from_utc_datetime(&naive_dt));
                             found_fields += 1;
                         } else {
                             log::warn!("Could not parse UTC time: {}", value);
