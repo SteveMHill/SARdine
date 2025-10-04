@@ -69,10 +69,15 @@ pub use f64_numerics::{
     Point3D, Point2D, GeographicCoord, RadarCoord, ImageCoord, GeometryF64, DopplerF64,
     NewtonRaphsonF64, RangeDopplerToGeo, PrecisionConverter,
 };
-pub use fast_unit_conversion::{
-    db_to_linear_inplace, db_to_linear_simd_par, linear_to_db_inplace, linear_to_db_simd_par,
-    IncidenceTerms, Units,
+// Use canonical unit conversion from constants module
+pub use crate::constants::unit_conversion::{
+    db_to_linear_inplace, linear_to_db_inplace, 
+    db_to_linear_parallel_chunked, linear_to_db_parallel_chunked,
+    db_to_linear_inplace_par, linear_to_db_inplace_par,
+    export_db_parallel,
 };
+// Keep IncidenceTerms and Units from fast_unit_conversion (not duplicated)
+pub use fast_unit_conversion::{IncidenceTerms, Units};
 pub use metadata_parser::{
     SinglePassXmlParser, CompactCalibrationData, CompactNoiseData, CompactGeometricData,
     CompactTimingData, CalibrationUnits, UnitType,

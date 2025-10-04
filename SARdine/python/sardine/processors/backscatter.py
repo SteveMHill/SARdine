@@ -1466,6 +1466,7 @@ class BackscatterProcessor:
                 
                 finite_percentage = len(finite_data) / working_data.size * 100
                 print(f"   📊 Input data: {finite_percentage:.1f}% finite values")
+                print(f"   📊 Input dimensions: {working_data.shape[0]}x{working_data.shape[1]}")
                 
                 if finite_percentage < 10.0:
                     raise RuntimeError(f"SCIENTIFIC MODE FAILURE: Insufficient valid data ({finite_percentage:.1f}%) for speckle filtering - minimum 10% required")
@@ -1481,43 +1482,69 @@ class BackscatterProcessor:
                 filter_type = str(self.speckle_filter)
                 window_size = int(self.filter_window) if self.filter_window is not None else 7
                 
-                # Calculate real number of looks from multilooking parameters
-                num_looks = float(self.multilook_range * self.multilook_azimuth)
+                # CRITICAL FIX: Adjust window size if image is too small
+                min_image_dim = min(working_data.shape[0], working_data.shape[1])
+                skip_speckle_filtering = False
                 
-                # Scientific speckle filter parameters for enhanced_lee
-                # Values based on literature: Lopes et al., "Adaptive Speckle Filters", IEEE Trans
-                edge_threshold = 0.5    # Edge detection threshold for enhanced Lee filter
-                damping_factor = 1.0    # Damping factor for enhanced Lee algorithm  
-                cv_threshold = 0.5      # Coefficient of variation threshold
+                if min_image_dim < window_size:
+                    original_window = window_size
+                    window_size = max(3, min_image_dim // 2 * 2 - 1)  # Ensure odd window size
+                    print(f"   ⚠️  Image too small ({working_data.shape}) for window size {original_window}, reducing to {window_size}")
+                    if window_size < 3:
+                        print(f"   ⚠️  Image too small for meaningful speckle filtering, skipping this step...")
+                        skip_speckle_filtering = True
+                
+                if not skip_speckle_filtering:
+                    # Calculate real number of looks from multilooking parameters
+                    num_looks = float(self.multilook_range * self.multilook_azimuth)
                     
-                # Apply speckle filtering with all required parameters
-                filtered_result = sardine.apply_speckle_filter(
-                    working_data, 
-                    filter_type, 
-                    window_size, 
-                    num_looks,
-                    edge_threshold,
-                    damping_factor, 
-                    cv_threshold
-                )
+                    # Scientific speckle filter parameters for enhanced_lee
+                    # Values based on literature: Lopes et al., "Adaptive Speckle Filters", IEEE Trans
+                    edge_threshold = 0.5    # Edge detection threshold for enhanced Lee filter
+                    damping_factor = 1.0    # Damping factor for enhanced Lee algorithm  
+                    cv_threshold = 0.5      # Coefficient of variation threshold
+                        
+                    # Apply speckle filtering with all required parameters
+                    filtered_result = sardine.apply_speckle_filter(
+                        working_data, 
+                        filter_type, 
+                        window_size, 
+                        num_looks,
+                        edge_threshold,
+                        damping_factor, 
+                        cv_threshold
+                    )
+                else:
+                    # Skip speckle filtering - use working_data as-is
+                    filtered_result = working_data
                 
                 # Handle result format - check if it's a dictionary with data key
-                if isinstance(filtered_result, dict):
-                    # Check for both 'data' and 'filtered_data' keys
-                    filtered_data = filtered_result.get('data')
-                    if filtered_data is None:
-                        filtered_data = filtered_result.get('filtered_data')
-                    if filtered_data is None or not isinstance(filtered_data, np.ndarray):
-                        raise RuntimeError("SCIENTIFIC MODE FAILURE: Speckle filtering failed to produce valid data array")
+                if skip_speckle_filtering:
+                    # Speckle filtering was skipped
+                    filtered_data = working_data
+                    step_duration = time.time() - step_start
+                    self.log_step(10, "Speckle Filtering", "skipped", 
+                                 f"Image too small: {working_data.shape}", step_duration)
+                    self.performance_monitor.end_step()
                 else:
-                    if not isinstance(filtered_result, np.ndarray):
-                        raise RuntimeError("SCIENTIFIC MODE FAILURE: Speckle filtering failed to produce valid numpy array")
-                    filtered_data = filtered_result
+                    # Speckle filtering was applied
+                    if isinstance(filtered_result, dict):
+                        # Check for both 'data' and 'filtered_data' keys
+                        filtered_data = filtered_result.get('data')
+                        if filtered_data is None:
+                            filtered_data = filtered_result.get('filtered_data')
+                        if filtered_data is None or not isinstance(filtered_data, np.ndarray):
+                            raise RuntimeError("SCIENTIFIC MODE FAILURE: Speckle filtering failed to produce valid data array")
+                    else:
+                        if not isinstance(filtered_result, np.ndarray):
+                            raise RuntimeError("SCIENTIFIC MODE FAILURE: Speckle filtering failed to produce valid numpy array")
+                        filtered_data = filtered_result
+                    
+                    step_duration = time.time() - step_start
+                    self.log_step(10, "Speckle Filtering", "success", 
+                                 f"Filter: {filter_type}, shape: {filtered_data.shape}", step_duration)
+                    self.performance_monitor.end_step()
                 
-                step_duration = time.time() - step_start
-                self.log_step(10, "Speckle Filtering", "success", 
-                             f"Filter: {filter_type}, shape: {filtered_data.shape}", step_duration)
-                self.performance_monitor.end_step()
                 working_data = filtered_data
                 
             except Exception as e:

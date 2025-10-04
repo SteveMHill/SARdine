@@ -21,35 +21,76 @@ use std::collections::HashMap; // For simple XML parsing
 /// - "2020-12-28T21:59:42.123456+00:00" (with timezone and microseconds)
 /// - "2020-12-28T21:59:42Z" (UTC format)
 /// - "2020-12-28T21:59:42.123456Z" (UTC with microseconds)
+/// 
+/// FIXED: Deterministic parsing without brittle ends_with checks
 pub fn parse_time_robust(time_str: &str) -> Option<DateTime<Utc>> {
-    // Try multiple common formats
-    let formats = [
-        "%Y-%m-%dT%H:%M:%S%.f%z", // With timezone and optional microseconds
-        "%Y-%m-%dT%H:%M:%S%z",    // With timezone, no microseconds
-        "%Y-%m-%dT%H:%M:%S%.fZ",  // UTC with optional microseconds
-        "%Y-%m-%dT%H:%M:%SZ",     // UTC, no microseconds
-        "%Y-%m-%dT%H:%M:%S%.f",   // No timezone, optional microseconds (assume UTC)
-        "%Y-%m-%dT%H:%M:%S",      // No timezone, no microseconds (assume UTC)
+    use chrono::TimeZone;
+    
+    // With offset (Z or ±hh:mm), with/without fractional seconds
+    const WITH_TZ: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f%:z",
+        "%Y-%m-%dT%H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%.fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
     ];
-
-    for format in &formats {
-        if let Ok(dt) = DateTime::parse_from_str(time_str, format) {
+    for fmt in WITH_TZ {
+        if let Ok(dt) = DateTime::parse_from_str(time_str, fmt) {
             return Some(dt.with_timezone(&Utc));
         }
-        // For formats without timezone, parse as naive and assume UTC
-        if format.ends_with('f') || format.ends_with('S') {
-            if let Ok(ndt) = NaiveDateTime::parse_from_str(time_str, format) {
-                return Some(DateTime::from_naive_utc_and_offset(ndt, Utc));
-            }
+    }
+
+    // Naive → assume UTC (deterministic conversion)
+    const NAIVE: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ];
+    for fmt in NAIVE {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(time_str, fmt) {
+            return Some(Utc.from_utc_datetime(&ndt));
         }
     }
 
-    // Fallback: try the basic chrono parser
-    if let Ok(dt) = time_str.parse::<DateTime<Utc>>() {
-        return Some(dt);
-    }
+    // Last resort: try direct parse
+    time_str.parse::<DateTime<Utc>>().ok()
+}
 
-    None
+// ============================================================================
+// TIME BASE STRUCTURES - Critical for terrain correction solver
+// ============================================================================
+
+/// Time base structure for consistent temporal referencing
+/// CRITICAL: All times must be referenced to orbit_ref_epoch to avoid
+/// solver failures with "azimuth=130k (max 50k)" type errors
+#[derive(Debug, Clone)]
+pub struct TimeBases {
+    /// Reference epoch from orbit file (earliest state vector time)
+    /// All other times should be computed relative to this
+    pub orbit_ref_epoch: DateTime<Utc>,
+    /// Product start time in UTC
+    pub product_start_utc: DateTime<Utc>,
+    /// Product stop time in UTC (if available)
+    pub product_stop_utc: Option<DateTime<Utc>>,
+}
+
+/// Doppler Centroid model with explicit time base
+/// Times are relative to orbit_ref_epoch, not product start
+#[derive(Clone, Debug)]
+pub struct DcModel {
+    /// Reference time in seconds since orbit_ref_epoch
+    pub t0_rel_s: f64,
+    /// Polynomial coefficients [c0, c1, c2, ...]
+    pub coeffs: Vec<f64>,
+}
+
+impl DcModel {
+    /// Evaluate Doppler centroid at time t_rel_s (seconds since orbit_ref_epoch)
+    pub fn eval_hz(&self, t_rel_s: f64) -> f64 {
+        let x = t_rel_s - self.t0_rel_s;
+        self.coeffs
+            .iter()
+            .enumerate()
+            .fold(0.0, |acc, (i, &a)| acc + a * x.powi(i as i32))
+    }
 }
 
 // ============================================================================
@@ -1372,9 +1413,11 @@ pub struct BurstData {
 // ============================================================================
 // MAIN PARSER FUNCTION
 // ============================================================================
-
 /// Parse Sentinel-1 annotation XML using SIMPLE regex approach
 /// NO MORE COMPLEX DESERIALIZERS - just extract what we need!
+/// 
+/// This function returns Result<ProductRoot, Box<dyn Error>> for backwards compatibility.
+/// For new code, prefer parse_annotation() which returns SarResult.
 pub fn parse_annotation_xml(xml_content: &str) -> Result<ProductRoot, Box<dyn std::error::Error>> {
     log::debug!("🔍 ANNOTATION PARSING: Starting annotation XML parsing");
 
@@ -1440,9 +1483,12 @@ pub fn parse_annotation_xml(xml_content: &str) -> Result<ProductRoot, Box<dyn st
     }
 }
 
-// Legacy alias for the main parsing function
+/// Canonical annotation parsing function with consistent error handling
+/// 
+/// Returns SarResult for consistency with the rest of the codebase.
+/// This is the function to use for all new code.
 pub fn parse_annotation(xml_content: &str) -> SarResult<ProductRoot> {
-    // Use the unified serde-based parser
+    // Call the legacy function and convert error type
     parse_annotation_xml(xml_content).map_err(|e| SarError::XmlParsing(e.to_string()))
 }
 
@@ -1478,6 +1524,124 @@ impl ProductRoot {
         }
 
         None
+    }
+
+    /// Derive time bases from annotation and orbit data
+    /// CRITICAL: This establishes the orbit_ref_epoch that all times must be relative to
+    /// to avoid terrain correction solver failures
+    pub fn derive_time_bases(&self, orbit_vectors: &[StateVector]) -> SarResult<TimeBases> {
+        let product_start_utc = self
+            .image_annotation
+            .as_ref()
+            .and_then(|ia| ia.image_information.as_ref())
+            .and_then(|ii| ii.product_first_line_utc_time.as_ref())
+            .and_then(|s| parse_time_robust(s))
+            .or_else(|| {
+                self.ads_header
+                    .as_ref()
+                    .and_then(|h| h.start_time.as_ref())
+                    .and_then(|s| parse_time_robust(s))
+            })
+            .ok_or_else(|| SarError::Metadata("Missing product start time".into()))?;
+
+        let product_stop_utc = self
+            .image_annotation
+            .as_ref()
+            .and_then(|ia| ia.image_information.as_ref())
+            .and_then(|ii| ii.product_last_line_utc_time.as_ref())
+            .and_then(|s| parse_time_robust(s))
+            .or_else(|| {
+                self.ads_header
+                    .as_ref()
+                    .and_then(|h| h.stop_time.as_ref())
+                    .and_then(|s| parse_time_robust(s))
+            });
+
+        // Choose orbit_ref_epoch: earliest state vector from precise orbit file
+        let orbit_ref_epoch = orbit_vectors
+            .iter()
+            .map(|sv| sv.time)
+            .min()
+            .ok_or_else(|| SarError::Metadata("No orbit state vectors found".into()))?;
+
+        log::info!(
+            "⏱️  Time bases established: orbit_ref_epoch={}, product_start={}, Δt={:.1}s",
+            orbit_ref_epoch.format("%Y-%m-%dT%H:%M:%S"),
+            product_start_utc.format("%Y-%m-%dT%H:%M:%S"),
+            (product_start_utc - orbit_ref_epoch).num_milliseconds() as f64 / 1000.0
+        );
+
+        Ok(TimeBases {
+            orbit_ref_epoch,
+            product_start_utc,
+            product_stop_utc,
+        })
+    }
+
+    /// Convert UTC time to seconds since orbit_ref_epoch
+    /// CRITICAL: Use this for all time conversions to avoid solver bugs
+    pub fn seconds_since_orbit_ref(&self, tb: &TimeBases, t_utc: DateTime<Utc>) -> f64 {
+        (t_utc - tb.orbit_ref_epoch)
+            .num_nanoseconds()
+            .unwrap_or(0) as f64
+            * 1e-9
+    }
+
+    /// Build Doppler Centroid models with explicit orbit_ref_epoch time base
+    /// CRITICAL: Times are relative to orbit_ref_epoch, not product start
+    pub fn build_dc_models(&self, tb: &TimeBases) -> SarResult<Vec<DcModel>> {
+        let list = self
+            .general_annotation
+            .as_ref()
+            .and_then(|ga| ga.dc_estimate_list.as_ref())
+            .or_else(|| {
+                self.doppler_centroid
+                    .as_ref()
+                    .and_then(|dc| dc.dc_estimate_list.as_ref())
+            })
+            .ok_or_else(|| SarError::Metadata("No dcEstimateList in annotation".into()))?;
+
+        let estimates = list
+            .dc_estimates
+            .as_ref()
+            .ok_or_else(|| SarError::Metadata("Empty dcEstimateList".into()))?;
+
+        let mut out = Vec::new();
+        for e in estimates {
+            // Validate polynomial coefficients
+            if e.data_dc_polynomial.is_empty() {
+                return Err(SarError::Metadata("Empty DC polynomial coefficients".into()));
+            }
+
+            // Convert t0 to seconds since orbit_ref_epoch
+            // If azimuth_time is present, prefer that; else treat t0 relative to product start
+            let t0_rel_s = if let Some(az) = &e.azimuth_time {
+                let az_utc = parse_time_robust(az).ok_or_else(|| {
+                    SarError::Metadata("Bad azimuthTime in dcEstimate".into())
+                })?;
+                self.seconds_since_orbit_ref(tb, az_utc)
+            } else {
+                // If t0 is relative to product start by definition in products
+                e.t0 + self.seconds_since_orbit_ref(tb, tb.product_start_utc)
+            };
+
+            out.push(DcModel {
+                t0_rel_s,
+                coeffs: e.data_dc_polynomial.clone(),
+            });
+        }
+
+        log::info!("📊 Built {} DC models with orbit_ref_epoch time base", out.len());
+        Ok(out)
+    }
+
+    /// Evaluate Doppler centroid at time t_rel_s (seconds since orbit_ref_epoch)
+    pub fn eval_dc_hz(dc_models: &[DcModel], t_rel_s: f64) -> f64 {
+        // Simplest: use first model; better: choose by nearest t0 or within window
+        if dc_models.is_empty() {
+            return 0.0;
+        }
+        dc_models[0].eval_hz(t_rel_s)
     }
 
     /// Extract orbit information

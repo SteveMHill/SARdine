@@ -1,10 +1,25 @@
-/// Ultra-fast unit conversion optimizations for SAR calibration processing
+/// CONSOLIDATION NOTICE: Unit conversion functions moved to canonical location
 ///
-/// Eliminates per-pixel unit conversion bottlenecks by:
-/// 1. Converting once at load time, not per pixel lookup
-/// 2. Using SIMD + Rayon for mass conversions
-/// 3. Precomputing incidence angle terms
-/// 4. Avoiding pow/log in hot loops
+/// The basic unit conversion functions (`db_to_linear_inplace`, `linear_to_db_inplace`, etc.)
+/// have been consolidated into `crate::constants::unit_conversion` to eliminate code duplication.
+///
+/// This module now contains only the specialized functions:
+/// - `IncidenceTerms`: Precomputed incidence angle terms for performance
+/// - `Units`: Canonical unit representation enum
+///
+/// For basic unit conversions, import from `crate::constants::unit_conversion` or `crate::core`
+/// which re-exports the canonical implementations.
+///
+/// # Migration Guide
+/// ```ignore
+/// // OLD (still works but deprecated):
+/// use sardine::core::fast_unit_conversion::{db_to_linear_inplace, linear_to_db_inplace};
+///
+/// // NEW (recommended):
+/// use sardine::constants::unit_conversion::{db_to_linear_inplace, linear_to_db_inplace};
+/// // OR:
+/// use sardine::core::{db_to_linear_inplace, linear_to_db_inplace};
+/// ```
 use rayon::prelude::*;
 
 /// Canonical unit representation - convert once, flag forever
@@ -14,57 +29,21 @@ pub enum Units {
     Db,     // Decibel scale (needs conversion)
 }
 
-/// Fast in-place dB to linear conversion using exp instead of pow
-/// Uses y = 10^(x/10) = exp((ln 10)/10 * x) - faster than powf
-pub fn db_to_linear_inplace(v: &mut [f32]) {
-    // Using expf is faster than powf; no branches
-    const K: f32 = std::f32::consts::LN_10 / 10.0;
-    v.iter_mut().for_each(|x| *x = (K * *x).exp());
-}
-
-/// Fast in-place linear to dB conversion using ln instead of log10
-/// Uses y = 10*log10(max(x, eps)) = 10/ln(10) * ln(...)
-pub fn linear_to_db_inplace(v: &mut [f32]) {
-    const INV_LN10_10: f32 = 10.0 / std::f32::consts::LN_10;
-    const EPS: f32 = 1e-30;
-    v.iter_mut()
-        .for_each(|x| *x = INV_LN10_10 * (x.max(EPS)).ln());
-}
-
-/// Vectorized parallel dB to linear conversion
-/// Uses optimized mathematical identities for maximum performance
-pub fn db_to_linear_simd_par(input: &[f32]) -> Vec<f32> {
-    const CHUNK_SIZE: usize = 1024; // Tune based on cache size
-    let ln10_div10 = std::f32::consts::LN_10 / 10.0;
-
-    input
-        .par_chunks(CHUNK_SIZE)
-        .flat_map(|chunk| {
-            // Vectorized processing using iterator optimization
-            chunk
-                .iter()
-                .map(|&val| (val * ln10_div10).exp())
-                .collect::<Vec<f32>>()
-        })
-        .collect()
-}
-
-/// Vectorized parallel linear to dB conversion  
-pub fn linear_to_db_simd_par(input: &[f32]) -> Vec<f32> {
-    const CHUNK_SIZE: usize = 1024;
-    let ten_div_ln10 = 10.0 / std::f32::consts::LN_10;
-
-    input
-        .par_chunks(CHUNK_SIZE)
-        .flat_map(|chunk| {
-            // Vectorized processing using iterator optimization
-            chunk
-                .iter()
-                .map(|&val| val.ln() * ten_div_ln10)
-                .collect::<Vec<f32>>()
-        })
-        .collect()
-}
+// ============================================================================
+// CONSOLIDATED: Basic unit conversion functions moved to crate::constants::unit_conversion
+// ============================================================================
+// 
+// The following functions are now in `crate::constants::unit_conversion`:
+// - db_to_linear_inplace(v: &mut [f32])
+// - linear_to_db_inplace(v: &mut [f32])
+// - db_to_linear_parallel_chunked(buf: &mut [f32])
+// - linear_to_db_parallel_chunked(buf: &mut [f32])
+// - db_to_linear_inplace_par(buf: &mut [f32])
+// - linear_to_db_inplace_par(buf: &mut [f32])
+// - export_db_parallel(image_linear: &mut [f32])
+//
+// These are re-exported from `crate::core` for convenience.
+// ============================================================================
 
 /// Precomputed incidence angle terms to eliminate per-pixel trig
 /// Avoids calling sin/cos per pixel during β⁰/γ⁰ derivation
@@ -188,7 +167,7 @@ impl FastUnitProcessor {
 /// Fast export to dB for final output
 /// Keeps pipeline in linear domain until the very end
 pub fn export_db_parallel(image_linear: &mut [f32]) {
-    linear_to_db_simd_par(image_linear);
+    crate::constants::unit_conversion::linear_to_db_inplace_par(image_linear);
 }
 
 /// Sanity check for flat arrays - avoid converting garbage
@@ -262,33 +241,35 @@ pub fn preprocess_calibration_vectors(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::constants::unit_conversion::{db_to_linear_inplace, linear_to_db_inplace};
+    use super::IncidenceTerms;
 
     #[test]
     fn test_db_to_linear_conversion() {
-        let mut values = vec![10.0, 20.0, 30.0]; // dB values
+        let mut values: Vec<f32> = vec![10.0, 20.0, 30.0]; // dB values
         db_to_linear_inplace(&mut values);
 
         // 10^(10/10) = 10, 10^(20/10) = 100, 10^(30/10) = 1000
-        assert!((values[0] - 10.0).abs() < 1e-5);
-        assert!((values[1] - 100.0).abs() < 1e-5);
-        assert!((values[2] - 1000.0).abs() < 1e-5);
+        // Using 0.001 tolerance due to f32 numerical precision in power operations
+        assert!((values[0] - 10.0_f32).abs() < 0.001);
+        assert!((values[1] - 100.0_f32).abs() < 0.001);
+        assert!((values[2] - 1000.0_f32).abs() < 0.001);
     }
 
     #[test]
     fn test_linear_to_db_conversion() {
-        let mut values = vec![10.0, 100.0, 1000.0]; // linear values
+        let mut values: Vec<f32> = vec![10.0, 100.0, 1000.0]; // linear values
         linear_to_db_inplace(&mut values);
 
         // 10*log10(10) = 10, 10*log10(100) = 20, 10*log10(1000) = 30
-        assert!((values[0] - 10.0).abs() < 1e-5);
-        assert!((values[1] - 20.0).abs() < 1e-5);
-        assert!((values[2] - 30.0).abs() < 1e-5);
+        assert!((values[0] - 10.0_f32).abs() < 1e-5);
+        assert!((values[1] - 20.0_f32).abs() < 1e-5);
+        assert!((values[2] - 30.0_f32).abs() < 1e-5);
     }
 
     #[test]
     fn test_incidence_terms() {
-        let alpha_rad = vec![0.5, 1.0, 1.5]; // radians
+        let alpha_rad: Vec<f32> = vec![0.5, 1.0, 1.5]; // radians
         let terms = IncidenceTerms::from_incidence_per_column(&alpha_rad);
 
         assert_eq!(terms.inv_sin.len(), 3);
@@ -297,7 +278,7 @@ mod tests {
         // Check that inv_sin * sin ≈ 1
         for (i, &alpha) in alpha_rad.iter().enumerate() {
             let sin_alpha = alpha.sin();
-            assert!((terms.inv_sin[i] * sin_alpha - 1.0).abs() < 1e-5);
+            assert!((terms.inv_sin[i] * sin_alpha - 1.0_f32).abs() < 1e-5);
         }
     }
 }
