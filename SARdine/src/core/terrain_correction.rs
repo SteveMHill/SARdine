@@ -3096,6 +3096,20 @@ impl TerrainCorrector {
         use crate::io::orbit::OrbitReader;
         use chrono::DateTime;
 
+        // FIXED: Check temporal coverage with 5-second margin
+        let first = crate::types::datetime_to_utc_seconds(
+            orbit_data.state_vectors.first().unwrap().time
+        );
+        let last = crate::types::datetime_to_utc_seconds(
+            orbit_data.state_vectors.last().unwrap().time
+        );
+        if time_seconds < first - 5.0 || time_seconds > last + 5.0 {
+            return Err(SarError::DataProcessingError(format!(
+                "Interpolation time {:.3}s outside orbit coverage [{:.3}, {:.3}]",
+                time_seconds, first, last
+            )));
+        }
+
         // Convert time_seconds to DateTime<Utc> using modern chrono API
         let time =
             DateTime::from_timestamp(time_seconds as i64, (time_seconds.fract() * 1e9) as u32)
@@ -3119,6 +3133,18 @@ impl TerrainCorrector {
                     time, e
                 ))
             })?;
+
+            // FIXED: Validate finiteness of interpolated values
+            if !position[0].is_finite() || !position[1].is_finite() || !position[2].is_finite() {
+                return Err(SarError::DataProcessingError(
+                    "Orbit interpolation returned non-finite position".to_string()
+                ));
+            }
+            if !velocity[0].is_finite() || !velocity[1].is_finite() || !velocity[2].is_finite() {
+                return Err(SarError::DataProcessingError(
+                    "Orbit interpolation returned non-finite velocity".to_string()
+                ));
+            }
 
             return Ok((
                 Position3D {
@@ -3145,6 +3171,9 @@ impl TerrainCorrector {
 
     /// Wrapper function for backward compatibility with existing fast_range_doppler_calculation calls
     /// This redirects to the scientific Range-Doppler implementation
+    /// 
+    /// FIXED: Returns continuous (f64, f64) coordinates to preserve sub-pixel precision
+    /// for accurate bilinear interpolation
     fn fast_range_doppler_calculation(
         &self,
         lat: f64,
@@ -3155,20 +3184,15 @@ impl TerrainCorrector {
         _sar_nrows: usize,
         _sar_ncols: usize,
     ) -> Option<(f64, f64)> {
-        // Convert to scientific implementation with proper types
-        let result = self.scientific_range_doppler_transformation(
+        // FIXED: Return floats directly from scientific transformation
+        // No premature rounding - preserve sub-pixel precision for resampling
+        self.scientific_range_doppler_transformation(
             lat,
             lon,
             elevation as f64,
             orbit_data,
             params,
-        );
-
-        // Convert from (usize, usize) to (f64, f64) for backward compatibility
-        match result {
-            Some((range_pixel, azimuth_pixel)) => Some((range_pixel as f64, azimuth_pixel as f64)),
-            None => None,
-        }
+        )
     }
 
     /// Optimized lat/lon to SAR pixel conversion with pre-computed lookup tables
@@ -3275,19 +3299,21 @@ impl TerrainCorrector {
     }
 
     /// Fast Doppler to azimuth pixel conversion
+    /// 
+    /// FIXED: Use actual azimuth_time_interval from annotation (critical for TOPS)
     fn doppler_to_azimuth_pixel_fast(
         &self,
         _doppler_freq: f64,
         azimuth_time: f64,
         params: &RangeDopplerParams,
     ) -> SarResult<f64> {
-        // FIXED: Use proper time-relative azimuth pixel calculation
-        // azimuth_time is relative to azimuth start time, not absolute timestamp
-        // Convert azimuth time to pixel using sampling rate (PRF)
-        let azimuth_pixel = azimuth_time * params.prf;
-
-        // Bounds check is handled elsewhere
-        Ok(azimuth_pixel)
+        // FIXED: Use azimuth_time_interval (actual line time from annotation)
+        // Only fallback to 1/PRF if missing/invalid
+        let mut dt = params.azimuth_time_interval;
+        if !dt.is_finite() || dt <= 0.0 {
+            dt = 1.0 / params.prf;
+        }
+        Ok(azimuth_time / dt)
     }
     fn latlon_to_sar_pixel_with_lut(
         &self,
@@ -4338,38 +4364,33 @@ impl TerrainCorrector {
             }
         };
 
-        // Convert to DEM pixel coordinates with pre-computed inverse transforms
-        let inv_pixel_width = 1.0 / self.dem_transform.pixel_width;
-        let inv_pixel_height = 1.0 / self.dem_transform.pixel_height;
+        // FIXED: Use division + floor() for both positive and negative pixel_height
+        // This correctly handles north-up rasters with negative pixel_height
+        let dem_x = (dem_x_coord - self.dem_transform.top_left_x) / self.dem_transform.pixel_width;
+        let dem_y = (dem_y_coord - self.dem_transform.top_left_y) / self.dem_transform.pixel_height;
 
-        let dem_x = (dem_x_coord - self.dem_transform.top_left_x) * inv_pixel_width;
-        let dem_y = (dem_y_coord - self.dem_transform.top_left_y) * inv_pixel_height;
-
-        // Fast floor using bit manipulation for positive values
-    let dem_col = dem_x as usize;
-    let dem_row = dem_y as usize;
+        // Use floor() (works for positive/negative step); cast after clamp
+        let dem_col_i = dem_x.floor() as isize;
+        let dem_row_i = dem_y.floor() as isize;
 
         let (dem_height, dem_width) = self.dem.dim();
 
-        // Bounds check with early return
-        if dem_row >= dem_height - 1 || dem_col >= dem_width - 1 {
+        // Clamp before casting to usize
+        if dem_row_i < 0 || dem_col_i < 0 || 
+           dem_row_i as usize >= dem_height - 1 || dem_col_i as usize >= dem_width - 1 {
             static DEM_INDEX_DEBUG_COUNT: AtomicUsize = AtomicUsize::new(0);
             let count = DEM_INDEX_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 10 {
-                log::error!(
-                    "❌ DEM index failure: lat={:.6}, lon={:.6}, dem_row={}, dem_col={}, dem_height={}, dem_width={}, dem_y={:.3}, dem_x={:.3}",
-                    lat,
-                    lon,
-                    dem_row,
-                    dem_col,
-                    dem_height,
-                    dem_width,
-                    dem_y,
-                    dem_x
+                log::debug!(
+                    "DEM index out of bounds: lat={:.6}, lon={:.6}, dem_row_i={}, dem_col_i={}, bounds=[0..{}, 0..{}]",
+                    lat, lon, dem_row_i, dem_col_i, dem_height - 1, dem_width - 1
                 );
             }
             return None;
         }
+
+        let dem_row = dem_row_i as usize;
+        let dem_col = dem_col_i as usize;
 
         // Bilinear interpolation weights
         let dx = dem_x - dem_col as f64;
