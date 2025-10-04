@@ -272,6 +272,69 @@ grep -rn "from_naive_utc_and_offset" src/io/orbit.rs
 
 ---
 
+---
+
+## 5. slc_reader.rs - API & Portability Fixes
+**Status**: ✅ COMPLETE  
+**Commit**: `4a7b939`
+
+### Critical Fixes Applied:
+
+**A. Test Visibility Fix**
+- `parse_orbit_from_product_id`: Changed `fn` → `pub(crate) fn`
+- **Impact**: Tests can now access this function
+- **Verification**: ✅ All 3 orbit parsing tests passing
+
+**B. Type Unification (9 locations)**
+- Replaced all `AnnotationRoot` references with `ProductRoot`
+- **Impact**: Consistent type usage throughout module
+- Files updated:
+  - `cached_annotations` HashMap type
+  - `get_annotation_for_polarization()` return type
+  - `get_all_subswath_annotations()` return type
+  - `get_primary_annotation_with_coverage_check()` return type
+  - `get_annotation_unified_validated()` return type + docs
+
+**C. Rust Portability (21 instances)**
+- Replaced `std::io::Error::other(format!(...))` with `Error::new(ErrorKind::Other, format!(...))`
+- **Impact**: Compatible with older Rust toolchains (pre-1.65)
+- Locations:
+  - ZIP archive access errors (3)
+  - GDAL dataset open errors (4)
+  - File reading errors (6)
+  - Calibration/noise parsing errors (8)
+
+### Test Results:
+```
+✅ test_parse_failure ... ok
+✅ test_parse_standard_slc_id ... ok
+✅ test_parse_variant_without_double_underscore ... ok
+
+Result: 3 passed; 0 failed
+```
+
+### Compilation Status:
+```
+✅ cargo build --release: SUCCESS (0.19s)
+✅ No compilation errors
+⚠️  31 warnings (unrelated to changes)
+```
+
+---
+
+## Overall Impact Summary
+
+**Lines Changed**: ~200+ critical fixes across 5 modules  
+**Precision Improvement**: 1ms → 1ns (1,000,000× for time calculations)  
+**Critical Bugs Fixed**: 16 total
+- 11 nanosecond precision issues (orbit.rs)
+- 5 DEM/SRTM bugs (dem.rs)
+- 6 API/portability issues (slc_reader.rs)
+
+**Scientific Correctness**: Eliminated systematic precision loss in orbit interpolation  
+**Data Coverage**: Both SRTM3 (3") and SRTM1 (1") tiles supported globally  
+**Code Quality**: Consistent APIs, modern idioms, broader toolchain compatibility
+
 **Document Status**: ✅ Complete  
 **Last Updated**: October 4, 2025  
-**Git Commits**: 1fe8d86, 7fbffcc, 7761158, 74dd754
+**Git Commits**: 1fe8d86, 7fbffcc, 7761158, 74dd754, 4a7b939
