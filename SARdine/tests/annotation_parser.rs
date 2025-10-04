@@ -313,17 +313,44 @@ mod s1 {
         approx(f_at_1, 101.5, 1e-9);
     }
 
+    /// Create minimal mock orbit vectors for testing extract_range_doppler_params()
+    fn create_mock_orbit_vectors() -> Vec<sardine::types::StateVector> {
+        use chrono::{TimeZone, Utc};
+        // Create 3 mock state vectors around 2020-12-28T21:59:42 (test product time)
+        let base_time = Utc.with_ymd_and_hms(2020, 12, 28, 21, 59, 30).unwrap();
+        vec![
+            sardine::types::StateVector {
+                time: base_time,
+                position: [7000000.0, 0.0, 0.0],
+                velocity: [0.0, 7500.0, 0.0],
+            },
+            sardine::types::StateVector {
+                time: base_time + chrono::Duration::seconds(10),
+                position: [7000000.0, 75000.0, 0.0],
+                velocity: [0.0, 7500.0, 0.0],
+            },
+            sardine::types::StateVector {
+                time: base_time + chrono::Duration::seconds(20),
+                position: [7000000.0, 150000.0, 0.0],
+                velocity: [0.0, 7500.0, 0.0],
+            },
+        ]
+    }
+
     #[test]
     fn range_doppler_params_are_consistent() {
         let parsed = parse_annotation_xml(XML_SAFE).expect("parse");
-        let params = parsed.extract_range_doppler_params().expect("rd params");
+        let orbit_vectors = create_mock_orbit_vectors();
+        let params = parsed.extract_range_doppler_params(&orbit_vectors).expect("rd params");
 
         approx(params.range_pixel_spacing, 2.329560, 1e-9); // from generalAnnotation
         approx(params.azimuth_pixel_spacing, 13.943035, 1e-6);
         approx(params.slant_range_time, 0.004, 1e-12); // from imageInformation
         approx(params.prf, 1710.0, 1e-9);
         approx(params.wavelength, C / 5.405e9, 1e-6);
-        assert!(params.product_start_time_abs > 1_600_000_000.0);
+        // Check new time base fields (orbit_ref_epoch should be around Dec 2020)
+        assert!(params.orbit_ref_epoch_utc > 1_600_000_000.0);
+        assert!(params.product_start_rel_s >= 0.0); // Product start relative to orbit epoch
         // doppler model present
         let dc = params.doppler_centroid.as_ref().expect("dc model");
         assert_eq!(dc.coeffs.len(), 3);
@@ -362,8 +389,9 @@ mod s1 {
                 .replace("2020-12-28T21:59:52+00:00", stop);
             let parsed = parse_annotation_xml(&xml).expect("parse");
             // Will parse product start time internally; we just ensure it does not error.
-            let params = parsed.extract_range_doppler_params().expect("rd params");
-            assert!(params.product_start_time_abs > 1.0e9);
+            let orbit_vectors = create_mock_orbit_vectors();
+            let params = parsed.extract_range_doppler_params(&orbit_vectors).expect("rd params");
+            assert!(params.orbit_ref_epoch_utc > 1.0e9); // Unix timestamp sanity check
         }
     }
 }
