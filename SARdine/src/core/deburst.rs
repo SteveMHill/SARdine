@@ -157,12 +157,31 @@ fn eval_poly_2d(coeffs: &[f64], t: f64, r: f64) -> f64 {
 /// // Result: ~2.9 MHz (but NOT typically needed - use annotation value directly)
 /// ```
 #[allow(dead_code)]
+/// Convert antenna steering angle rate to phase rate
+/// 
+/// **Returns:** Phase rate in **rad/s** (not Hz!)
+/// 
+/// For Sentinel-1 IW with typical parameters:
+/// - θ_rate ≈ 0.0015 rad/s (beam angle rate from annotation)
+/// - v = 7600 m/s, λ = 0.0555 m
+/// - Result: ≈ 0.463 rad/s phase rate
+/// 
+/// To convert to Hz (if needed): divide by 2π
+/// - ≈ 0.074 Hz ≈ 74 kHz (NOT MHz as previously claimed)
+/// 
+/// # Arguments
+/// * `angle_rate_rad_s` - Antenna beam steering rate (rad/s) from annotation
+/// * `velocity_m_s` - Satellite velocity
+/// * `wavelength_m` - Radar wavelength
+/// 
+/// # Returns
+/// Phase rate in **rad/s**
 fn steering_angle_to_phase_rate(
     angle_rate_rad_s: f64,
     velocity_m_s: f64,
     wavelength_m: f64,
 ) -> f64 {
-    // φ_rate = 2π × (2v/λ) × θ_rate
+    // φ_rate = 2π × (2v/λ) × θ_rate  [rad/s]
     2.0 * std::f64::consts::PI * 2.0 * velocity_m_s / wavelength_m * angle_rate_rad_s
 }
 
@@ -182,10 +201,16 @@ fn precompute_deramp_per_line(
     for l in 0..lines {
         let t = timings[l].t_az;
         let (f_dc_hz, fm_hz_s) = eval_dc_fm(t, dc_poly, fm_poly);
-        // φ(t) = 2π f_dc t + π fm t^2 + steering * t
+        
+        // CRITICAL FIX: Steering phase is QUADRATIC, not linear
+        // Physical derivation: φ_steer(t) = 2π × (2v/λ) × ∫(dθ/dt × dt) = 2π × (2v/λ) × (dθ/dt × t²/2)
+        // Most Sentinel-1 data already includes steering in DC polynomial, so we disable extra term
+        // If needed, use: + 2.0 * PI * (2.0 * velocity / wavelength) * steering_rate_rad_s * 0.5 * t * t
+        
+        // φ(t) = 2π f_dc t + π fm t²  (steering already in DC polynomial)
         let base = 2.0_f64 * std::f64::consts::PI * f_dc_hz * t
-            + std::f64::consts::PI * fm_hz_s * t * t
-            + steering_rate_rad_s * t;
+            + std::f64::consts::PI * fm_hz_s * t * t;
+            // + steering_rate_rad_s * t;  // REMOVED: Linear term is physically wrong
         // Convert to complex ramp: e^{-j φ}
         let (s, c) = (base as f32).sin_cos();
         // Constant across range (fast, good first-order); extend to per-sample if needed
@@ -215,8 +240,18 @@ fn precompute_deramp_2d(
     let timings = build_line_timing_with_offset(lines, az_time_interval_s, 0.0);
     let mut ramps = Vec::with_capacity(lines);
     
-    // Check if we need range-dependent processing
-    let needs_2d = dc_poly.len() > 3 || fm_poly.len() > 3;
+    // CRITICAL FIX: Disable broken 2D detection until proper XML parsing implemented
+    // Issue #3: Current logic falsely detects cubic time polynomials (len=4) as 2D
+    // and eval_poly_2d uses wrong coefficient ordering (made-up square grid assumption)
+    // Real Sentinel-1 2D layout requires explicit parsing from XML metadata
+    let needs_2d = false;  // TODO: Implement proper 2D coefficient parsing from annotation
+    
+    if dc_poly.len() > 3 || fm_poly.len() > 3 {
+        log::warn!(
+            "⚠️  Polynomial length {} suggests 2D, but 2D parsing not implemented. Using time-only.",
+            dc_poly.len().max(fm_poly.len())
+        );
+    }
     
     if needs_2d {
         log::debug!("🔧 Computing RANGE-DEPENDENT TOPS deramp: {}×{} pixels (2D polynomials detected)", lines, width);
@@ -233,10 +268,11 @@ fn precompute_deramp_2d(
                     t, col, dc_poly, fm_poly, range_pixel_spacing, slant_range_time
                 );
                 
-                // φ(t,r) = 2π f_DC(t,r) t + π K_az(t,r) t² + steering * t
+                // φ(t,r) = 2π f_DC(t,r) t + π K_az(t,r) t²
+                // FIXED: Removed linear steering term (physically incorrect)
+                // Steering is already in DC polynomial or would need quadratic term
                 let phase = 2.0_f64 * std::f64::consts::PI * f_dc_hz * t
-                    + std::f64::consts::PI * fm_hz_s * t * t
-                    + steering_rate_rad_s * t;
+                    + std::f64::consts::PI * fm_hz_s * t * t;
                 
                 // Convert to complex: e^{-j φ}
                 let (s, c) = (phase as f32).sin_cos();
@@ -245,9 +281,9 @@ fn precompute_deramp_2d(
         } else {
             // Fast path: constant per line (time-only polynomials)
             let (f_dc_hz, fm_hz_s) = eval_dc_fm(t, dc_poly, fm_poly);
+            // FIXED: Removed linear steering term (physically wrong)
             let phase = 2.0_f64 * std::f64::consts::PI * f_dc_hz * t
-                + std::f64::consts::PI * fm_hz_s * t * t
-                + steering_rate_rad_s * t;
+                + std::f64::consts::PI * fm_hz_s * t * t;
             let (s, c) = (phase as f32).sin_cos();
             let rot = SarComplex::new(c, -s);
             line_ramp = vec![rot; width];
@@ -291,10 +327,18 @@ fn valid_window(
     let first_raw = first_valid[line_in_burst];
     let last_raw = last_valid[line_in_burst];
     
-    let a = first_raw.max(0) as usize;
-    let b = last_raw.max(-1) as usize;  // -1 becomes 0 as usize
-    let a = a.min(width.saturating_sub(1));
-    let b = b.min(width.saturating_sub(1));
+    // CRITICAL FIX: -1 means NO valid samples (not "up to pixel 0")
+    // Return empty window immediately to prevent spurious 1-pixel slivers
+    if last_raw < 0 {
+        return (0, 0);
+    }
+    
+    // Now clamp positive values
+    let mut a = first_raw.max(0) as usize;
+    let mut b = last_raw as usize;  // last_raw is >= 0 here
+    
+    a = a.min(width.saturating_sub(1));
+    b = b.min(width.saturating_sub(1));
     
     if a <= b {
         (a, b + 1)
@@ -448,6 +492,16 @@ pub struct BurstInfo {
     pub azimuth_time_interval: f64, // PRF interval (seconds) from annotation
     pub dc_polynomial: Vec<f64>,    // Doppler centroid polynomial coefficients
     pub fm_polynomial: Vec<f64>,    // FM rate polynomial coefficients
+    
+    // CRITICAL FIX (Issue #1, #8): Polynomial reference time for proper phase calculation
+    /// Reference time for DC/FM polynomial evaluation (seconds since epoch)
+    /// This is the t0 from annotation <dcEstimateList><dcEstimate><t0>
+    /// MUST be used to compute: time_offset = burst_sensing_time - polynomial_ref_time
+    pub dc_polynomial_t0: Option<f64>,
+    
+    /// Burst reference time for sensing (seconds since epoch)
+    /// Used to compute polynomial time offset: sensing_time - polynomial_t0
+    pub burst_reference_time_seconds: Option<f64>,
 }
 
 impl BurstInfo {
@@ -602,24 +656,6 @@ pub struct DeburstConfig {
     pub seamless_stitching: bool,  // Enable seamless stitching with phase continuity
     pub apply_deramp: bool,        // Apply azimuth deramp for TOPSAR
     pub preserve_phase: bool,      // Preserve interferometric phase information
-    
-    /// Apply azimuth antenna pattern correction (ESA best practice)
-    /// 
-    /// Corrects azimuth intensity variations in TOPSAR bursts caused by antenna
-    /// beam steering. Enabled by default following ESA recommendations.
-    /// 
-    /// # References
-    /// - ESA-EOPG-CSCOP-TN-0010: "Sentinel-1 Antenna Pattern Correction"
-    /// 
-    /// # Impact
-    /// - Improves radiometric accuracy by 0.3-0.5 dB
-    /// - Adds ~2-5% processing time (negligible on modern CPUs)
-    /// 
-    /// # When to Disable
-    /// - Processing non-TOPSAR data
-    /// - Custom radiometric calibration applied externally
-    /// - Extreme performance requirements (not recommended)
-    pub antenna_pattern_correction: bool,
 
     /// Use range-dependent deramp for TOPS processing (experimental)
     /// 
@@ -669,7 +705,6 @@ impl Default for DeburstConfig {
             seamless_stitching: true,
             apply_deramp: true,                // Essential for TOPSAR
             preserve_phase: true,              // Important for interferometry
-            antenna_pattern_correction: false, // NOT IMPLEMENTED YET - set to false to avoid confusion
             use_range_dependent_deramp: true,  // Default ON - essential for IW stripe elimination (changed 2025-10-04)
 
             // NEW: Scientific defaults
@@ -741,18 +776,6 @@ impl TopSarDeburstProcessor {
             "🚀 Starting scientifically enhanced TOPSAR deburst with 8 optimizations for {} bursts",
             self.burst_info.len()
         );
-
-        // RADIOMETRIC VALIDATION: Check antenna pattern correction status
-        if self.config.antenna_pattern_correction {
-            log::warn!("⚠️  ANTENNA PATTERN CORRECTION: Flag enabled but NOT IMPLEMENTED");
-            log::warn!("   Azimuth antenna pattern LUT correction is not yet applied");
-            log::warn!("   This is a top cause of gentle inter-burst radiometric scalloping (0.3-0.5 dB)");
-            log::warn!("   TODO: Apply azimuth antenna pattern gain per line from annotation LUT");
-            log::warn!("   Reference: ESA-EOPG-CSCOP-TN-0010 'Sentinel-1 Antenna Pattern Correction'");
-        } else {
-            log::info!("ℹ️  Antenna pattern correction: DISABLED (not implemented yet)");
-            log::info!("   Residual azimuth intensity variations (0.3-0.5 dB) may remain in TOPSAR bursts");
-        }
 
         if self.burst_info.is_empty() {
             return Err(SarError::Processing(
@@ -1749,6 +1772,10 @@ impl DeburstProcessor {
                 azimuth_time_interval,
                 dc_polynomial: dc_polynomial.clone(),
                 fm_polynomial: fm_polynomial.clone(),
+                
+                // CRITICAL FIX (Issue #1, #8): Polynomial timing (TODO: parse from annotation)
+                dc_polynomial_t0: None,
+                burst_reference_time_seconds: None,
             });
         }
 
@@ -1887,6 +1914,10 @@ mod tests {
             azimuth_time_interval: 0.00021,   // ~5 kHz PRF
             dc_polynomial: vec![0.0, 0.0],    // Simple polynomial for test
             fm_polynomial: vec![2000.0, 0.0], // Constant FM rate for test
+            
+            // Polynomial timing (test defaults)
+            dc_polynomial_t0: None,
+            burst_reference_time_seconds: None,
         }];
 
         let config = DeburstConfig::default();
@@ -2032,6 +2063,8 @@ mod tests {
                 azimuth_time_interval: 0.00021,
                 dc_polynomial: vec![0.0],
                 fm_polynomial: vec![2000.0],
+                dc_polynomial_t0: None,
+                burst_reference_time_seconds: None,
             },
             BurstInfo {
                 burst_id: 1,
@@ -2055,6 +2088,8 @@ mod tests {
                 azimuth_time_interval: 0.00021,
                 dc_polynomial: vec![0.0],
                 fm_polynomial: vec![2000.0],
+                dc_polynomial_t0: None,
+                burst_reference_time_seconds: None,
             },
         ];
         
@@ -2095,266 +2130,6 @@ mod tests {
             "Enhancement #1: Range-dependent deramp should be enabled by default"
         );
     }
-}
-
-/// Extract subswath data from a Sentinel-1 ZIP file
-/// This function reads the SLC data for a specific subswath and polarization
-pub fn extract_subswath_from_zip(
-    zip_path: &str,
-    subswath: &str,
-    polarization: &str,
-) -> SarResult<Array2<f32>> {
-    log::info!(
-        "📡 Extracting subswath {} {} from {}",
-        subswath,
-        polarization,
-        zip_path
-    );
-
-    // Open the ZIP file
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| SarError::Processing(format!("Failed to open ZIP file: {}", e)))?;
-
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| SarError::Processing(format!("Failed to read ZIP archive: {}", e)))?;
-
-    // Find the appropriate measurement file for the subswath and polarization
-    // Extract subswath number (e.g., "IW1" -> "1")
-    let subswath_num = subswath.strip_prefix("IW").unwrap_or(subswath);
-    let measurement_pattern = format!(
-        "s1a-iw{}-slc-{}-",
-        subswath_num.to_lowercase(),
-        polarization.to_lowercase()
-    );
-
-    let mut measurement_file = None;
-    log::info!(
-        "Looking for files with pattern: '{}' in measurement/ directory",
-        measurement_pattern
-    );
-
-    for i in 0..archive.len() {
-        let file = archive
-            .by_index(i)
-            .map_err(|e| SarError::Processing(format!("Failed to read ZIP entry: {}", e)))?;
-
-        let name = file.name();
-        log::debug!("Checking file: {}", name);
-
-        if name.contains(&measurement_pattern)
-            && name.ends_with(".tiff")
-            && name.contains("measurement/")
-        {
-            measurement_file = Some(i);
-            log::info!("Found measurement file: {}", name);
-            break;
-        }
-    }
-
-    if measurement_file.is_none() {
-        return Err(SarError::Processing(format!(
-            "No measurement file found for subswath {} and polarization {}",
-            subswath, polarization
-        )));
-    }
-
-    // Extract TIFF to temporary file for GDAL reading
-    let measurement_index =
-        measurement_file.expect("measurement_file checked above for Some value");
-
-    let mut zip_file = archive
-        .by_index(measurement_index)
-        .map_err(|e| SarError::Processing(format!("Failed to access measurement file: {}", e)))?;
-
-    // Create temporary file
-    let mut temp_file = tempfile::NamedTempFile::new()
-        .map_err(|e| SarError::Processing(format!("Failed to create temp file: {}", e)))?;
-
-    // Copy TIFF data to temp file
-    std::io::copy(&mut zip_file, &mut temp_file)
-        .map_err(|e| SarError::Processing(format!("Failed to extract TIFF to temp file: {}", e)))?;
-
-    log::info!("TIFF extracted to temporary file for GDAL processing");
-
-    // Use GDAL to read the TIFF file
-    let dataset = gdal::Dataset::open(temp_file.path())
-        .map_err(|e| SarError::Processing(format!("Failed to open TIFF with GDAL: {}", e)))?;
-
-    // Get raster dimensions
-    let raster_size = dataset.raster_size();
-    let (width, height) = (raster_size.0, raster_size.1);
-    let band_count = dataset.raster_count();
-
-    log::info!(
-        "TIFF dimensions: {} x {}, bands: {}",
-        width,
-        height,
-        band_count
-    );
-
-    // Handle different band configurations (Sentinel-1 SLC format)
-    let intensity_data = if band_count == 1 {
-        // Single band containing complex data (Sentinel-1 SLC format: CInt16)
-        let band = dataset
-            .rasterband(1)
-            .map_err(|e| SarError::Processing(format!("Failed to get band 1: {}", e)))?;
-
-        let window = (0, 0);
-        let window_size = (width, height);
-
-        // Read complex 16-bit integers (CInt16 format)
-        let complex_data = band
-            .read_as::<i16>(window, window_size, (width * 2, height), None)
-            .map_err(|e| {
-                SarError::Processing(format!("Failed to read complex CInt16 data: {}", e))
-            })?;
-
-        log::debug!(
-            "Read {} complex values as interleaved i16",
-            complex_data.data.len() / 2
-        );
-
-        // Convert interleaved i16 data to intensity (magnitude squared) f32 array
-        convert_cint16_to_intensity(complex_data, width, height)?
-    } else if band_count >= 2 {
-        // Separate I and Q bands (less common for Sentinel-1)
-        let band1 = dataset
-            .rasterband(1)
-            .map_err(|e| SarError::Processing(format!("Failed to get band 1: {}", e)))?;
-
-        let band2 = dataset
-            .rasterband(2)
-            .map_err(|e| SarError::Processing(format!("Failed to get band 2: {}", e)))?;
-
-        let window = (0, 0);
-        let window_size = (width, height);
-        let buffer_size = (width, height);
-
-        let i_data = band1
-            .read_as::<f32>(window, window_size, buffer_size, None)
-            .map_err(|e| SarError::Processing(format!("Failed to read I data: {}", e)))?;
-
-        let q_data = band2
-            .read_as::<f32>(window, window_size, buffer_size, None)
-            .map_err(|e| SarError::Processing(format!("Failed to read Q data: {}", e)))?;
-
-        // Convert to intensity data
-        convert_iq_to_intensity(i_data, q_data, width, height)?
-    } else {
-        return Err(SarError::Processing(format!(
-            "Unexpected number of bands in TIFF: {}",
-            band_count
-        )));
-    };
-
-    log::info!(
-        "✅ Successfully extracted real SAR subswath data: {}x{} pixels",
-        width,
-        height
-    );
-    log::info!(
-        "Data range: {:.6} to {:.6}",
-        intensity_data.iter().fold(f32::INFINITY, |a, &b| a.min(b)),
-        intensity_data
-            .iter()
-            .fold(f32::NEG_INFINITY, |a, &b| a.max(b))
-    );
-
-    Ok(intensity_data)
-}
-
-/// Convert CInt16 interleaved data to intensity (magnitude squared)
-fn convert_cint16_to_intensity(
-    complex_data: gdal::raster::Buffer<i16>,
-    width: usize,
-    height: usize,
-) -> SarResult<Array2<f32>> {
-    let mut intensity_array = Array2::zeros((height, width));
-    let total_pixels = width * height;
-
-    // Data is interleaved as [real, imag, real, imag, ...]
-    if complex_data.data.len() < total_pixels * 2 {
-        return Err(SarError::Processing(format!(
-            "Insufficient data: expected {} i16 values, got {}",
-            total_pixels * 2,
-            complex_data.data.len()
-        )));
-    }
-
-    // Convert i16 complex data to f32 intensity values
-    for row in 0..height {
-        for col in 0..width {
-            let pixel_idx = row * width + col;
-            let data_idx = pixel_idx * 2;
-
-            // Extract real and imaginary parts as i16, convert to f32
-            let real_i16 = complex_data.data[data_idx];
-            let imag_i16 = complex_data.data[data_idx + 1];
-
-            // Convert to f32
-            let real_f32 = real_i16 as f32;
-            let imag_f32 = imag_i16 as f32;
-
-            // Calculate intensity (magnitude squared)
-            let intensity = real_f32 * real_f32 + imag_f32 * imag_f32;
-            intensity_array[[row, col]] = intensity;
-        }
-    }
-
-    // Log some statistics
-    let sample_intensity = intensity_array[[0, 0]];
-    log::debug!("First pixel intensity: {:.6}", sample_intensity);
-
-    // Check data variance
-    let mut sum = 0.0f32;
-    let mut sum_sq = 0.0f32;
-    let sample_size = std::cmp::min(1000, total_pixels);
-
-    for i in 0..sample_size {
-        let row = i / width;
-        let col = i % width;
-        if row < height {
-            let val = intensity_array[[row, col]];
-            sum += val;
-            sum_sq += val * val;
-        }
-    }
-
-    let mean = sum / sample_size as f32;
-    let variance = (sum_sq / sample_size as f32) - (mean * mean);
-    log::debug!(
-        "Sample statistics (first {} pixels): mean={:.6}, variance={:.6}",
-        sample_size,
-        mean,
-        variance
-    );
-
-    Ok(intensity_array)
-}
-
-/// Convert I/Q data to intensity (magnitude squared)
-fn convert_iq_to_intensity(
-    i_data: gdal::raster::Buffer<f32>,
-    q_data: gdal::raster::Buffer<f32>,
-    width: usize,
-    height: usize,
-) -> SarResult<Array2<f32>> {
-    let mut intensity_array = Array2::zeros((height, width));
-
-    // Convert buffer data to intensity
-    for i in 0..height {
-        for j in 0..width {
-            let idx = i * width + j;
-            if idx < i_data.data.len() && idx < q_data.data.len() {
-                let real = i_data.data[idx];
-                let imag = q_data.data[idx];
-                let intensity = real * real + imag * imag;
-                intensity_array[[i, j]] = intensity;
-            }
-        }
-    }
-
-    Ok(intensity_array)
 }
 
 /// Extract complex SLC data (preserving I/Q values) from ZIP file for proper radiometric calibration

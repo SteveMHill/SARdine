@@ -957,6 +957,10 @@ impl TerrainFlattener {
 
     /// Apply terrain flattening normalization using local incidence angle correction
     ///
+    /// # Input Requirements
+    /// - `sigma0`: Calibrated backscatter coefficient array
+    /// - `local_incidence_angles`: Local incidence angles in **RADIANS** (not degrees)
+    ///
     /// # Mathematical Basis
     /// Terrain flattening removes topographic modulation from SAR backscatter:
     ///
@@ -965,7 +969,7 @@ impl TerrainFlattener {
     /// where:
     /// - γ⁰ = terrain-flattened backscatter coefficient (gamma-nought)
     /// - σ⁰ = original backscatter coefficient (sigma-nought)
-    /// - θ_lia = local incidence angle between radar look vector and surface normal
+    /// - θ_lia = local incidence angle between radar look vector and surface normal (radians)
     ///
     /// # Literature References
     /// - Small, D. (2011): "Flattening Gamma: Radiometric Terrain Correction for SAR Imagery",
@@ -1002,6 +1006,8 @@ impl TerrainFlattener {
         let min_angle_rad = self.params.min_incidence_angle * PI / 180.0;
         let max_angle_rad = self.params.max_incidence_angle * PI / 180.0;
 
+        let safe_cos_cap = 0.342f32; // cos(70°) - consistent threshold everywhere
+
         if self.params.enable_parallel && rows > self.params.chunk_size {
             // Parallel processing - collect results then apply
             let row_indices: Vec<usize> = (0..rows).collect();
@@ -1014,30 +1020,26 @@ impl TerrainFlattener {
                             let theta_lia = local_incidence_angles[[i, j]];
                             let sigma0_val = sigma0[[i, j]];
 
-                            let gamma0_val = if self.params.apply_masking {
-                                if theta_lia < min_angle_rad || theta_lia > max_angle_rad {
-                                    f32::NAN // Mark as invalid
-                                } else {
-                                    // Apply terrain flattening with realistic threshold
-                                    let cos_theta = theta_lia.cos();
-                                    if cos_theta > 0.342 {
-                                        // Limit to 70° max incidence angle (cos(70°) = 0.342)
-                                        sigma0_val / cos_theta
-                                    } else {
-                                        // For extreme angles, mark as invalid instead of amplifying
-                                        f32::NAN
-                                    }
-                                }
+                            // Validate sigma0 input (finite and non-negative)
+                            if !sigma0_val.is_finite() || sigma0_val < 0.0 {
+                                local_gamma0.push((i, j, f32::NAN));
+                                continue;
+                            }
+
+                            // Apply incidence angle masking if enabled
+                            if self.params.apply_masking
+                                && (theta_lia < min_angle_rad || theta_lia > max_angle_rad)
+                            {
+                                local_gamma0.push((i, j, f32::NAN));
+                                continue;
+                            }
+
+                            // Apply terrain flattening with consistent 70° safety cap
+                            let cos_theta = theta_lia.cos();
+                            let gamma0_val = if cos_theta > safe_cos_cap {
+                                sigma0_val / cos_theta
                             } else {
-                                // Apply terrain flattening without masking
-                                let cos_theta = theta_lia.cos();
-                                if cos_theta > 0.342 {
-                                    // Limit to 70° max incidence angle (cos(70°) = 0.342)
-                                    sigma0_val / cos_theta
-                                } else {
-                                    // For extreme angles, mark as invalid instead of amplifying
-                                    f32::NAN
-                                }
+                                f32::NAN // Avoid unrealistic amplification at extreme grazing angles
                             };
                             local_gamma0.push((i, j, gamma0_val));
                         }
@@ -1059,36 +1061,27 @@ impl TerrainFlattener {
                     let theta_lia = local_incidence_angles[[i, j]];
                     let sigma0_val = sigma0[[i, j]];
 
-                    // Apply masking if enabled
+                    // Validate sigma0 input (finite and non-negative)
+                    if !sigma0_val.is_finite() || sigma0_val < 0.0 {
+                        gamma0[[i, j]] = f32::NAN;
+                        continue;
+                    }
+
+                    // Apply incidence angle masking if enabled
                     if self.params.apply_masking
                         && (theta_lia < min_angle_rad || theta_lia > max_angle_rad)
                     {
-                        gamma0[[i, j]] = f32::NAN; // Mark as invalid
+                        gamma0[[i, j]] = f32::NAN;
                         continue;
                     }
 
-                    // Validate input sigma0 value first
-                    if !sigma0_val.is_finite() || sigma0_val < 0.0 || sigma0_val > 10.0 {
-                        gamma0[[i, j]] = f32::NAN; // Mark invalid input as NaN
-                        continue;
-                    }
-
-                    // Apply terrain flattening with realistic threshold
+                    // Apply terrain flattening with consistent 70° safety cap
                     let cos_theta = theta_lia.cos();
-                    if cos_theta > 0.2 {
-                        // Limit to 70° max incidence angle
-                        let result = sigma0_val / cos_theta;
-                        // Clamp result to reasonable range to prevent extreme values
-                        use crate::core::global_clamp_debug::ClampDebug;
-                        gamma0[[i, j]] = result.dbg_clamp(0.0, 100.0, "gamma0_pixel_upper");
+                    gamma0[[i, j]] = if cos_theta > safe_cos_cap {
+                        sigma0_val / cos_theta
                     } else {
-                        // For extreme angles, limit amplification to prevent unrealistic values
-                        let safe_cos = cos_theta.max(0.2);
-                        let result = sigma0_val / safe_cos;
-                        // Clamp result to reasonable range
-                        use crate::core::global_clamp_debug::ClampDebug;
-                        gamma0[[i, j]] = result.dbg_clamp(0.0, 100.0, "gamma0_pixel_lower");
-                    }
+                        f32::NAN // Avoid unrealistic amplification at extreme grazing angles
+                    };
                 }
             }
         }

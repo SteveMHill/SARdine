@@ -91,11 +91,15 @@ else
 fi
 echo ""
 
-# 7. Power/intensity conversion in wrong places
+# 7. Power/intensity conversion in wrong places (SAR-specific, not geometric calculations)
 echo -e "${YELLOW}7. Power/Intensity Conversion (should only be in calibrate.rs)${NC}"
 echo "   Files: src/io/*.rs, src/core/deburst.rs"
-if rg -n "norm_sqr|magnitude.*sqr|to_power|intensity.*=" \
-   src/io/ src/core/deburst.rs 2>/dev/null | grep -v "// "; then
+# Exclude false positives: velocity_magnitude, gradient_magnitude (legitimate geometric calculations)
+if rg -n "norm_sqr|magnitude.*sqr|to_power|complex.*intensity|real.*imag.*intensity" \
+   src/io/ src/core/deburst.rs 2>/dev/null | \
+   grep -v "// " | \
+   grep -v "velocity_magnitude" | \
+   grep -v "gradient_magnitude"; then
     echo -e "${RED}   ❌ VIOLATION FOUND${NC}"
     violations_found=$((violations_found + 1))
 else

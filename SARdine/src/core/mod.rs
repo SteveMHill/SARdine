@@ -2,7 +2,6 @@
 
 pub mod advanced_masking;
 pub mod calibrate;
-pub mod calibration_optimized; // Optimized calibration with dense per-column caching
 pub mod context_extraction; // Extract ProcessingContext from annotation data
 pub mod coordinate_frames; // Type-safe coordinate frame handling
 pub mod dc_fm_provider; // DC/FM-rate provider trait with mocking support
@@ -43,9 +42,6 @@ pub use advanced_masking::{
     AdvancedMaskingConfig, AdvancedMaskingProcessor, MaskingMethod,
 };
 pub use calibrate::{CalibrationCoefficients, CalibrationProcessor, CalibrationType};
-pub use calibration_optimized::{
-    DenseCalibrationCache, FusedCalibrationMode, OptimizedCalibrationProcessor,
-};
 pub use context_extraction::{
     extract_from_annotation, update_with_calibration, update_with_dem,
 };

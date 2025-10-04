@@ -9,36 +9,36 @@ struct IntegralImage {
     sum_table: Array2<f64>,
     /// Integral of squared values for variance calculation
     sum_sq_table: Array2<f64>,
-    /// Count table for valid pixels (non-zero, finite)
-    count_table: Array2<u32>,
+    /// Count table for valid pixels (>= 0, finite) - using u64 to prevent overflow
+    count_table: Array2<u64>,
 }
 
 impl IntegralImage {
     /// Create integral image from input data
+    /// Uses row-wise accumulation for better numerical stability
     fn new(image: &Array2<f32>) -> Self {
         let (height, width) = image.dim();
         let mut sum_table = Array2::zeros((height + 1, width + 1));
         let mut sum_sq_table = Array2::zeros((height + 1, width + 1));
         let mut count_table = Array2::zeros((height + 1, width + 1));
 
-        // Build integral tables using dynamic programming
+        // Build integral tables using row-wise accumulation for better numerical stability
         for i in 1..=height {
+            let mut row_sum = 0.0f64;
+            let mut row_sum_sq = 0.0f64;
+            let mut row_cnt = 0u64;
+
             for j in 1..=width {
                 let pixel = image[[i - 1, j - 1]];
-                let (val, val_sq, cnt) = if pixel.is_finite() && pixel > 0.0 {
-                    (pixel as f64, (pixel * pixel) as f64, 1u32)
-                } else {
-                    (0.0, 0.0, 0u32)
-                };
-
-                sum_table[[i, j]] =
-                    val + sum_table[[i - 1, j]] + sum_table[[i, j - 1]] - sum_table[[i - 1, j - 1]];
-
-                sum_sq_table[[i, j]] = val_sq + sum_sq_table[[i - 1, j]] + sum_sq_table[[i, j - 1]]
-                    - sum_sq_table[[i - 1, j - 1]];
-
-                count_table[[i, j]] = cnt + count_table[[i - 1, j]] + count_table[[i, j - 1]]
-                    - count_table[[i - 1, j - 1]];
+                // Treat zeros as valid intensity (common for masked areas)
+                if pixel.is_finite() && pixel >= 0.0 {
+                    row_sum += pixel as f64;
+                    row_sum_sq += (pixel as f64) * (pixel as f64);
+                    row_cnt += 1;
+                }
+                sum_table[[i, j]] = sum_table[[i - 1, j]] + row_sum;
+                sum_sq_table[[i, j]] = sum_sq_table[[i - 1, j]] + row_sum_sq;
+                count_table[[i, j]] = count_table[[i - 1, j]] + row_cnt;
             }
         }
 
@@ -73,13 +73,13 @@ impl IntegralImage {
             - self.sum_sq_table[[row2 + 1, col1]]
             + self.sum_sq_table[[row1, col1]];
 
-        // Use i64 arithmetic to avoid overflow/underflow
-        let count = (self.count_table[[row2 + 1, col2 + 1]] as i64)
-            - (self.count_table[[row1, col2 + 1]] as i64)
-            - (self.count_table[[row2 + 1, col1]] as i64)
-            + (self.count_table[[row1, col1]] as i64);
+        // Use i128 arithmetic to safely handle u64 counts
+        let count = (self.count_table[[row2 + 1, col2 + 1]] as i128)
+            - (self.count_table[[row1, col2 + 1]] as i128)
+            - (self.count_table[[row2 + 1, col1]] as i128)
+            + (self.count_table[[row1, col1]] as i128);
 
-        let count = count.max(0) as u32;
+        let count = count.max(0) as u64;
 
         if count == 0 {
             return (0.0, 0.0);
@@ -87,11 +87,8 @@ impl IntegralImage {
 
         let n = count as f64;
         let mean = sum / n;
-        let variance = if count > 1 {
-            (sum_sq / n - mean * mean).max(0.0)
-        } else {
-            0.0
-        };
+        // Ensure variance is always non-negative (guard against numerical precision issues)
+        let variance = (sum_sq / n - mean * mean).max(0.0);
 
         (mean as f32, variance as f32)
     }
@@ -246,13 +243,6 @@ impl SpeckleFilter {
         let mut result = Array2::zeros((height, width));
         let half_window = self.params.window_size / 2;
 
-        // Build integral image if needed for large windows
-        let integral = if self.params.window_size >= 9 {
-            Some(IntegralImage::new(image))
-        } else {
-            None
-        };
-
         // Process image in tiles with overlap for boundary handling
         for tile_row in (0..height).step_by(effective_tile_size) {
             for tile_col in (0..width).step_by(effective_tile_size) {
@@ -272,9 +262,16 @@ impl SpeckleFilter {
                     ])
                     .to_owned();
 
-                // Process tile
+                // Build per-tile integral image when window >= 9 (simpler and safer than global offsets)
+                let tile_integral = if self.params.window_size >= 9 {
+                    Some(IntegralImage::new(&tile))
+                } else {
+                    None
+                };
+
+                // Process tile with its own integral image
                 let filtered_tile =
-                    self.apply_filter_to_tile(&tile, filter_type, integral.as_ref())?;
+                    self.apply_filter_to_tile(&tile, filter_type, tile_integral.as_ref())?;
 
                 // Calculate offsets for copying results back
                 let copy_start_row = half_window.min(tile_row - padded_start_row);
@@ -574,7 +571,7 @@ impl SpeckleFilter {
                     for wi in i_start..i_end {
                         for wj in j_start..j_end {
                             let pixel_val = tile[[wi, wj]];
-                            if pixel_val.is_finite() && pixel_val > 0.0 {
+                            if pixel_val.is_finite() && pixel_val >= 0.0 {
                                 window_values.push(pixel_val);
                             }
                         }
@@ -613,7 +610,7 @@ impl SpeckleFilter {
 
                         if ii >= 0 && ii < height as i32 && jj >= 0 && jj < width as i32 {
                             let pixel_val = image[[ii as usize, jj as usize]];
-                            if pixel_val.is_finite() && pixel_val > 0.0 {
+                            if pixel_val.is_finite() && pixel_val >= 0.0 {
                                 sum += pixel_val;
                                 count += 1;
                             }
@@ -909,7 +906,7 @@ impl SpeckleFilter {
 
                         if ii >= 0 && ii < height as i32 && jj >= 0 && jj < width as i32 {
                             let pixel_val = image[[ii as usize, jj as usize]];
-                            if pixel_val.is_finite() && pixel_val > 0.0 {
+                            if pixel_val.is_finite() && pixel_val >= 0.0 {
                                 window_values.push(pixel_val);
                             }
                         }
@@ -994,11 +991,10 @@ impl SpeckleFilter {
             for j in j_start..j_end {
                 let pixel_val = image[[i, j]];
                 if pixel_val.is_finite() && pixel_val >= 0.0 && pixel_val <= 255.0 {
-                    let bin = pixel_val as usize;
-                    if bin < 256 {
-                        histogram[bin] += 1;
-                        total_pixels += 1;
-                    }
+                    // Round and clamp to [0,255] for robust binning
+                    let bin = (pixel_val.round() as i32).clamp(0, 255) as usize;
+                    histogram[bin] += 1;
+                    total_pixels += 1;
                 }
             }
         }
@@ -1082,7 +1078,7 @@ impl SpeckleFilter {
                     for wi in i_start..i_end {
                         for wj in j_start..j_end {
                             let pixel_val = image[[wi, wj]];
-                            if pixel_val.is_finite() && pixel_val > 0.0 {
+                            if pixel_val.is_finite() && pixel_val >= 0.0 {
                                 window_values.push(pixel_val);
                             }
                         }
@@ -1484,7 +1480,7 @@ impl SpeckleFilter {
                 for wi in 0..self.params.window_size {
                     for wj in 0..self.params.window_size {
                         let value = window[[wi, wj]];
-                        if value.is_finite() && value > 0.0 {
+                        if value.is_finite() && value >= 0.0 {
                             let di = (wi as i32 - half_window as i32).abs() as f32;
                             let dj = (wj as i32 - half_window as i32).abs() as f32;
                             let distance = (di * di + dj * dj).sqrt();
@@ -1623,7 +1619,7 @@ impl SpeckleFilter {
 
                 if ii >= 0 && ii < height as i32 && jj >= 0 && jj < width as i32 {
                     let pixel_val = image[[ii as usize, jj as usize]];
-                    if pixel_val.is_finite() && pixel_val > 0.0 {
+                    if pixel_val.is_finite() && pixel_val >= 0.0 {
                         values.push(pixel_val);
                     }
                 }
@@ -1668,7 +1664,7 @@ impl SpeckleFilter {
         for i in i_start..i_end {
             for j in j_start..j_end {
                 let pixel_val = image[[i, j]];
-                if pixel_val.is_finite() && pixel_val > 0.0 {
+                if pixel_val.is_finite() && pixel_val >= 0.0 {
                     sum += pixel_val;
                     sum_sq += pixel_val * pixel_val;
                     count += 1;
@@ -1754,7 +1750,7 @@ impl SpeckleFilter {
         for i in 0..height {
             for j in 0..width {
                 let val = image[[i, j]];
-                if val.is_finite() && val > 0.0 {
+                if val.is_finite() && val >= 0.0 {
                     values.push(val);
                 }
             }
@@ -1837,7 +1833,7 @@ impl SpeckleFilter {
         let mut count = 0;
 
         for value in window.iter() {
-            if value.is_finite() && *value > 0.0 {
+            if value.is_finite() && *value >= 0.0 {
                 sum += *value;
                 count += 1;
             }
@@ -1856,7 +1852,7 @@ impl SpeckleFilter {
         let mut count = 0;
 
         for value in window.iter() {
-            if value.is_finite() && *value > 0.0 {
+            if value.is_finite() && *value >= 0.0 {
                 let diff = *value - mean;
                 sum_sq_diff += diff * diff;
                 count += 1;

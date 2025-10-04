@@ -2245,7 +2245,6 @@ impl SlcReader {
             seamless_stitching: true,
             apply_deramp: true,
             preserve_phase: true,
-            antenna_pattern_correction: false,
             use_range_dependent_deramp: false, // Use fast time-only deramp
 
             // NEW: Scientific enhancements (use conservative defaults)
@@ -2635,53 +2634,6 @@ impl SlcReader {
             "Output pixel spacing: range={}m, azimuth={}m",
             new_range_spacing,
             new_azimuth_spacing
-        );
-
-        Ok((multilooked_data, new_range_spacing, new_azimuth_spacing))
-    }
-
-    /// Complete workflow: calibrate and multilook SLC data
-    ///
-    /// This is a convenience method that combines calibration and multilooking
-    pub fn calibrate_and_multilook(
-        &mut self,
-        pol: Polarization,
-        cal_type: crate::core::calibrate::CalibrationType,
-        range_looks: usize,
-        azimuth_looks: usize,
-    ) -> SarResult<(Array2<f32>, f64, f64)> {
-        log::info!("Starting calibrate and multilook workflow for {:?}", pol);
-
-        // First, get deburst data
-        let deburst_data = self.deburst_slc(pol)?;
-        log::info!(
-            "Deburst data: {} x {}",
-            deburst_data.nrows(),
-            deburst_data.ncols()
-        );
-
-        // Get calibration coefficients
-        let cal_data = self.read_calibration_data(pol)?;
-
-        // Create calibration processor
-        let processor = crate::core::calibrate::CalibrationProcessor::new(cal_data, cal_type);
-
-        // Apply calibration to get intensity data
-        let intensity_data = processor.calibrate(&deburst_data)?;
-        log::info!(
-            "Calibrated data: {} x {}",
-            intensity_data.nrows(),
-            intensity_data.ncols()
-        );
-
-        // Apply multilooking
-        let (multilooked_data, new_range_spacing, new_azimuth_spacing) =
-            self.multilook_intensity(&intensity_data, pol, range_looks, azimuth_looks)?;
-
-        log::info!(
-            "Complete workflow finished: final dimensions {}x{}",
-            multilooked_data.nrows(),
-            multilooked_data.ncols()
         );
 
         Ok((multilooked_data, new_range_spacing, new_azimuth_spacing))
