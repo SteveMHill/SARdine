@@ -227,6 +227,8 @@ mod tests {
             azimuth_time_interval: 0.0002,
             dc_polynomial: vec![0.0],
             fm_polynomial: vec![0.0],
+            dc_polynomial_t0: Some(0.0),
+            burst_reference_time_seconds: Some(0.0),
         }];
 
         let config = DeburstConfig::default();
