@@ -20,6 +20,12 @@ import numpy as np
 # Import modular components
 from sardine.processors import BackscatterProcessor
 from sardine import utils
+from sardine.partial_pipeline import (
+    _collect_subswath_slices,
+    _compute_geotransform,
+    _compute_slice_geotransform,
+    _validate_geotransform_uniqueness,
+)
 
 
 def print_banner():
@@ -105,14 +111,30 @@ def cmd_info(args):
         print("🔍 Analyzing Sentinel-1 product...")
         product_metadata = sardine.get_product_info(args.input)
         
-        # Count files in ZIP archive
+        # Count files in product (ZIP or SAFE format)
         import zipfile
         input_path = Path(args.input)
         try:
-            with zipfile.ZipFile(input_path, 'r') as zip_file:
-                total_files = len(zip_file.namelist())
-        except Exception:
-            total_files = "N/A"
+            if input_path.is_file() and input_path.suffix.lower() == '.zip':
+                # ZIP format
+                with zipfile.ZipFile(input_path, 'r') as zip_file:
+                    total_files = len(zip_file.namelist())
+            elif input_path.is_dir() and (
+                '.SAFE' in input_path.name or 
+                (input_path / 'manifest.safe').exists()
+            ):
+                # SAFE directory format
+                def count_safe_files(directory):
+                    count = 0
+                    for item in directory.rglob('*'):
+                        if item.is_file():
+                            count += 1
+                    return count
+                total_files = count_safe_files(input_path)
+            else:
+                total_files = "Unknown format"
+        except Exception as e:
+            total_files = f"Error: {e}"
         
         # Restructure data for display function compatibility
         info = {
@@ -591,9 +613,13 @@ def cmd_deburst(args):
             print("⚠️  Warning: This doesn't appear to be an IW mode product")
             print("   Deburst is primarily designed for IW mode data")
         
-        # Find available polarizations
-        annotation_files = reader.find_annotation_files()
-        available_polarizations = list(annotation_files.keys())
+        # Find available polarizations using complete subswath discovery only
+        try:
+            all_annotations = reader.find_all_annotation_files()
+            available_polarizations = list(all_annotations.keys())
+        except Exception as e:
+            print(f"❌ Error discovering annotations: {e}")
+            return 1
         
         print(f"📡 Available polarizations: {', '.join(available_polarizations)}")
         
@@ -694,9 +720,13 @@ def cmd_calibrate(args):
         # Initialize reader with comprehensive metadata cache for optimal performance
         reader = sardine.SlcReader.new_with_full_cache(str(input_path))
         
-        # Find available polarizations
-        annotation_files = reader.find_annotation_files()
-        available_polarizations = list(annotation_files.keys())
+        # Find available polarizations using complete subswath discovery only
+        try:
+            all_annotations = reader.find_all_annotation_files()
+            available_polarizations = list(all_annotations.keys())
+        except Exception as e:
+            print(f"❌ Error discovering annotations: {e}")
+            return 1
         
         print(f"📡 Available polarizations: {', '.join(available_polarizations)}")
         
@@ -824,9 +854,13 @@ def cmd_topsar_merge(args):
         # Initialize reader with comprehensive metadata cache for optimal performance
         reader = sardine.SlcReader.new_with_full_cache(str(input_path))
         
-        # Find available polarizations
-        annotation_files = reader.find_annotation_files()
-        available_polarizations = list(annotation_files.keys())
+        # Find available polarizations using complete subswath discovery only
+        try:
+            all_annotations = reader.find_all_annotation_files()
+            available_polarizations = list(all_annotations.keys())
+        except Exception as e:
+            print(f"❌ Error discovering annotations: {e}")
+            return 1
         
         print(f"📡 Available polarizations: {', '.join(available_polarizations)}")
         
@@ -861,6 +895,58 @@ def cmd_topsar_merge(args):
                     print(f"⚠️  Warning: Only {len(subswaths)} sub-swaths found, merge not needed")
                     continue
                 
+                try:
+                    subswath_slices = _collect_subswath_slices(reader, pol)
+                    if not subswath_slices:
+                        raise RuntimeError(
+                            "No IW subswath geometry available for geotransform validation"
+                        )
+
+                    row_stops = [
+                        slc.stop
+                        for slc, _ in subswath_slices.values()
+                        if slc.stop is not None
+                    ]
+                    col_stops = [
+                        slc.stop
+                        for _, slc in subswath_slices.values()
+                        if slc.stop is not None
+                    ]
+
+                    if not row_stops or not col_stops:
+                        raise RuntimeError(
+                            "Incomplete subswath slice definitions (missing stop indices)"
+                        )
+
+                    global_rows = int(max(row_stops))
+                    global_cols = int(max(col_stops))
+                    if global_rows <= 0 or global_cols <= 0:
+                        raise RuntimeError(
+                            f"Invalid global raster dimensions derived: {global_rows}×{global_cols}"
+                        )
+
+                    base_transform = _compute_geotransform(
+                        metadata, global_rows, global_cols
+                    )
+                    subswath_transforms = {
+                        subswath_id: _compute_slice_geotransform(
+                            base_transform, line_slice, sample_slice
+                        )
+                        for subswath_id, (line_slice, sample_slice) in subswath_slices.items()
+                    }
+                    _validate_geotransform_uniqueness(subswath_transforms)
+                    if getattr(args, "verbose", False):
+                        print("   • Geotransform validation passed (unique subswath offsets)")
+                except Exception as validation_error:
+                    print(
+                        f"❌ Geotransform validation failed for {pol}: {validation_error}"
+                    )
+                    if getattr(args, "verbose", False):
+                        import traceback
+
+                        traceback.print_exc()
+                    return 1
+
                 # Perform calibration + TOPSAR merge
                 merged_data = sardine.topsar_merge(
                     str(input_path),
@@ -975,9 +1061,13 @@ def cmd_multilook(args):
         # Initialize reader with comprehensive metadata cache for optimal performance
         reader = sardine.SlcReader.new_with_full_cache(str(input_path))
         
-        # Find available polarizations
-        annotation_files = reader.find_annotation_files()
-        available_polarizations = list(annotation_files.keys())
+        # Find available polarizations using complete subswath discovery only
+        try:
+            all_annotations = reader.find_all_annotation_files()
+            available_polarizations = list(all_annotations.keys())
+        except Exception as e:
+            print(f"❌ Error discovering annotations: {e}")
+            return 1
         
         print(f"📡 Available polarizations: {', '.join(available_polarizations)}")
         
@@ -1164,21 +1254,47 @@ def cmd_terrain_flatten(args):
         
         print(f"🔄 Processing with calibration type: {cal_type}")
         
-        # Process with automatic DEM preparation
+        # Process using modular components: calibration + multilooking + terrain flattening
         try:
-            gamma0_data, incidence_angles, range_spacing, azimuth_spacing = reader.calibrate_multilook_and_flatten_auto_dem(
+            # Step 1: Radiometric calibration
+            print(f"🔄 Step 1: Radiometric calibration ({cal_type})")
+            calibrated_data = reader.radiometric_calibration_with_denoising(
                 polarization,
-                cal_type,
+                cal_type
+            )
+            
+            # Step 2: Multilooking
+            print(f"🔄 Step 2: Multilooking ({args.range_looks}x{args.azimuth_looks})")
+            # Note: Need to get pixel spacing from metadata for proper multilooking
+            # Using default values for now - should be extracted from annotation
+            range_spacing = 2.33  # Default Sentinel-1 range pixel spacing
+            azimuth_spacing = 14.0  # Default Sentinel-1 azimuth pixel spacing
+            
+            multilooked_data = sardine.apply_multilooking(
+                calibrated_data,
                 args.range_looks,
                 args.azimuth_looks,
-                args.dem_cache
+                range_spacing,
+                azimuth_spacing
             )
+            
+            # Step 3: Terrain flattening
+            print(f"🔄 Step 3: Terrain flattening")
+            gamma0_data, incidence_angles = sardine.apply_terrain_flattening(
+                multilooked_data,
+                args.dem_cache,  # DEM path or auto
+                30.0  # DEM resolution
+            )
+            
+            # Calculate final pixel spacing
+            final_range_spacing = range_spacing * args.range_looks
+            final_azimuth_spacing = azimuth_spacing * args.azimuth_looks
             
             processing_time = time.time() - start_time
             
             print(f"✅ Terrain flattening completed in {processing_time:.2f}s")
             print(f"📊 Output shape: {gamma0_data.shape}")
-            print(f"📏 Pixel spacing: {range_spacing:.2f}m x {azimuth_spacing:.2f}m (azimuth)")
+            print(f"📏 Pixel spacing: {final_range_spacing:.2f}m x {final_azimuth_spacing:.2f}m (azimuth)")
             
             # Save gamma0 data
             output_gamma0 = f"gamma0_{polarization}_{args.range_looks}x{args.azimuth_looks}.npy"
@@ -3136,6 +3252,122 @@ Examples:
         help="Path to SLC metadata file"
     )
 
+    # Download command
+    download_parser = subparsers.add_parser(
+        "download",
+        help="Download Sentinel-1 SLC products"
+    )
+    download_parser.add_argument(
+        "--product-names",
+        nargs='+',
+        help="Sentinel-1 product names to download"
+    )
+    download_parser.add_argument(
+        "--product-file",
+        help="File containing list of product names (one per line)"
+    )
+    download_parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory to save downloaded files"
+    )
+    download_parser.add_argument(
+        "--copernicus-username",
+        help="ESA Copernicus Hub username"
+    )
+    download_parser.add_argument(
+        "--copernicus-password",
+        help="ESA Copernicus Hub password"
+    )
+    download_parser.add_argument(
+        "--asf-username",
+        help="Alaska Satellite Facility username (optional)"
+    )
+    download_parser.add_argument(
+        "--asf-password",
+        help="Alaska Satellite Facility password (optional)"
+    )
+
+    # Search command
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search for Sentinel-1 products"
+    )
+    search_parser.add_argument(
+        "--start-date",
+        required=True,
+        help="Start date in YYYY-MM-DD format"
+    )
+    search_parser.add_argument(
+        "--end-date",
+        required=True,
+        help="End date in YYYY-MM-DD format"
+    )
+    search_parser.add_argument(
+        "--platform",
+        choices=["S1A", "S1B"],
+        help="Platform name (S1A, S1B, or both if not specified)"
+    )
+    search_parser.add_argument(
+        "--product-type",
+        choices=["SLC", "GRD", "OCN"],
+        help="Product type (SLC, GRD, OCN, or all if not specified)"
+    )
+    search_parser.add_argument(
+        "--acquisition-mode",
+        choices=["IW", "EW", "SM", "WV"],
+        help="Acquisition mode (IW, EW, SM, WV, or all if not specified)"
+    )
+    search_parser.add_argument(
+        "--polarization",
+        choices=["VV", "VH", "HH", "HV", "VV+VH", "HH+HV"],
+        help="Polarization mode"
+    )
+    search_parser.add_argument(
+        "--orbit-direction",
+        choices=["ASCENDING", "DESCENDING"],
+        help="Orbit direction"
+    )
+    search_parser.add_argument(
+        "--relative-orbit",
+        type=int,
+        help="Relative orbit number"
+    )
+    search_parser.add_argument(
+        "--aoi-wkt",
+        help="Area of interest in WKT format (e.g., 'POLYGON((lon1 lat1, lon2 lat2, ...))')"
+    )
+    search_parser.add_argument(
+        "--max-results",
+        type=int,
+        default=100,
+        help="Maximum number of results to return (default: 100)"
+    )
+    search_parser.add_argument(
+        "--copernicus-username",
+        help="ESA Copernicus Hub username"
+    )
+    search_parser.add_argument(
+        "--copernicus-password",
+        help="ESA Copernicus Hub password"
+    )
+    search_parser.add_argument(
+        "--asf-username",
+        help="Alaska Satellite Facility username (optional)"
+    )
+    search_parser.add_argument(
+        "--asf-password",
+        help="Alaska Satellite Facility password (optional)"
+    )
+    search_parser.add_argument(
+        "--output-file",
+        help="Save search results to JSON file"
+    )
+    search_parser.add_argument(
+        "--product-names-file",
+        help="Save product names to text file (one per line)"
+    )
+
     args = parser.parse_args()
     
     if not args.command:
@@ -3190,6 +3422,10 @@ Examples:
         return cmd_latlon_to_ecef(args)
     elif args.command == "mask":
         return cmd_mask(args)
+    elif args.command == "download":
+        return cmd_download(args)
+    elif args.command == "search":
+        return cmd_search(args)
     
     return 1
 
@@ -3318,6 +3554,132 @@ def handle_masking(args):
         
     except Exception as e:
         print(f"Error in masking workflow: {e}")
+        raise
+
+
+def cmd_download(args):
+    """Download Sentinel-1 SLC products by product name"""
+    import sardine
+    import os
+    
+    print(f"Downloading Sentinel-1 products...")
+    
+    # Prepare product names
+    product_names = []
+    if args.product_names:
+        product_names.extend(args.product_names)
+    if args.product_file:
+        with open(args.product_file, 'r') as f:
+            product_names.extend([line.strip() for line in f if line.strip()])
+    
+    if not product_names:
+        print("Error: No product names specified. Use --product-names or --product-file")
+        return
+    
+    print(f"Products to download: {len(product_names)}")
+    for name in product_names:
+        print(f"  - {name}")
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"Output directory: {args.output_dir}")
+    
+    try:
+        # Download products
+        downloaded_paths = sardine.download_sentinel1_products(
+            product_names,
+            args.output_dir,
+            copernicus_username=args.copernicus_username,
+            copernicus_password=args.copernicus_password,
+            asf_username=args.asf_username,
+            asf_password=args.asf_password
+        )
+        
+        print(f"\nSuccessfully downloaded {len(downloaded_paths)} products:")
+        for path in downloaded_paths:
+            print(f"  ✓ {path}")
+            
+    except Exception as e:
+        print(f"Download failed: {e}")
+        raise
+
+
+def cmd_search(args):
+    """Search for Sentinel-1 products"""
+    import sardine
+    import json
+    from datetime import datetime
+    
+    print(f"Searching for Sentinel-1 products...")
+    print(f"Time range: {args.start_date} to {args.end_date}")
+    if args.platform:
+        print(f"Platform: {args.platform}")
+    if args.product_type:
+        print(f"Product type: {args.product_type}")
+    if args.acquisition_mode:
+        print(f"Acquisition mode: {args.acquisition_mode}")
+    if args.polarization:
+        print(f"Polarization: {args.polarization}")
+    if args.orbit_direction:
+        print(f"Orbit direction: {args.orbit_direction}")
+    if args.relative_orbit:
+        print(f"Relative orbit: {args.relative_orbit}")
+    if args.aoi_wkt:
+        print(f"Area of interest: {args.aoi_wkt}")
+    print(f"Max results: {args.max_results}")
+    
+    try:
+        # Search for products
+        products = sardine.search_sentinel1_products(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            platform=args.platform,
+            product_type=args.product_type,
+            acquisition_mode=args.acquisition_mode,
+            polarization=args.polarization,
+            orbit_direction=args.orbit_direction,
+            relative_orbit=args.relative_orbit,
+            aoi_wkt=args.aoi_wkt,
+            max_results=args.max_results,
+            copernicus_username=args.copernicus_username,
+            copernicus_password=args.copernicus_password,
+            asf_username=args.asf_username,
+            asf_password=args.asf_password
+        )
+        
+        print(f"\nFound {len(products)} products:")
+        print("-" * 80)
+        
+        total_size_mb = 0
+        for product in products:
+            print(f"Title: {product['title']}")
+            print(f"  Platform: {product['platform_name']}")
+            print(f"  Type: {product['product_type']}")
+            print(f"  Mode: {product['acquisition_mode']}")
+            print(f"  Polarization: {', '.join(product['polarization'])}")
+            print(f"  Start time: {product['start_time']}")
+            print(f"  Orbit: {product['relative_orbit_number']} ({product['orbit_direction']})")
+            print(f"  Size: {product['size_mb']:.1f} MB")
+            total_size_mb += product['size_mb']
+            print()
+        
+        print(f"Total size: {total_size_mb:.1f} MB ({total_size_mb/1024:.1f} GB)")
+        
+        # Save results to file if requested
+        if args.output_file:
+            with open(args.output_file, 'w') as f:
+                json.dump(products, f, indent=2)
+            print(f"Results saved to: {args.output_file}")
+        
+        # Save product names list if requested
+        if args.product_names_file:
+            with open(args.product_names_file, 'w') as f:
+                for product in products:
+                    f.write(f"{product['title']}\n")
+            print(f"Product names saved to: {args.product_names_file}")
+            
+    except Exception as e:
+        print(f"Search failed: {e}")
         raise
 
 

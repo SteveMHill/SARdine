@@ -70,12 +70,12 @@ class ProcessingChainMetadata:
 class QualityMetadata:
     """Quality assessment and validation metadata"""
     valid_pixel_percentage: float
-    shadow_pixel_percentage: float
-    layover_pixel_percentage: float
-    steep_terrain_percentage: float  # Pixels with cos(θ) < threshold
     backscatter_statistics: Dict[str, float]  # min, max, mean, std
     incidence_angle_range: Tuple[float, float]  # [min, max] in degrees
     quality_flags: List[str]      # Quality warnings/flags
+    shadow_pixel_percentage: Optional[float] = None
+    layover_pixel_percentage: Optional[float] = None
+    steep_terrain_percentage: Optional[float] = None  # Pixels with cos(θ) < threshold
     
 @dataclass
 class GeospatialMetadata:
@@ -177,6 +177,9 @@ class RTCMetadataBuilder:
                       # Geospatial info
                       pixel_spacing: Tuple[float, float], scene_center: Tuple[float, float],
                       scene_extent: Tuple[float, float, float, float],
+                      shadow_pixels_pct: Optional[float] = None,
+                      layover_pixels_pct: Optional[float] = None,
+                      steep_terrain_pct: Optional[float] = None,
                       coordinate_system: str = "EPSG:4326") -> ComprehensiveRTCMetadata:
         """Build complete RTC metadata"""
         
@@ -226,14 +229,22 @@ class RTCMetadataBuilder:
         )
         
         # Build quality metadata
+        quality_flags: List[str] = []
+        if shadow_pixels_pct is None:
+            quality_flags.append("Shadow percentage placeholder – computation pending")
+        if layover_pixels_pct is None:
+            quality_flags.append("Layover percentage placeholder – computation pending")
+        if steep_terrain_pct is None:
+            quality_flags.append("Steep terrain percentage placeholder – computation pending")
+
         quality_metadata = QualityMetadata(
             valid_pixel_percentage=valid_pixels_pct,
-            shadow_pixel_percentage=100.0 - valid_pixels_pct,  # Approximation
-            layover_pixel_percentage=0.0,  # Should be calculated
-            steep_terrain_percentage=0.0,  # Should be calculated
+            shadow_pixel_percentage=shadow_pixels_pct,
+            layover_pixel_percentage=layover_pixels_pct,
+            steep_terrain_percentage=steep_terrain_pct,
             backscatter_statistics=backscatter_stats,
             incidence_angle_range=incidence_range,
-            quality_flags=[]
+            quality_flags=quality_flags
         )
         
         # Build geospatial metadata

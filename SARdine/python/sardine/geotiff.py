@@ -14,8 +14,17 @@ try:
 except ImportError:
     RASTERIO_AVAILABLE = False
 
-def export_geotiff(data, output_path, bounds=None, crs='EPSG:4326', nodata=None, 
-                   compress='lzw', tiled=True, description=None):
+def export_geotiff(
+    data,
+    output_path,
+    bounds=None,
+    crs='EPSG:4326',
+    nodata=None,
+    compress='lzw',
+    tiled=True,
+    description=None,
+    geotransform=None,
+):
     """
     Export a 2D array to GeoTIFF format.
     
@@ -51,12 +60,20 @@ def export_geotiff(data, output_path, bounds=None, crs='EPSG:4326', nodata=None,
     
     height, width = data.shape
     
-    # Create transform from bounds or use identity
-    if bounds is not None:
+    # Create transform from explicit geotransform or bounds
+    if geotransform is not None:
+        if bounds is not None:
+            # Prefer explicit geotransform when both are provided
+            pass
+        if not (isinstance(geotransform, (list, tuple)) and len(geotransform) == 6):
+            raise ValueError("geotransform must be a 6-tuple/list: (ulx, xres, xskew, uly, yskew, yres)")
+        transform = rasterio.Affine.from_gdal(*geotransform)
+    elif bounds is not None:
         west, south, east, north = bounds
         transform = from_bounds(west, south, east, north, width, height)
     else:
-        transform = rasterio.transform.from_origin(0, height, 1, 1)
+        # Scientific mode: refuse to write without real georeferencing
+        raise ValueError("GeoTIFF export requires either 'geotransform' or 'bounds'. Placeholders are not allowed.")
     
     # Setup profile
     profile = {
@@ -84,8 +101,17 @@ def export_geotiff(data, output_path, bounds=None, crs='EPSG:4326', nodata=None,
     
     return output_path
 
-def export_cog(data, output_path, bounds=None, crs='EPSG:4326', nodata=None,
-               compress='lzw', description=None, overviews=True):
+def export_cog(
+    data,
+    output_path,
+    bounds=None,
+    crs='EPSG:4326',
+    nodata=None,
+    compress='lzw',
+    description=None,
+    overviews=True,
+    geotransform=None,
+):
     """
     Export a 2D array to Cloud Optimized GeoTIFF (COG) format.
     
@@ -121,12 +147,18 @@ def export_cog(data, output_path, bounds=None, crs='EPSG:4326', nodata=None,
     
     height, width = data.shape
     
-    # Create transform from bounds or use identity
-    if bounds is not None:
+    # Create transform from explicit geotransform or bounds
+    if geotransform is not None:
+        if bounds is not None:
+            pass
+        if not (isinstance(geotransform, (list, tuple)) and len(geotransform) == 6):
+            raise ValueError("geotransform must be a 6-tuple/list: (ulx, xres, xskew, uly, yskew, yres)")
+        transform = rasterio.Affine.from_gdal(*geotransform)
+    elif bounds is not None:
         west, south, east, north = bounds
         transform = from_bounds(west, south, east, north, width, height)
     else:
-        transform = rasterio.transform.from_origin(0, height, 1, 1)
+        raise ValueError("COG export requires either 'geotransform' or 'bounds'. Placeholders are not allowed.")
     
     # COG-optimized profile
     profile = {
@@ -161,8 +193,17 @@ def export_cog(data, output_path, bounds=None, crs='EPSG:4326', nodata=None,
     
     return output_path
 
-def export_multiband_geotiff(data_list, output_path, band_names=None, bounds=None, 
-                            crs='EPSG:4326', nodata=None, compress='lzw', tiled=True):
+def export_multiband_geotiff(
+    data_list,
+    output_path,
+    band_names=None,
+    bounds=None,
+    crs='EPSG:4326',
+    nodata=None,
+    compress='lzw',
+    tiled=True,
+    geotransform=None,
+):
     """
     Export multiple 2D arrays as a multi-band GeoTIFF.
     
@@ -207,12 +248,18 @@ def export_multiband_geotiff(data_list, output_path, band_names=None, bounds=Non
     height, width = first_shape
     num_bands = len(data_list)
     
-    # Create transform from bounds or use identity
-    if bounds is not None:
+    # Create transform from explicit geotransform or bounds
+    if geotransform is not None:
+        if bounds is not None:
+            pass
+        if not (isinstance(geotransform, (list, tuple)) and len(geotransform) == 6):
+            raise ValueError("geotransform must be a 6-tuple/list: (ulx, xres, xskew, uly, yskew, yres)")
+        transform = rasterio.Affine.from_gdal(*geotransform)
+    elif bounds is not None:
         west, south, east, north = bounds
         transform = from_bounds(west, south, east, north, width, height)
     else:
-        transform = rasterio.transform.from_origin(0, height, 1, 1)
+        raise ValueError("GeoTIFF export requires either 'geotransform' or 'bounds'. Placeholders are not allowed.")
     
     # Setup profile
     profile = {
