@@ -230,7 +230,13 @@ impl SlcReader {
         let p = Path::new(file);
         let lf = file.to_ascii_lowercase();
 
-        lf.contains("annotation/calibration/")
+        // Check for annotation/calibration path using components
+        let has_calibration_path = {
+            let mut components: Vec<_> = p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+            components.windows(2).any(|w| w[0] == "annotation" && w[1] == "calibration")
+        };
+
+        has_calibration_path
             && p.extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.eq_ignore_ascii_case("xml"))
@@ -245,7 +251,13 @@ impl SlcReader {
         let p = Path::new(file);
         let lf = file.to_ascii_lowercase();
 
-        lf.contains("annotation/calibration/")
+        // Check for annotation/calibration path using components
+        let has_calibration_path = {
+            let components: Vec<_> = p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+            components.windows(2).any(|w| w[0] == "annotation" && w[1] == "calibration")
+        };
+
+        has_calibration_path
             && p.extension()
                 .and_then(|e| e.to_str())
                 .map(|s| s.eq_ignore_ascii_case("xml"))
@@ -456,8 +468,21 @@ impl SlcReader {
             // Only include main annotation files, exclude calibration, noise, and RFI subdirectories
             if Self::is_annotation_xml(&file) && !file.contains("rfi") {
                 // Additional check: only include files directly in annotation/ directory, not subdirectories
-                let annotation_relative = file.split("annotation/").nth(1).unwrap_or("");
-                if annotation_relative.contains('/') {
+                use std::path::Path;
+                let path = Path::new(&file);
+                // Check if there are subdirectories after 'annotation' component
+                let mut found_annotation = false;
+                let mut has_subdir = false;
+                for comp in path.components() {
+                    if found_annotation && comp.as_os_str() != path.file_name().unwrap_or_default() {
+                        has_subdir = true;
+                        break;
+                    }
+                    if comp.as_os_str().to_str().map(|s| s.to_lowercase() == "annotation").unwrap_or(false) {
+                        found_annotation = true;
+                    }
+                }
+                if has_subdir {
                     // Skip files in subdirectories (like calibration/, noise/, rfi/)
                     continue;
                 }
@@ -893,10 +918,10 @@ impl SlcReader {
             let window = (0, 0);
             let window_size = (width, height);
 
-            // **IMPROVED COMPLEX READ**: Read with explicit type validation
-            // Sentinel-1 SLC uses complex 16-bit integers (CInt16) stored as interleaved i16 pairs
+            // **PROPER COMPLEX READ**: Read complex data directly without width*2 trick
+            // GDAL handles CInt16 internally - we read as i16 and let GDAL give us interleaved data
             let complex_data = band
-                .read_as::<i16>(window, window_size, (width * 2, height), None)
+                .read_as::<i16>(window, window_size, (width, height), None)
                 .map_err(|e| {
                     SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read complex CInt16 data from GDAL band: {}",
@@ -1093,9 +1118,9 @@ impl SlcReader {
             let window = (0, 0);
             let window_size = (width, height);
 
-            // **IMPROVED COMPLEX READ**: Sentinel-1 SLC uses complex 16-bit integers (CInt16)
+            // **PROPER COMPLEX READ**: Read complex data directly without width*2 trick
             let complex_data = band
-                .read_as::<i16>(window, window_size, (width * 2, height), None)
+                .read_as::<i16>(window, window_size, (width, height), None)
                 .map_err(|e| {
                     SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read complex CInt16 data from GDAL: {}",
@@ -1975,7 +2000,12 @@ impl SlcReader {
         let mut annotations: HashMap<Polarization, Vec<String>> = HashMap::new();
 
         for file in files {
-            if file.contains("annotation/")
+            // Check for annotation directory using path components
+            let has_annotation = std::path::Path::new(&file)
+                .components()
+                .any(|c| c.as_os_str().to_str().map(|s| s.to_lowercase() == "annotation").unwrap_or(false));
+            
+            if has_annotation
                 && file.ends_with(".xml")
                 && !file.contains("calibration")
             {
@@ -2133,7 +2163,12 @@ impl SlcReader {
         let files = self.list_files()?;
 
         for file in files {
-            if file.contains("annotation/") && file.ends_with(".xml") && file.contains("-iw") {
+            // Check for annotation directory using path components
+            let has_annotation = std::path::Path::new(&file)
+                .components()
+                .any(|c| c.as_os_str().to_str().map(|s| s.to_lowercase() == "annotation").unwrap_or(false));
+            
+            if has_annotation && file.ends_with(".xml") && file.contains("-iw") {
                 return Ok(true);
             }
         }
