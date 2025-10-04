@@ -55,10 +55,13 @@ macro_rules! dbg_clamp {
     }};
 }
 
+/// DEPRECATED: Use crate::types::datetime_to_utc_seconds() instead
+#[deprecated(since = "0.2.2", note = "Use crate::types::datetime_to_utc_seconds() for consistency")]
 #[inline]
 pub fn datetime_to_seconds(dt: DateTime<Utc>) -> f64 {
-    dt.timestamp() as f64 + (dt.timestamp_subsec_nanos() as f64) * 1e-9
+    crate::types::datetime_to_utc_seconds(dt)
 }
+
 use crate::types::{
     BoundingBox, GeoTransform, MaskResult, MaskingWorkflow, OrbitData, SarError, SarResult,
     StateVector, SurfaceNormal,
@@ -1117,9 +1120,16 @@ pub struct RangeDopplerParams {
     pub wavelength: f64,
     /// Speed of light (m/s)
     pub speed_of_light: f64,
-    /// Absolute product start time in seconds (Unix epoch)
+    /// CRITICAL: Orbit reference epoch in seconds since Unix epoch
+    /// All times must be computed relative to this to avoid solver failures
+    pub orbit_ref_epoch_utc: f64,
+    /// Product start time in seconds since orbit_ref_epoch (NOT Unix epoch)
+    pub product_start_rel_s: f64,
+    /// Absolute product start time in seconds (Unix epoch) - for legacy compatibility
+    #[deprecated(since = "0.2.2", note = "Use product_start_rel_s with orbit_ref_epoch_utc")]
     pub product_start_time_abs: f64,
-    /// Absolute product stop time in seconds (Unix epoch)
+    /// Absolute product stop time in seconds (Unix epoch) - for legacy compatibility
+    #[deprecated(since = "0.2.2", note = "Use product_start_rel_s + product_duration")]
     pub product_stop_time_abs: f64,
     /// Total acquisition duration in seconds (stop - start)
     pub product_duration: f64,
@@ -1138,12 +1148,14 @@ pub struct RangeDopplerParams {
 }
 
 impl RangeDopplerParams {
-    /// Create parameters from real annotation data - ONLY way to create parameters
-    /// This prevents accidental use of hardcoded parameters
+    /// Create parameters from real annotation data with orbit vectors
+    /// CRITICAL: Requires orbit vectors to establish orbit_ref_epoch
+    /// This prevents accidental use of hardcoded parameters AND ensures proper time base
     pub fn from_annotation(
         annotation: &crate::io::annotation::AnnotationRoot,
+        orbit_vectors: &[StateVector],
     ) -> crate::types::SarResult<Self> {
-        annotation.extract_range_doppler_params()
+        annotation.extract_range_doppler_params(orbit_vectors)
     }
 }
 
@@ -2399,35 +2411,35 @@ impl TerrainCorrector {
             return None;
         }
 
-        // Scientific azimuth pixel calculation (GRID RELATIVE)
-        // t_rel_grid = t_abs - product_start_time_abs
-        let azimuth_time_from_start = absolute_azimuth_time - params.product_start_time_abs;
+        // CRITICAL FIX: Compute azimuth time relative to product start
+        // Both azimuth_time_rel_orbit and product_start_rel_s are relative to orbit_ref_epoch
+        // So: azimuth_time_from_start = azimuth_time_rel_orbit - product_start_rel_s
+        let azimuth_time_from_start = azimuth_time_rel_orbit - params.product_start_rel_s;
         
-        // CRITICAL DIAGNOSTIC: Check if product_start_time_abs is reasonable
-        let time_since_orbit_ref = params.product_start_time_abs - orbit_ref_epoch;
+        // DIAGNOSTIC: Verify time base consistency
         static DIAG_ONCE: Once = Once::new();
         DIAG_ONCE.call_once(|| {
-            log::error!(
-                "🔍 TIME EPOCH DIAGNOSTIC:\n\
-                   orbit_ref_epoch (abs)   = {:.6}s ({})\n\
-                   product_start_time_abs  = {:.6}s\n\
-                   Δ (product - orbit_ref) = {:.3}s\n\
-                   product_duration        = {:.3}s\n\
-                   Expected product end    = {:.6}s",
-                orbit_ref_epoch,
+            log::info!(
+                "⏱️  TIME BASE DIAGNOSTIC:\n\
+                   orbit_ref_epoch (UTC)     = {:.6}s ({})\n\
+                   product_start_rel_s       = {:.3}s (since orbit_ref_epoch)\n\
+                   product_duration          = {:.3}s\n\
+                   azimuth_time_rel_orbit    = {:.3}s (first point)\n\
+                   azimuth_time_from_start   = {:.3}s (first point)",
+                params.orbit_ref_epoch_utc,
                 orbit_data.reference_time,
-                params.product_start_time_abs,
-                time_since_orbit_ref,
+                params.product_start_rel_s,
                 params.product_duration,
-                params.product_start_time_abs + params.product_duration
+                azimuth_time_rel_orbit,
+                azimuth_time_from_start
             );
         });
         
         // Guard: extremely large relative grid times indicate wrong epoch selection
         if azimuth_time_from_start > 60.0 { // Sentinel-1 IW burst-merged scenes ~25s, full scenes < 30s
             log::error!(
-                "🚨 EPOCH MISMATCH: azimuth_time_from_start={:.3}s (>60s). Likely using wrong time origin (orbit vs grid). orbit_ref_epoch={:.3}, product_start_time_abs={:.3}, rel_orbit_time={:.3}",
-                azimuth_time_from_start, orbit_ref_epoch, params.product_start_time_abs, azimuth_time_rel_orbit
+                "🚨 EPOCH MISMATCH: azimuth_time_from_start={:.3}s (>60s). Check time base: orbit_ref_epoch={:.3}s, product_start_rel={:.3}s, azimuth_rel_orbit={:.3}s",
+                azimuth_time_from_start, params.orbit_ref_epoch_utc, params.product_start_rel_s, azimuth_time_rel_orbit
             );
         }
 
@@ -2446,10 +2458,10 @@ impl TerrainCorrector {
             );
         }
 
-        if azimuth_time_from_start < -5.0 || azimuth_time_from_start > 30.0 {
+        if azimuth_time_from_start < -5.0 || azimuth_time_from_start > params.product_duration + 5.0 {
             log::warn!(
-                "🚨 SUSPICIOUS azimuth timing: {:.6}s (expected 0-25s for this scene)",
-                azimuth_time_from_start
+                "🚨 SUSPICIOUS azimuth timing: {:.6}s (expected 0 to {:.3}s for this scene)",
+                azimuth_time_from_start, params.product_duration
             );
         }
 
@@ -7405,6 +7417,8 @@ mod tests {
         };
 
         // Create parameters with valid bounds
+        let orbit_ref = datetime_to_seconds(now);
+        let product_start = datetime_to_seconds(now);
         let params = RangeDopplerParams {
             range_pixel_spacing: 2.3,
             azimuth_pixel_spacing: 14.0,
@@ -7413,8 +7427,12 @@ mod tests {
             azimuth_time_interval: 0.002055556,
             wavelength: 0.0555,
             speed_of_light: 299792458.0,
-            product_start_time_abs: datetime_to_seconds(now),
-            product_stop_time_abs: datetime_to_seconds(now) + 10.0,
+            orbit_ref_epoch_utc: orbit_ref,      // Test: use same time as orbit ref
+            product_start_rel_s: product_start - orbit_ref,  // Relative time (0.0 for test)
+            #[allow(deprecated)]
+            product_start_time_abs: product_start,
+            #[allow(deprecated)]
+            product_stop_time_abs: product_start + 10.0,
             product_duration: 10.0,
             total_azimuth_lines: Some(10),
             doppler_centroid: None,
@@ -8264,7 +8282,11 @@ impl MetadataFirstTerrainProcessor {
                 )
             })?,
             speed_of_light: crate::constants::SPEED_OF_LIGHT_M_S,
+            orbit_ref_epoch_utc: 0.0, // Default value for MetadataFirst processor (unused in this mode)
+            product_start_rel_s: 0.0,  // Default value for MetadataFirst processor (unused in this mode)
+            #[allow(deprecated)]
             product_start_time_abs: 0.0, // Default value for MetadataFirst processor
+            #[allow(deprecated)]
             product_stop_time_abs: 0.0,
             product_duration: 0.0,
             total_azimuth_lines: None,

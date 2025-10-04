@@ -2307,9 +2307,14 @@ impl ProductRoot {
             .map(|pi| pi.radar_frequency)
     }
 
+    /// Extract Range-Doppler parameters with proper time base
+    /// CRITICAL: Requires orbit vectors to establish orbit_ref_epoch
     pub fn extract_range_doppler_params(
         &self,
+        orbit_vectors: &[StateVector],
     ) -> SarResult<crate::core::terrain_correction::RangeDopplerParams> {
+        // CRITICAL: Derive time bases first to establish orbit_ref_epoch
+        let time_bases = self.derive_time_bases(orbit_vectors)?;
         let (range_ps, az_ps) = self
             .get_pixel_spacing()
             .ok_or_else(|| SarError::Metadata("Missing range/azimuth pixel spacing".to_string()))?;
@@ -2339,52 +2344,28 @@ impl ProductRoot {
                 1.0 / prf
             });
 
-        // Parse product start time (grid epoch)
-        let product_start_time_abs = {
-            // Prefer imageInformation productFirstLineUtcTime, fallback to ads_header.start_time
-            let start_opt = self
-                .image_annotation
-                .as_ref()
-                .and_then(|ia| ia.image_information.as_ref())
-                .and_then(|ii| ii.product_first_line_utc_time.clone())
-                .or_else(|| self.ads_header.as_ref().and_then(|h| h.start_time.clone()));
-            let dt = start_opt
-                .and_then(|s| parse_time_robust(&s))
-                .ok_or_else(|| {
-                    SarError::Metadata(
-                        "Missing product start time for Doppler centroid time base".to_string(),
-                    )
-                })?;
-            let time_seconds = (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9;
-            
-            // CRITICAL VALIDATION: Ensure product start time is reasonable (2000-2100)
-            const Y2000: f64 = 946684800.0;  // 2000-01-01 00:00:00 UTC
-            const Y2100: f64 = 4102444800.0; // 2100-01-01 00:00:00 UTC
-            if time_seconds < Y2000 || time_seconds > Y2100 {
-                return Err(SarError::Metadata(format!(
-                    "Product start time {:.3} ({}) outside reasonable range [2000-2100]",
-                    time_seconds, dt
-                )));
-            }
-            
-            log::debug!("✅ Product start time: {} ({:.3}s since Unix epoch)", dt, time_seconds);
-            time_seconds
+        // CRITICAL: Use time_bases to compute times relative to orbit_ref_epoch
+        let orbit_ref_epoch_utc = (time_bases.orbit_ref_epoch.timestamp() as f64) 
+            + (time_bases.orbit_ref_epoch.timestamp_subsec_nanos() as f64) * 1e-9;
+        
+        let product_start_time_abs = (time_bases.product_start_utc.timestamp() as f64)
+            + (time_bases.product_start_utc.timestamp_subsec_nanos() as f64) * 1e-9;
+        
+        let product_stop_time_abs = if let Some(stop_utc) = time_bases.product_stop_utc {
+            (stop_utc.timestamp() as f64) + (stop_utc.timestamp_subsec_nanos() as f64) * 1e-9
+        } else {
+            product_start_time_abs // fallback: zero duration if missing
         };
-
-        // Parse product stop time (last line)
-        let product_stop_time_abs = {
-            let stop_opt = self
-                .image_annotation
-                .as_ref()
-                .and_then(|ia| ia.image_information.as_ref())
-                .and_then(|ii| ii.product_last_line_utc_time.clone())
-                .or_else(|| self.ads_header.as_ref().and_then(|h| h.stop_time.clone()));
-            let dt = stop_opt.and_then(|s| parse_time_robust(&s));
-            dt.map(|d| (d.timestamp() as f64) + (d.timestamp_subsec_nanos() as f64) * 1e-9)
-                .unwrap_or(product_start_time_abs) // fallback: zero duration if missing
-        };
+        
+        // CRITICAL: Compute product_start_rel_s (seconds since orbit_ref_epoch)
+        let product_start_rel_s = product_start_time_abs - orbit_ref_epoch_utc;
 
         let product_duration = (product_stop_time_abs - product_start_time_abs).max(0.0);
+        
+        log::info!(
+            "⏱️  Time base established: orbit_ref_epoch={:.6}s, product_start_rel={:.3}s, duration={:.3}s",
+            orbit_ref_epoch_utc, product_start_rel_s, product_duration
+        );
 
         // CRITICAL VALIDATION: Ensure product duration is reasonable
         if product_duration < 0.0 || product_duration > 100.0 {
@@ -2455,8 +2436,12 @@ impl ProductRoot {
             azimuth_time_interval,
             wavelength,
             speed_of_light: SPEED_OF_LIGHT_M_S as f64,
-            product_start_time_abs,
-            product_stop_time_abs,
+            orbit_ref_epoch_utc,        // NEW: Orbit reference epoch
+            product_start_rel_s,         // NEW: Time relative to orbit_ref_epoch
+            #[allow(deprecated)]
+            product_start_time_abs,      // DEPRECATED: For legacy compatibility
+            #[allow(deprecated)]
+            product_stop_time_abs,       // DEPRECATED: For legacy compatibility
             product_duration,
             total_azimuth_lines,
             doppler_centroid,

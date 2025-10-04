@@ -3175,6 +3175,22 @@ fn terrain_correction(
         .get("prf")
         .ok_or_else(|| PyValueError::new_err("Missing prf in metadata"))?;
     
+    // Extract orbit reference epoch if provided, otherwise use product start time
+    let orbit_ref_epoch_utc = real_metadata
+        .get("orbit_ref_epoch_utc")
+        .copied()
+        .unwrap_or(product_start_time_abs); // Fallback: use product start as ref epoch
+    
+    // Compute product_start_rel_s (relative to orbit_ref_epoch)
+    let product_start_rel_s = product_start_time_abs - orbit_ref_epoch_utc;
+    
+    let product_stop_time_abs = real_metadata
+        .get("product_stop_time_abs")
+        .copied()
+        .unwrap_or(product_start_time_abs);
+    
+    let product_duration = (product_stop_time_abs - product_start_time_abs).max(0.0);
+    
     let rd_params = crate::core::terrain_correction::RangeDopplerParams {
         range_pixel_spacing: *real_metadata
             .get("range_pixel_spacing")
@@ -3194,15 +3210,13 @@ fn terrain_correction(
             .copied()
             .unwrap_or(1.0 / prf),  // Fallback to 1/PRF if not provided
         speed_of_light: crate::constants::physical::SPEED_OF_LIGHT_M_S,
+        orbit_ref_epoch_utc,        // NEW: Orbit reference epoch
+        product_start_rel_s,         // NEW: Product start relative to orbit_ref_epoch
+        #[allow(deprecated)]
         product_start_time_abs,
-        product_stop_time_abs: real_metadata
-            .get("product_stop_time_abs")
-            .copied()
-            .unwrap_or(product_start_time_abs),
-        product_duration: real_metadata
-            .get("product_stop_time_abs")
-            .map(|stop| (*stop - product_start_time_abs).max(0.0))
-            .unwrap_or(0.0),
+        #[allow(deprecated)]
+        product_stop_time_abs,
+        product_duration,
         total_azimuth_lines: real_metadata
             .get("number_of_lines")
             .map(|v| *v as usize),
