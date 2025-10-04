@@ -1989,19 +1989,37 @@ impl CalibrationCoefficients {
         image_width: usize,
     ) -> SarResult<CalibrationCoordinateMapper> {
         // CRITICAL SCIENTIFIC FIX: No fallback values for LUT boundaries
-        let pmin = self.vectors.iter().flat_map(|v| v.pixels.iter()).cloned().min()
+        let mut pmin = self.vectors.iter().flat_map(|v| v.pixels.iter()).cloned().min()
             .ok_or_else(|| SarError::Processing("No pixel coordinates in calibration vectors - cannot create mapper".to_string()))?
-            as f64;
-        let pmax = self.vectors.iter().flat_map(|v| v.pixels.iter()).cloned().max()
+            as i64;
+        let mut pmax = self.vectors.iter().flat_map(|v| v.pixels.iter()).cloned().max()
             .ok_or_else(|| SarError::Processing("Cannot determine maximum pixel from calibration vectors".to_string()))?
-            as f64;
+            as i64;
 
-        let slc_range_offset = pmin;
-        let slc_range_scale = if image_width > 1 {
-            (pmax - pmin) / (image_width - 1) as f64
-        } else {
-            1.0
-        };
+        // Handle 1-based pixel coordinates (normalize to 0-based)
+        if pmin == 1 {
+            pmin -= 1;
+            pmax -= 1;
+        }
+
+        // Validate non-degenerate span
+        if pmax <= pmin {
+            return Err(SarError::Processing(format!(
+                "Degenerate pixel span: pmax ({}) <= pmin ({})",
+                pmax, pmin
+            )));
+        }
+
+        // Validate image width
+        if image_width <= 1 {
+            return Err(SarError::Processing(format!(
+                "Invalid image width: {} (must be > 1)",
+                image_width
+            )));
+        }
+
+        let slc_range_offset = pmin as f64;
+        let slc_range_scale = (pmax - pmin) as f64 / (image_width - 1) as f64;
 
         log::info!(
             "🔧 AUTO COORDINATE MAPPER: pmin={:.0}, pmax={:.0}, width={}, scale={:.3}",
@@ -2050,23 +2068,29 @@ impl CalibrationCoefficients {
             })
             .collect();
 
+        // PERFORMANCE FIX: O(H log N) binary search instead of O(H·N) linear scan
+        let vector_lines: Vec<i32> = self.vectors.iter().map(|v| v.line).collect();
+        
         let azimuth_brackets = slc_lines
             .iter()
             .map(|&slc_line| {
-                let mut lower = 0usize;
-                let mut upper = self.vectors.len() - 1;
-
-                for (idx, vector) in self.vectors.iter().enumerate() {
-                    if vector.line <= slc_line {
-                        lower = idx;
-                    }
-                    if vector.line >= slc_line {
-                        upper = idx;
-                        break;
+                // Binary search for upper bound (first element >= slc_line)
+                let mut lo = 0usize;
+                let mut hi = vector_lines.len();
+                
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if vector_lines[mid] <= slc_line {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
                     }
                 }
+                
+                let upper = lo.min(vector_lines.len() - 1);
+                let lower = upper.saturating_sub(1);
 
-                if lower == upper {
+                if lower == upper || vector_lines[lower] == vector_lines[upper] {
                     return AzimuthBracketCache {
                         lower,
                         upper,
@@ -2074,18 +2098,14 @@ impl CalibrationCoefficients {
                     };
                 }
 
-                let line1 = self.vectors[lower].line as f32;
-                let line2 = self.vectors[upper].line as f32;
-                let weight = if (line2 - line1).abs() > f32::EPSILON {
-                    (slc_line as f32 - line1) / (line2 - line1)
-                } else {
-                    0.0
-                };
+                let line1 = vector_lines[lower] as f32;
+                let line2 = vector_lines[upper] as f32;
+                let weight = ((slc_line as f32 - line1) / (line2 - line1)).clamp(0.0, 1.0);
 
                 AzimuthBracketCache {
                     lower,
                     upper,
-                    weight: weight.clamp(0.0, 1.0),
+                    weight,
                 }
             })
             .collect::<Vec<_>>();
@@ -2773,16 +2793,13 @@ impl CalibrationCoefficients {
         self.invert_lut_in_place(&mut lut);
 
         // Log final calibrated values for validation
-        if let Some(test_row) = lut
+        let sample = *lut
             .sigma_values
             .row(lut.sigma_values.nrows() / 2)
             .iter()
-            .take(5)
-            .collect::<Vec<_>>()
-            .first()
-        {
-            log::info!("📊 Post-inversion σ⁰ LUT sample: {:.6e} (should be ~1e-3 to 1e-2 for proper land σ⁰)", test_row);
-        }
+            .next()
+            .unwrap_or(&0.0);
+        log::info!("📊 Post-inversion σ⁰ LUT sample: {:.6e} (should be ~1e-3 to 1e-2 for proper land σ⁰)", sample);
 
         lut.is_precomputed = true;
         self.lut = Some(lut);
@@ -3160,7 +3177,8 @@ impl CalibrationCoefficients {
         if after_pixel == before_pixel {
             Ok(values[before_idx])
         } else {
-            let weight = (pixel - before_pixel) as f32 / (after_pixel - before_pixel) as f32;
+            // CRITICAL FIX: Use clamped_pixel for weight to ensure 0 <= weight <= 1
+            let weight = (clamped_pixel - before_pixel) as f32 / (after_pixel - before_pixel) as f32;
             Ok(values[before_idx] * (1.0 - weight) + values[after_idx] * weight)
         }
     }
