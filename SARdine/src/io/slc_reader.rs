@@ -3516,6 +3516,8 @@ mod tests {
   </imageAnnotation>
 
   <swathTiming>
+    <linesPerBurst>1507</linesPerBurst>
+    <samplesPerBurst>21632</samplesPerBurst>
     <burstList count="1">
       <burst>
         <azimuthTime>2020-12-28T21:59:42Z</azimuthTime>

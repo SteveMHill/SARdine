@@ -1602,15 +1602,19 @@ mod tests {
     <missionId>S1A</missionId>
     <absoluteOrbitNumber>30639</absoluteOrbitNumber>
     <missionDataTakeId>123456</missionDataTakeId>
+    <imageNumber>1</imageNumber>
     <startTime>2020-12-28T21:59:42.123456Z</startTime>
   </adsHeader>
   <generalAnnotation>
     <productInformation>
+      <platformHeading>12.34</platformHeading>
+      <rangeSamplingRate>6.4345241e+07</rangeSamplingRate>
       <radarFrequency>5.405000e+09</radarFrequency>
+      <azimuthSteeringRate>1.590368784</azimuthSteeringRate>
       <rangePixelSpacing>2.329560</rangePixelSpacing>
       <azimuthPixelSpacing>13.943035</azimuthPixelSpacing>
     </productInformation>
-    <downlinkInformationList>
+    <downlinkInformationList count="1">
       <downlinkInformation>
         <prf>1710.0</prf>
       </downlinkInformation>
@@ -1625,16 +1629,26 @@ mod tests {
     </imageInformation>
   </imageAnnotation>
   <geolocationGrid>
-    <geolocationGridPointList>
+    <geolocationGridPointList count="2">
       <geolocationGridPoint>
+        <slantRangeTime>0.004</slantRangeTime>
+        <line>0</line>
+        <pixel>0</pixel>
         <latitude>45.0</latitude>
         <longitude>10.0</longitude>
+        <height>0.0</height>
         <incidenceAngle>33.0</incidenceAngle>
+        <elevationAngle>5.0</elevationAngle>
       </geolocationGridPoint>
       <geolocationGridPoint>
+        <slantRangeTime>0.004</slantRangeTime>
+        <line>1</line>
+        <pixel>1</pixel>
         <latitude>45.1</latitude>
         <longitude>10.1</longitude>
+        <height>0.0</height>
         <incidenceAngle>39.0</incidenceAngle>
+        <elevationAngle>6.0</elevationAngle>
       </geolocationGridPoint>
     </geolocationGridPointList>
   </geolocationGrid>
