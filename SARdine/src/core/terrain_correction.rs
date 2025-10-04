@@ -352,12 +352,12 @@ impl TerrainCorrectionConfig {
                 let elevation_margin = (dem_max - dem_min) * 0.1;
                 let calculated_min = dem_min - elevation_margin - 50.0;
                 let calculated_max = dem_max + elevation_margin + 100.0;
-                log::error!("🔍 ELEVATION BOUNDS DEBUG: dem_min={:.1}, dem_max={:.1}, margin={:.1}", dem_min, dem_max, elevation_margin);
-                log::error!("🔍 ELEVATION BOUNDS DEBUG: calculated_min={:.1}, calculated_max={:.1}", calculated_min, calculated_max);
+                log::debug!("🔍 ELEVATION BOUNDS DEBUG: dem_min={:.1}, dem_max={:.1}, margin={:.1}", dem_min, dem_max, elevation_margin);
+                log::debug!("🔍 ELEVATION BOUNDS DEBUG: calculated_min={:.1}, calculated_max={:.1}", calculated_min, calculated_max);
                 (calculated_min, calculated_max)
             }
             None => {
-                log::error!("🔍 ELEVATION BOUNDS DEBUG: Using global defaults: min=-11000.0, max=9000.0");
+                log::debug!("🔍 ELEVATION BOUNDS DEBUG: Using global defaults: min=-11000.0, max=9000.0");
                 // Global conservative defaults from WGS84 ellipsoid extremes
                 (-11000.0, 9000.0) // Mariana Trench to Everest with margin
             }
@@ -377,7 +377,7 @@ impl TerrainCorrectionConfig {
             tie_point_stride: 64,
         };
         
-        log::error!("🔍 FINAL CONFIG DEBUG: min_valid_elevation={:.1}, max_valid_elevation={:.1}", 
+        log::debug!("🔍 FINAL CONFIG DEBUG: min_valid_elevation={:.1}, max_valid_elevation={:.1}", 
                    config.min_valid_elevation, config.max_valid_elevation);
         
         config
@@ -1200,7 +1200,7 @@ impl TerrainCorrector {
         };
 
         // Calculate DEM elevation statistics for proper configuration
-        log::error!("🔍 STARTING DEM statistics calculation in TerrainCorrector::new");
+        log::debug!("🔍 STARTING DEM statistics calculation in TerrainCorrector::new");
         let mut dem_min = f32::INFINITY;
         let mut dem_max = f32::NEG_INFINITY;
         let mut value_count = 0;
@@ -1217,7 +1217,7 @@ impl TerrainCorrector {
             }
         }
         
-        log::error!("🔍 DEM STATS: count={}, min={:.1}, max={:.1}, first_values={:?}", 
+        log::debug!("🔍 DEM STATS: count={}, min={:.1}, max={:.1}, first_values={:?}", 
                    value_count, dem_min, dem_max, first_values);
         let dem_stats = if dem_min.is_finite() && dem_max.is_finite() && dem_min <= dem_max {
             // Ensure minimum range for single-value DEMs
@@ -2263,7 +2263,7 @@ impl TerrainCorrector {
         orbit_data: &OrbitData,
         params: &RangeDopplerParams,
     ) -> Option<(usize, usize)> {
-        log::error!("🔍 RD TRANSFORM START: lat={:.6}, lon={:.6}, elevation={:.1}", lat, lon, elevation);
+        log::trace!("🔍 RD TRANSFORM START: lat={:.6}, lon={:.6}, elevation={:.1}", lat, lon, elevation);
         // Inline bounds diagnostics (non-panicking) to surface any inverted logic earlier upstream.
         let diag_bounds = |min_v: f64, max_v: f64, label: &str| {
             if min_v > max_v {
@@ -2287,15 +2287,15 @@ impl TerrainCorrector {
             return None;
         }
 
-        log::error!("🔍 RD TRANSFORM: About to call latlon_to_ecef");
+        log::trace!("🔍 RD TRANSFORM: About to call latlon_to_ecef");
         // TEMPORARY CLAMP TRAP: Check if we're about to call a function that does problematic clamp
         if (elevation - 60.0).abs() < 0.1 {
-            log::error!("🚨 CLAMP TRAP: About to process elevation 60.0 - watching for clamp calls");
+            log::debug!("🚨 CLAMP TRAP: About to process elevation 60.0 - watching for clamp calls");
         }
         
         // Convert lat/lon/elevation to ECEF coordinates
         let target_ecef = self.latlon_to_ecef(lat, lon, elevation);
-        log::error!("🔍 RD TRANSFORM: latlon_to_ecef returned: [{:.1}, {:.1}, {:.1}]", 
+        log::trace!("🔍 RD TRANSFORM: latlon_to_ecef returned: [{:.1}, {:.1}, {:.1}]", 
                    target_ecef[0], target_ecef[1], target_ecef[2]);
 
         // Validate ECEF coordinates
@@ -2593,7 +2593,7 @@ impl TerrainCorrector {
 
         // Physical validation based on sensor parameters
         // TRIAGE LOG (before bounds check) – verifies correct time origin usage for azimuth indexing
-        log::error!(
+        log::trace!(
             "grid map: t_abs={:.6}, t_rel_grid={:.6}, prf={:.3}, az_idx={:.1}, max={}",
             absolute_azimuth_time,
             azimuth_time_grid,
@@ -2693,7 +2693,7 @@ impl TerrainCorrector {
                 "Seed time {:.2} outside safe orbit bounds [{:.2}, {:.2}], clamping",
                 best_time, min_orbit_time, max_orbit_time
             );
-            log::error!("🔍 CLAMP DEBUG #1: best_time.clamp({:.1}, {:.1})", min_orbit_time, max_orbit_time);
+            log::trace!("🔍 CLAMP DEBUG #1: best_time.clamp({:.1}, {:.1})", min_orbit_time, max_orbit_time);
             best_time = diag_clamp(best_time, min_orbit_time, max_orbit_time, "best_time");
         }
 
@@ -2715,7 +2715,7 @@ impl TerrainCorrector {
                     "Newton-Raphson: clamping time {:.2} to [{:.2}, {:.2}] (with {:.1}s margin)",
                     azimuth_time, min_orbit_time, max_orbit_time, margin
                 );
-                log::error!("🔍 CLAMP DEBUG #2: azimuth_time.clamp({:.1}, {:.1})", min_orbit_time - margin, max_orbit_time + margin);
+                log::trace!("🔍 CLAMP DEBUG #2: azimuth_time.clamp({:.1}, {:.1})", min_orbit_time - margin, max_orbit_time + margin);
                 azimuth_time = diag_clamp(azimuth_time, min_orbit_time - margin, max_orbit_time + margin, "azimuth_time_iter");
             }
             // Convert relative time to absolute time for orbit interpolation
@@ -2991,7 +2991,7 @@ impl TerrainCorrector {
             let mut doppler_derivative = if let Some(derivative) = doppler_derivative {
                 derivative
             } else {
-                log::error!("🔍 All derivative attempts failed - no finite derivative found");
+                log::warn!("🔍 All derivative attempts failed - no finite derivative found");
                 0.0
             };
 
@@ -3052,10 +3052,10 @@ impl TerrainCorrector {
                     time_update,
                     dbg_clamp!("time_update_preview", time_update, -MAX_TIME_STEP, MAX_TIME_STEP)
                 );
-                log::error!("🔍 CLAMP DEBUG #3: time_update.clamp({:.1}, {:.1})", -MAX_TIME_STEP, MAX_TIME_STEP);
+                log::trace!("🔍 CLAMP DEBUG #3: time_update.clamp({:.1}, {:.1})", -MAX_TIME_STEP, MAX_TIME_STEP);
             }
 
-            log::error!("🔍 CLAMP DEBUG #4: time_update.clamp({:.1}, {:.1})", -MAX_TIME_STEP, MAX_TIME_STEP);
+            log::trace!("🔍 CLAMP DEBUG #4: time_update.clamp({:.1}, {:.1})", -MAX_TIME_STEP, MAX_TIME_STEP);
             let time_update = dbg_clamp!("time_update", time_update, -MAX_TIME_STEP, MAX_TIME_STEP);
             let previous_time_snapshot = azimuth_time;
 
@@ -5139,7 +5139,7 @@ impl TerrainCorrector {
                 let max_slant_range = 1_500_000.0; // 1500 km (extended for our test)
 
                 // Normalize slant range to 0-1 range
-                log::error!("🔍 CLAMP DEBUG #5: range_normalized.clamp({:.1}, {:.1})", 0.0, 1.0);
+                log::trace!("🔍 CLAMP DEBUG #5: range_normalized.clamp({:.1}, {:.1})", 0.0, 1.0);
                 let range_normalized = diag_clamp(
                     (slant_range - min_slant_range) / (max_slant_range - min_slant_range),
                     0.0,
@@ -5152,7 +5152,7 @@ impl TerrainCorrector {
                 let max_time = 80.0; // Based on our 9-vector orbit span
                 let time_normalized =
                     {
-                        log::error!("🔍 CLAMP DEBUG #6: time_normalized.clamp({:.1}, {:.1})", 0.0, 1.0);
+                        log::trace!("🔍 CLAMP DEBUG #6: time_normalized.clamp({:.1}, {:.1})", 0.0, 1.0);
                         diag_clamp((zero_doppler_time - min_time) / (max_time - min_time), 0.0, 1.0, "time_normalized")
                     };
 
@@ -6067,7 +6067,7 @@ impl TerrainCorrector {
         let scale = cos_ref / cos_lia.max(eps);
 
         // Clamp scale to reasonable range for stability
-    log::error!("🔍 CLAMP DEBUG #7: scale.clamp({:.1}, {:.1})", 0.1, 10.0);
+    log::trace!("🔍 CLAMP DEBUG #7: scale.clamp({:.1}, {:.1})", 0.1, 10.0);
     dbg_clamp!("rtc_scale", scale, 0.1, 10.0) as f32
     }
 
@@ -6186,7 +6186,7 @@ impl TerrainCorrector {
         enable_spatial_cache: bool,
         chunk_size: Option<usize>,
     ) -> SarResult<(Array2<f32>, GeoTransform)> {
-        log::error!("🔍 DIAGNOSTIC: Ultra-optimized terrain correction starting...");
+        log::debug!("🔍 DIAGNOSTIC: Ultra-optimized terrain correction starting...");
         log::error!(
             "📊 Input: {}x{} array, interpolation: {:?}",
             sar_image.nrows(),
@@ -6202,7 +6202,7 @@ impl TerrainCorrector {
         );
 
         // CRITICAL: Validate all parameters for NaN/infinite values
-        log::error!("🔍 PARAMETER VALIDATION:");
+        log::debug!("🔍 PARAMETER VALIDATION:");
         log::error!(
             "   range_spacing: {}, finite: {}",
             params.range_pixel_spacing,
@@ -6331,7 +6331,7 @@ impl TerrainCorrector {
                                    (global_i < 5 && global_j < 5);
                     
                     if should_log {
-                        log::error!("🔍 TERRAIN CORRECTION DEBUG: Processing pixel ({},{}) -> map_coords({:.6},{:.6})", 
+                        log::trace!("🔍 TERRAIN CORRECTION DEBUG: Processing pixel ({},{}) -> map_coords({:.6},{:.6})", 
                                  global_i, global_j, map_x, map_y);
                     }
                     
@@ -6353,7 +6353,7 @@ impl TerrainCorrector {
                                     
                                     // CRITICAL DEBUG: Log just before range-doppler call to trace clamp panic
                                     if should_log {
-                                        log::error!("🔍 About to call scientific_range_doppler_transformation with elevation={:.1}m", elevation);
+                                        log::trace!("🔍 About to call scientific_range_doppler_transformation with elevation={:.1}m", elevation);
                                     }
                                     
                                     // Find corresponding SAR pixel using TEXTBOOK range-doppler
