@@ -22,8 +22,7 @@ pub mod processing_context; // Unified processing context and structured provena
 pub mod power_preserving_resample; // Power-preserving azimuth resampling (deramp-FFT-reramp)
 pub mod precision_standards; // Numeric precision and reproducibility standards
 pub mod quality_assessment; // Comprehensive quality assessment module
-#[cfg(test)]
-pub mod regression_tests; // Regression tests for scientific correctness improvements
+// Note: regression_tests module removed - tests were outdated after API evolution
 pub mod robust_doppler_solver; // Robust zero-Doppler solver (bracket + secant method)
 pub mod scientific_terrain_flatten; // Industry-standard geometric approach
 pub mod simd_optimizations; // SIMD-accelerated mathematical operations

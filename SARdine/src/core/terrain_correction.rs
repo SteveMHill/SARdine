@@ -1784,7 +1784,7 @@ impl TerrainCorrector {
                                 )
                             {
                                 // Check if SAR pixel is within image bounds
-                                if sar_range < sar_image.dim().1 && sar_azimuth < sar_image.dim().0
+                                if sar_range < sar_image.dim().1 as f64 && sar_azimuth < sar_image.dim().0 as f64
                                 {
                                     // Bilinear interpolation from SAR image
                                     let value = self.bilinear_interpolate_unified(
@@ -2055,7 +2055,7 @@ impl TerrainCorrector {
                             coord_successes += 1;
                             // TIMING: Fast bilinear interpolation
                             let interp_start = Instant::now();
-                            if sar_x < sar_image.ncols() && sar_y < sar_image.nrows() {
+                            if sar_x < sar_image.ncols() as f64 && sar_y < sar_image.nrows() as f64 {
                                 interp_attempts += 1;
                                 let interpolated_value = self.bilinear_interpolate_unified(
                                     sar_image,
@@ -2198,7 +2198,7 @@ impl TerrainCorrector {
                     if let Some((sar_x, sar_y)) = self.scientific_range_doppler_transformation(
                         lat, lon, elevation, orbit_data, params,
                     ) {
-                        if sar_x < sar_image.ncols() && sar_y < sar_image.nrows() {
+                        if sar_x < sar_image.ncols() as f64 && sar_y < sar_image.nrows() as f64 {
                             let interpolated_value = self.bilinear_interpolate_unified(
                                 sar_image,
                                 sar_x as f64,
@@ -2255,6 +2255,10 @@ impl TerrainCorrector {
     /// Based on standard SAR processing literature (Cumming & Wong, 2005)
     /// Implements proper Newton-Raphson zero-Doppler time calculation
     /// and parameter-driven coordinate validation
+    /// Scientific Range-Doppler coordinate transformation
+    /// Based on standard SAR processing literature (Cumming & Wong, 2005)
+    /// 
+    /// FIXED: Returns continuous (f64, f64) coordinates to preserve sub-pixel precision
     fn scientific_range_doppler_transformation(
         &self,
         lat: f64,
@@ -2262,7 +2266,7 @@ impl TerrainCorrector {
         elevation: f64,
         orbit_data: &OrbitData,
         params: &RangeDopplerParams,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<(f64, f64)> {
         log::trace!("🔍 RD TRANSFORM START: lat={:.6}, lon={:.6}, elevation={:.1}", lat, lon, elevation);
         // Inline bounds diagnostics (non-panicking) to surface any inverted logic earlier upstream.
         let diag_bounds = |min_v: f64, max_v: f64, label: &str| {
@@ -2619,7 +2623,8 @@ impl TerrainCorrector {
                 range_pixel,
                 azimuth_pixel
             );
-            Some((range_pixel.round() as usize, azimuth_pixel.round() as usize))
+            // FIXED: Return continuous coordinates for sub-pixel precision
+            Some((range_pixel, azimuth_pixel))
         } else {
             // Don't completely fail on large coordinates - log warning and return None
             log::warn!(
@@ -6387,8 +6392,8 @@ impl TerrainCorrector {
                                                          lat, lon, elevation, sar_range, sar_azimuth);
                                             }
                                             
-                                            // Check bounds - now using usize
-                                            if sar_range < sar_image.dim().1 && sar_azimuth < sar_image.dim().0 {
+                                            // Check bounds
+                                            if sar_range < sar_image.dim().1 as f64 && sar_azimuth < sar_image.dim().0 as f64 {
                                                 // Apply selected interpolation method
                                                 let value = self.interpolate_sar_value(
                                                     sar_image, 
