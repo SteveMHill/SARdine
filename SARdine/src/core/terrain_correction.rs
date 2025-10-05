@@ -2143,40 +2143,9 @@ impl TerrainCorrector {
         Ok((chunk_data, valid_count))
     }
 
-    /// ⚠️  DEPRECATED: Use bilinear_interpolate_unified() instead
-    ///
-    /// This function had relaxed bounds checking that differed from the standard implementation.
-    /// The unified version provides consistent behavior across all interpolation use cases.
-    fn bilinear_interpolate_fast(&self, sar_image: &Array2<f32>, x: f64, y: f64) -> f32 {
-        // Redirect to unified implementation for consistency
-        self.bilinear_interpolate_unified(sar_image, x, y)
-    }
 
-    /// Legacy row-based processing (kept for compatibility)
-    fn process_row_chunk_optimized(
-        &self,
-        sar_image: &Array2<f32>,
-        orbit_data: &OrbitData,
-        params: &RangeDopplerParams,
-        output_transform: &GeoTransform,
-        orbit_lut: &HashMap<u64, StateVector>,
-        start_row: usize,
-        end_row: usize,
-        output_width: usize,
-    ) -> SarResult<(Array2<f32>, usize)> {
-        // Use 2D tile processing for better cache performance
-        self.process_tile_chunk_optimized(
-            sar_image,
-            orbit_data,
-            params,
-            output_transform,
-            orbit_lut,
-            start_row,
-            end_row,
-            0,
-            output_width,
-        )
-    }
+
+
 
     /// Scientific Range-Doppler coordinate transformation
     /// Based on standard SAR processing literature (Cumming & Wong, 2005)
@@ -3438,52 +3407,7 @@ impl TerrainCorrector {
         result as f32
     }
 
-    /// ⚠️  DEPRECATED: Use bilinear_interpolate_unified() instead
-    ///
-    /// This function uses inconsistent floor() vs round() with other parts of the codebase
-    /// and will be removed in future versions.
-    fn bilinear_interpolate(&self, image: &Array2<f32>, x: f64, y: f64) -> f32 {
-        let (height, width) = image.dim();
 
-        // Ensure coordinates are within valid range
-        if x < 0.0 || y < 0.0 || x >= (width as f64) || y >= (height as f64) {
-            return f32::NAN;
-        }
-
-        let x1 = x.floor() as usize;
-        let y1 = y.floor() as usize;
-
-        // Ensure all indices are within bounds
-        if x1 >= width || y1 >= height {
-            return f32::NAN;
-        }
-
-        let x2 = (x1 + 1).min(width - 1);
-        let y2 = (y1 + 1).min(height - 1);
-
-        // Double-check bounds before array access
-        if x2 >= width || y2 >= height {
-            return f32::NAN;
-        }
-
-        let dx = x - x1 as f64;
-        let dy = y - y1 as f64;
-
-        // Safe array access with bounds checking
-        let v11 = image[[y1, x1]];
-        let v12 = image[[y2, x1]];
-        let v21 = image[[y1, x2]];
-        let v22 = image[[y2, x2]];
-
-        // Check for NaN values
-        if v11.is_nan() || v12.is_nan() || v21.is_nan() || v22.is_nan() {
-            return f32::NAN;
-        }
-
-        let v1 = v11 * (1.0 - dx as f32) + v21 * dx as f32;
-        let v2 = v12 * (1.0 - dx as f32) + v22 * dx as f32;
-        v1 * (1.0 - dy as f32) + v2 * dy as f32
-    }
 
 
 
@@ -4042,15 +3966,7 @@ impl TerrainCorrector {
         Ok(relative_time)
     }
 
-    /// Legacy UTM transformation (kept for compatibility)
-    ///
-    /// ⚠️  DEPRECATED: Use enhanced_geographic_to_utm() for new code
-    /// This version lacks proper error checking and numerical accuracy
-    fn geographic_to_utm(&self, lon: f64, lat: f64, epsg_code: u32) -> SarResult<(f64, f64)> {
-        // Convert to LatLon and delegate to enhanced version
-        let coords = LatLon::new(lat, lon)?;
-        self.enhanced_geographic_to_utm(coords, epsg_code)
-    }
+
 
     /// Placeholder for future GDAL/PROJ integration
     ///
@@ -6514,7 +6430,7 @@ impl TerrainCorrector {
                     f32::NAN
                 }
             }
-            InterpolationMethod::Bilinear => self.bilinear_interpolate(sar_image, x, y),
+            InterpolationMethod::Bilinear => self.bilinear_interpolate_unified(sar_image, x, y),
             InterpolationMethod::Bicubic => self.bicubic_interpolate(sar_image, x, y),
             InterpolationMethod::Sinc => self.sinc_interpolate(sar_image, x, y),
             InterpolationMethod::Lanczos => self.lanczos_interpolate(sar_image, x, y),
