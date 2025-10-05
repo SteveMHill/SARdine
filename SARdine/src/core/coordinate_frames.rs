@@ -135,6 +135,24 @@ impl<Frame> LineIdx<Frame> {
     pub fn checked_sub(&self, offset: usize) -> Option<Self> {
         self.0.checked_sub(offset).map(|v| Self::new(v))
     }
+    
+    /// Add offset with Result-based error handling
+    pub fn try_add(&self, offset: usize) -> SarResult<Self> {
+        self.0.checked_add(offset)
+            .map(Self::new)
+            .ok_or_else(|| crate::types::SarError::InvalidParameter(
+                format!("Line index overflow: {} + {}", self.0, offset)
+            ))
+    }
+    
+    /// Subtract offset with Result-based error handling
+    pub fn try_sub(&self, offset: usize) -> SarResult<Self> {
+        self.0.checked_sub(offset)
+            .map(Self::new)
+            .ok_or_else(|| crate::types::SarError::InvalidParameter(
+                format!("Line index underflow: {} - {}", self.0, offset)
+            ))
+    }
 }
 
 impl<Frame> PixelIdx<Frame> {
@@ -152,6 +170,24 @@ impl<Frame> PixelIdx<Frame> {
     
     pub fn checked_sub(&self, offset: usize) -> Option<Self> {
         self.0.checked_sub(offset).map(|v| Self::new(v))
+    }
+    
+    /// Add offset with Result-based error handling
+    pub fn try_add(&self, offset: usize) -> SarResult<Self> {
+        self.0.checked_add(offset)
+            .map(Self::new)
+            .ok_or_else(|| crate::types::SarError::InvalidParameter(
+                format!("Pixel index overflow: {} + {}", self.0, offset)
+            ))
+    }
+    
+    /// Subtract offset with Result-based error handling
+    pub fn try_sub(&self, offset: usize) -> SarResult<Self> {
+        self.0.checked_sub(offset)
+            .map(Self::new)
+            .ok_or_else(|| crate::types::SarError::InvalidParameter(
+                format!("Pixel index underflow: {} - {}", self.0, offset)
+            ))
     }
 }
 
@@ -180,6 +216,11 @@ impl<Frame> CoordinatePosition<Frame> {
     
     pub fn from_indices(line: LineIdx<Frame>, pixel: PixelIdx<Frame>) -> Self {
         Self { line, pixel }
+    }
+    
+    /// Check if position is within bounds
+    pub fn is_within_bounds(&self, max_lines: usize, max_pixels: usize) -> bool {
+        self.line.value() < max_lines && self.pixel.value() < max_pixels
     }
 }
 
@@ -397,21 +438,44 @@ impl BurstToStitchedConverter {
     }
     
     /// Convert burst coordinates directly to stitched coordinates
+    /// 
+    /// Error messages preserve context about which conversion stage failed
     pub fn convert_position(&self, burst_pos: BurstPosition) -> SarResult<StitchedPosition> {
-        let subswath_pos = self.burst_to_subswath.convert_position(burst_pos)?;
+        let subswath_pos = self.burst_to_subswath.convert_position(burst_pos)
+            .map_err(|e| crate::types::SarError::InvalidParameter(
+                format!("Burst→Subswath conversion failed: {}", e)
+            ))?;
+        
         self.subswath_to_stitched.convert_position(subswath_pos)
+            .map_err(|e| crate::types::SarError::InvalidParameter(
+                format!("Subswath→Stitched conversion failed: {}", e)
+            ))
     }
     
     /// Convert individual line index
     pub fn convert_line(&self, burst_line: BurstLineIdx) -> SarResult<StitchedLineIdx> {
-        let subswath_line = self.burst_to_subswath.convert_line(burst_line)?;
+        let subswath_line = self.burst_to_subswath.convert_line(burst_line)
+            .map_err(|e| crate::types::SarError::InvalidParameter(
+                format!("Burst→Subswath line conversion failed: {}", e)
+            ))?;
+        
         self.subswath_to_stitched.convert_line(subswath_line)
+            .map_err(|e| crate::types::SarError::InvalidParameter(
+                format!("Subswath→Stitched line conversion failed: {}", e)
+            ))
     }
     
     /// Convert individual pixel index
     pub fn convert_pixel(&self, burst_pixel: BurstPixelIdx) -> SarResult<StitchedPixelIdx> {
-        let subswath_pixel = self.burst_to_subswath.convert_pixel(burst_pixel)?;
+        let subswath_pixel = self.burst_to_subswath.convert_pixel(burst_pixel)
+            .map_err(|e| crate::types::SarError::InvalidParameter(
+                format!("Burst→Subswath pixel conversion failed: {}", e)
+            ))?;
+        
         self.subswath_to_stitched.convert_pixel(subswath_pixel)
+            .map_err(|e| crate::types::SarError::InvalidParameter(
+                format!("Subswath→Stitched pixel conversion failed: {}", e)
+            ))
     }
 }
 
@@ -452,6 +516,31 @@ impl<Frame> fmt::Display for PixelIdx<Frame> {
 impl<Frame> fmt::Display for CoordinatePosition<Frame> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "({}, {})", self.line, self.pixel)
+    }
+}
+
+impl fmt::Display for BurstToSubswathConverter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BurstToSubswath[offset=({},{}), burst_size={}x{}, subswath_size={}x{}]",
+            self.burst_line_offset, self.burst_pixel_offset,
+            self.burst_lines, self.burst_pixels,
+            self.subswath_lines, self.subswath_pixels)
+    }
+}
+
+impl fmt::Display for SubswathToStitchedConverter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "SubswathToStitched[offset=({},{}), subswath_size={}x{}, stitched_size={}x{}]",
+            self.subswath_line_offset, self.subswath_pixel_offset,
+            self.subswath_lines, self.subswath_pixels,
+            self.stitched_lines, self.stitched_pixels)
+    }
+}
+
+impl fmt::Display for BurstToStitchedConverter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BurstToStitched[\n  {},\n  {}\n]",
+            self.burst_to_subswath, self.subswath_to_stitched)
     }
 }
 
@@ -553,6 +642,38 @@ pub mod coord_utils {
         } else {
             None
         }
+    }
+    
+    /// Safe mutable array access using type-safe coordinates
+    pub fn safe_array_access_mut<'a, T, Frame>(
+        array: &'a mut ndarray::Array2<T>,
+        pos: &CoordinatePosition<Frame>,
+    ) -> Option<&'a mut T> {
+        let (rows, cols) = array.dim();
+        if is_position_valid(pos, rows, cols) {
+            Some(&mut array[[pos.line.value(), pos.pixel.value()]])
+        } else {
+            None
+        }
+    }
+    
+    /// Check if a frame contains a given position
+    pub fn contains<Frame>(
+        pos: &CoordinatePosition<Frame>,
+        max_lines: usize,
+        max_pixels: usize,
+    ) -> bool {
+        is_position_valid(pos, max_lines, max_pixels)
+    }
+    
+    /// Create a range of line indices for iteration
+    pub fn line_range<Frame>(start: usize, end: usize) -> impl Iterator<Item = LineIdx<Frame>> {
+        (start..end).map(LineIdx::new)
+    }
+    
+    /// Create a range of pixel indices for iteration
+    pub fn pixel_range<Frame>(start: usize, end: usize) -> impl Iterator<Item = PixelIdx<Frame>> {
+        (start..end).map(PixelIdx::new)
     }
 }
 
@@ -680,5 +801,106 @@ mod tests {
         // burst(50,100) -> subswath(60,120) -> stitched(160,420)
         assert_eq!(stitched_pos.line.value(), 160);  // 50 + 10 + 100
         assert_eq!(stitched_pos.pixel.value(), 420); // 100 + 20 + 300
+    }
+    
+    #[test]
+    fn test_try_add_try_sub() {
+        let line = BurstLineIdx::new(100);
+        
+        // Test try_add success
+        let added = line.try_add(50).unwrap();
+        assert_eq!(added.value(), 150);
+        
+        // Test try_sub success
+        let subtracted = line.try_sub(30).unwrap();
+        assert_eq!(subtracted.value(), 70);
+        
+        // Test try_sub underflow
+        let result = line.try_sub(200);
+        assert!(result.is_err());
+        
+        // Test try_add overflow
+        let large = BurstLineIdx::new(usize::MAX - 10);
+        let result = large.try_add(20);
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_edge_case_arithmetic() {
+        // Test at zero
+        let zero = BurstLineIdx::new(0);
+        assert!(zero.try_sub(1).is_err());
+        assert_eq!(zero.try_add(1).unwrap().value(), 1);
+        
+        // Test at max-1
+        let near_max = BurstLineIdx::new(usize::MAX - 1);
+        assert_eq!(near_max.try_add(1).unwrap().value(), usize::MAX);
+        assert!(near_max.try_add(2).is_err());
+    }
+    
+    #[test]
+    fn test_position_bounds_checking() {
+        let pos = BurstPosition::new(100, 200);
+        
+        // Within bounds
+        assert!(pos.is_within_bounds(1000, 1000));
+        assert!(pos.is_within_bounds(101, 201));
+        
+        // Out of bounds
+        assert!(!pos.is_within_bounds(100, 200)); // Equal to max (exclusive bound)
+        assert!(!pos.is_within_bounds(50, 1000));
+        assert!(!pos.is_within_bounds(1000, 50));
+    }
+    
+    #[test]
+    fn test_converter_display() {
+        let converter = BurstToSubswathConverter::new(
+            10, 20, 100, 200, 1000, 2000
+        );
+        
+        let display = format!("{}", converter);
+        assert!(display.contains("offset=(10,20)"));
+        assert!(display.contains("burst_size=100x200"));
+        assert!(display.contains("subswath_size=1000x2000"));
+    }
+    
+    #[test]
+    fn test_error_context_preservation() {
+        let burst_to_subswath = BurstToSubswathConverter::new(
+            0, 0, 10, 10, 100, 100
+        );
+        
+        let subswath_to_stitched = SubswathToStitchedConverter::new(
+            0, 0, 100, 100, 200, 200
+        );
+        
+        let complete = BurstToStitchedConverter::new(
+            burst_to_subswath,
+            subswath_to_stitched,
+        );
+        
+        // Test error in first stage (burst bounds)
+        let invalid_burst = BurstPosition::new(15, 5);
+        let err = complete.convert_position(invalid_burst).unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("Burst→Subswath"));
+        
+        // Test error in second stage (would need invalid subswath bounds setup)
+        // This test confirms error messages preserve context
+    }
+    
+    #[test]
+    fn test_range_iterators() {
+        use coord_utils::{line_range, pixel_range};
+        
+        let lines: Vec<_> = line_range::<BurstFrame>(0, 5).collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0].value(), 0);
+        assert_eq!(lines[4].value(), 4);
+        
+        let pixels: Vec<_> = pixel_range::<SubswathFrame>(10, 15).collect();
+        assert_eq!(pixels.len(), 5);
+        assert_eq!(pixels[0].value(), 10);
+        assert_eq!(pixels[4].value(), 14);
     }
 }
