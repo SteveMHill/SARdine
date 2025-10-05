@@ -8,6 +8,27 @@ use crate::core::type_safe_units::{Seconds, Hertz};
 use std::collections::HashMap;
 
 // ============================================================================
+// OUT-OF-RANGE POLICY
+// ============================================================================
+
+/// Policy for handling azimuth times outside valid range
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutOfRangePolicy {
+    /// Return error for out-of-range times (strict, recommended)
+    Error,
+    /// Clamp to nearest valid time
+    Clamp,
+    /// Use nearest burst polynomial (extrapolate)
+    NearestBurst,
+}
+
+impl Default for OutOfRangePolicy {
+    fn default() -> Self {
+        OutOfRangePolicy::Error // Strict by default
+    }
+}
+
+// ============================================================================
 // DC/FM-RATE PROVIDER TRAIT
 // ============================================================================
 
@@ -76,8 +97,8 @@ pub struct PolynomialDcFmProvider {
     burst_time_ranges: Vec<(Seconds, Seconds)>,
     /// Overall valid time range
     time_range: (Seconds, Seconds),
-    /// Reference time for polynomial evaluation (typically burst center)
-    reference_time: Seconds,
+    /// Out-of-range policy
+    out_of_range_policy: OutOfRangePolicy,
 }
 
 /// DC polynomial representation
@@ -109,6 +130,22 @@ impl PolynomialDcFmProvider {
         fm_polynomials: Vec<FmPolynomial>,
         burst_time_ranges: Vec<(Seconds, Seconds)>,
     ) -> SarResult<Self> {
+        Self::with_policy(dc_polynomials, fm_polynomials, burst_time_ranges, OutOfRangePolicy::default())
+    }
+    
+    /// Create new polynomial provider with custom out-of-range policy
+    pub fn with_policy(
+        dc_polynomials: Vec<DcPolynomial>,
+        fm_polynomials: Vec<FmPolynomial>,
+        burst_time_ranges: Vec<(Seconds, Seconds)>,
+        out_of_range_policy: OutOfRangePolicy,
+    ) -> SarResult<Self> {
+        if dc_polynomials.is_empty() {
+            return Err(SarError::InvalidMetadata(
+                "DC polynomials cannot be empty".to_string()
+            ));
+        }
+        
         if dc_polynomials.len() != fm_polynomials.len() {
             return Err(SarError::InvalidMetadata(
                 "Mismatch between DC and FM polynomial counts".to_string()
@@ -119,6 +156,18 @@ impl PolynomialDcFmProvider {
             return Err(SarError::InvalidMetadata(
                 "Mismatch between polynomial count and burst time ranges".to_string()
             ));
+        }
+        
+        // Validate burst time ranges are ordered and non-overlapping
+        for i in 0..burst_time_ranges.len() - 1 {
+            let (_, end_i) = burst_time_ranges[i];
+            let (start_next, _) = burst_time_ranges[i + 1];
+            if end_i > start_next {
+                return Err(SarError::InvalidMetadata(
+                    format!("Burst time ranges overlap: burst {} ends at {:.6}s, burst {} starts at {:.6}s",
+                        i, end_i.value(), i + 1, start_next.value())
+                ));
+            }
         }
         
         // Compute overall time range
@@ -132,15 +181,12 @@ impl PolynomialDcFmProvider {
         
         let time_range = (min_time, max_time);
         
-        // Use middle of time range as reference
-        let reference_time = Seconds::new((min_time.value() + max_time.value()) / 2.0);
-        
         Ok(Self {
             dc_polynomials,
             fm_polynomials,
             burst_time_ranges,
             time_range,
-            reference_time,
+            out_of_range_policy,
         })
     }
     
@@ -168,15 +214,27 @@ impl PolynomialDcFmProvider {
         Ok(closest_idx)
     }
     
-    /// Evaluate polynomial at given time
+    /// Evaluate polynomial at given time using Horner's method
+    /// 
+    /// Horner's method is numerically stable and efficient:
+    /// p(x) = c0 + c1*x + c2*x² + c3*x³ + ...
+    ///      = c0 + x*(c1 + x*(c2 + x*(c3 + ...)))
+    /// 
+    /// Benefits over naive power method:
+    /// - O(n) multiplications instead of O(n²)
+    /// - Better numerical stability (fewer roundoff errors)
+    /// - More cache-friendly
     fn evaluate_polynomial(coefficients: &[f64], time: Seconds, reference_time: Seconds) -> f64 {
-        let dt = time.value() - reference_time.value();
-        let mut result = 0.0;
-        let mut dt_power = 1.0;
+        if coefficients.is_empty() {
+            return 0.0;
+        }
         
-        for &coeff in coefficients {
-            result += coeff * dt_power;
-            dt_power *= dt;
+        let dt = time.value() - reference_time.value();
+        
+        // Horner's method: evaluate from highest degree down
+        let mut result = coefficients[coefficients.len() - 1];
+        for &coeff in coefficients[..coefficients.len() - 1].iter().rev() {
+            result = result * dt + coeff;
         }
         
         result
@@ -185,12 +243,35 @@ impl PolynomialDcFmProvider {
 
 impl DcFmRateProvider for PolynomialDcFmProvider {
     fn get_dc(&self, az_time: Seconds) -> SarResult<Hertz> {
-        let poly_idx = self.find_polynomial_index(az_time)?;
+        // Check time validity first based on policy
+        let time_to_use = match self.out_of_range_policy {
+            OutOfRangePolicy::Error => {
+                if !self.is_time_valid(az_time) {
+                    return Err(SarError::InvalidInput(format!(
+                        "Azimuth time {:.6} s is outside valid range [{:.6}, {:.6}] s",
+                        az_time.value(),
+                        self.time_range.0.value(),
+                        self.time_range.1.value()
+                    )));
+                }
+                az_time
+            }
+            OutOfRangePolicy::Clamp => {
+                let clamped = az_time.value().clamp(
+                    self.time_range.0.value(),
+                    self.time_range.1.value()
+                );
+                Seconds::new(clamped)
+            }
+            OutOfRangePolicy::NearestBurst => az_time, // find_polynomial_index handles this
+        };
+        
+        let poly_idx = self.find_polynomial_index(time_to_use)?;
         let dc_poly = &self.dc_polynomials[poly_idx];
         
         let dc_hz = Self::evaluate_polynomial(
             &dc_poly.coefficients,
-            az_time,
+            time_to_use,
             dc_poly.reference_time,
         );
         
@@ -198,12 +279,35 @@ impl DcFmRateProvider for PolynomialDcFmProvider {
     }
     
     fn get_fm_rate(&self, az_time: Seconds) -> SarResult<f64> {
-        let poly_idx = self.find_polynomial_index(az_time)?;
+        // Check time validity first based on policy
+        let time_to_use = match self.out_of_range_policy {
+            OutOfRangePolicy::Error => {
+                if !self.is_time_valid(az_time) {
+                    return Err(SarError::InvalidInput(format!(
+                        "Azimuth time {:.6} s is outside valid range [{:.6}, {:.6}] s",
+                        az_time.value(),
+                        self.time_range.0.value(),
+                        self.time_range.1.value()
+                    )));
+                }
+                az_time
+            }
+            OutOfRangePolicy::Clamp => {
+                let clamped = az_time.value().clamp(
+                    self.time_range.0.value(),
+                    self.time_range.1.value()
+                );
+                Seconds::new(clamped)
+            }
+            OutOfRangePolicy::NearestBurst => az_time, // find_polynomial_index handles this
+        };
+        
+        let poly_idx = self.find_polynomial_index(time_to_use)?;
         let fm_poly = &self.fm_polynomials[poly_idx];
         
         let fm_rate = Self::evaluate_polynomial(
             &fm_poly.coefficients,
-            az_time,
+            time_to_use,
             fm_poly.reference_time,
         );
         
@@ -333,8 +437,8 @@ impl MockDcFmProvider {
                 Hertz::new(base_dc + amplitude_dc * phase_rad.sin())
             }
             Some(MockTimeVariation::Step { steps }) => {
-                // Find appropriate step
-                for &(step_time, dc_val, _) in steps {
+                // Find appropriate step (iterate in reverse to get last step <= az_time)
+                for &(step_time, dc_val, _) in steps.iter().rev() {
                     if az_time >= step_time {
                         return dc_val;
                     }
@@ -359,8 +463,8 @@ impl MockDcFmProvider {
                 base_fm + amplitude_fm * phase_rad.sin()
             }
             Some(MockTimeVariation::Step { steps }) => {
-                // Find appropriate step
-                for &(step_time, _, fm_val) in steps {
+                // Find appropriate step (iterate in reverse to get last step <= az_time)
+                for &(step_time, _, fm_val) in steps.iter().rev() {
                     if az_time >= step_time {
                         return fm_val;
                     }
@@ -417,10 +521,10 @@ impl DcFmRateProvider for MockDcFmProvider {
 pub struct CachedDcFmProvider<T: DcFmRateProvider> {
     /// Underlying provider
     inner: T,
-    /// DC cache: time -> DC value
-    dc_cache: std::sync::RwLock<HashMap<u64, Hertz>>,
-    /// FM rate cache: time -> FM rate
-    fm_cache: std::sync::RwLock<HashMap<u64, f64>>,
+    /// DC cache: time -> DC value (uses signed i64 key for negative times)
+    dc_cache: std::sync::RwLock<HashMap<i64, Hertz>>,
+    /// FM rate cache: time -> FM rate (uses signed i64 key for negative times)
+    fm_cache: std::sync::RwLock<HashMap<i64, f64>>,
     /// Cache time resolution (seconds)
     time_resolution: f64,
 }
@@ -436,9 +540,12 @@ impl<T: DcFmRateProvider> CachedDcFmProvider<T> {
         }
     }
     
-    /// Convert time to cache key
-    fn time_to_key(&self, time: Seconds) -> u64 {
-        (time.value() / self.time_resolution).round() as u64
+    /// Convert time to cache key using signed i64 with floor
+    /// 
+    /// This correctly handles negative times (e.g., orbit-relative times)
+    /// Uses floor instead of round for consistent bucketing
+    fn time_to_key(&self, time: Seconds) -> i64 {
+        (time.value() / self.time_resolution).floor() as i64
     }
     
     /// Clear caches
@@ -633,8 +740,138 @@ mod tests {
             &coeffs, time, ref_time
         );
         
-        // 100 - 50*2 + 25*4 = 100 - 100 + 100 = 100
+        // Using Horner's method: 100 - 50*2 + 25*4 = 100 - 100 + 100 = 100
         assert_eq!(result, 100.0);
+    }
+    
+    #[test]
+    fn test_horner_vs_naive() {
+        // Test that Horner's method gives same result as naive for small values
+        let coeffs = vec![1.0, 2.0, 3.0, 4.0]; // 1 + 2*t + 3*t^2 + 4*t^3
+        let time = Seconds::new(0.5);
+        let ref_time = Seconds::new(0.0);
+        
+        let horner_result = PolynomialDcFmProvider::evaluate_polynomial(
+            &coeffs, time, ref_time
+        );
+        
+        // Expected: 1 + 2*0.5 + 3*0.25 + 4*0.125 = 1 + 1 + 0.75 + 0.5 = 3.25
+        assert!((horner_result - 3.25).abs() < 1e-10);
+    }
+    
+    #[test]
+    fn test_out_of_range_policy_error() {
+        let dc_poly = DcPolynomial {
+            coefficients: vec![-7000.0],
+            reference_time: Seconds::new(100.0),
+            time_range: (Seconds::new(50.0), Seconds::new(150.0)),
+        };
+        
+        let fm_poly = FmPolynomial {
+            coefficients: vec![-2300.0],
+            reference_time: Seconds::new(100.0),
+            time_range: (Seconds::new(50.0), Seconds::new(150.0)),
+        };
+        
+        let burst_ranges = vec![(Seconds::new(50.0), Seconds::new(150.0))];
+        
+        let provider = PolynomialDcFmProvider::with_policy(
+            vec![dc_poly],
+            vec![fm_poly],
+            burst_ranges,
+            OutOfRangePolicy::Error,
+        ).unwrap();
+        
+        // Valid time - should work
+        assert!(provider.get_dc(Seconds::new(100.0)).is_ok());
+        
+        // Out of range - should error
+        assert!(provider.get_dc(Seconds::new(25.0)).is_err());
+        assert!(provider.get_fm_rate(Seconds::new(200.0)).is_err());
+    }
+    
+    #[test]
+    fn test_out_of_range_policy_clamp() {
+        let dc_poly = DcPolynomial {
+            coefficients: vec![-7000.0, -10.0], // -7000 - 10*dt
+            reference_time: Seconds::new(100.0),
+            time_range: (Seconds::new(50.0), Seconds::new(150.0)),
+        };
+        
+        let fm_poly = FmPolynomial {
+            coefficients: vec![-2300.0],
+            reference_time: Seconds::new(100.0),
+            time_range: (Seconds::new(50.0), Seconds::new(150.0)),
+        };
+        
+        let burst_ranges = vec![(Seconds::new(50.0), Seconds::new(150.0))];
+        
+        let provider = PolynomialDcFmProvider::with_policy(
+            vec![dc_poly],
+            vec![fm_poly],
+            burst_ranges,
+            OutOfRangePolicy::Clamp,
+        ).unwrap();
+        
+        // Out of range below - should clamp to 50.0
+        let dc_low = provider.get_dc(Seconds::new(25.0)).unwrap();
+        let expected_low = -7000.0 - 10.0 * (50.0 - 100.0); // t=50 clamped
+        assert_eq!(dc_low.value(), expected_low);
+        
+        // Out of range above - should clamp to 150.0
+        let dc_high = provider.get_dc(Seconds::new(200.0)).unwrap();
+        let expected_high = -7000.0 - 10.0 * (150.0 - 100.0); // t=150 clamped
+        assert_eq!(dc_high.value(), expected_high);
+    }
+    
+    #[test]
+    fn test_cache_key_signed() {
+        let mock = MockDcFmProvider::constant(-7000.0, -2300.0);
+        let cached = CachedDcFmProvider::new(mock, 1.0); // 1s resolution
+        
+        // Test positive time
+        let key_pos = cached.time_to_key(Seconds::new(100.5));
+        assert_eq!(key_pos, 100);
+        
+        // Test negative time (orbit-relative)
+        let key_neg = cached.time_to_key(Seconds::new(-50.3));
+        assert_eq!(key_neg, -51); // floor of -50.3
+        
+        // Test zero
+        let key_zero = cached.time_to_key(Seconds::new(0.0));
+        assert_eq!(key_zero, 0);
+    }
+    
+    #[test]
+    fn test_mock_step_variation_reverse() {
+        let steps = vec![
+            (Seconds::new(0.0), Hertz::new(-7000.0), -2300.0),
+            (Seconds::new(50.0), Hertz::new(-7100.0), -2350.0),
+            (Seconds::new(100.0), Hertz::new(-7200.0), -2400.0),
+        ];
+        
+        let provider = MockDcFmProvider {
+            dc_value: Hertz::new(-6900.0),
+            fm_rate_value: -2250.0,
+            time_range: (Seconds::new(0.0), Seconds::new(200.0)),
+            time_variation: Some(MockTimeVariation::Step { steps }),
+        };
+        
+        // Before all steps
+        let dc_early = provider.get_dc_at_time(Seconds::new(-10.0));
+        assert_eq!(dc_early.value(), -6900.0); // base value
+        
+        // At first step
+        let dc_0 = provider.get_dc_at_time(Seconds::new(0.0));
+        assert_eq!(dc_0.value(), -7000.0);
+        
+        // Between steps
+        let dc_75 = provider.get_dc_at_time(Seconds::new(75.0));
+        assert_eq!(dc_75.value(), -7100.0); // second step
+        
+        // After last step
+        let dc_150 = provider.get_dc_at_time(Seconds::new(150.0));
+        assert_eq!(dc_150.value(), -7200.0); // third step
     }
     
     #[test]
