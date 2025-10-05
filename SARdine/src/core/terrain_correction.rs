@@ -1890,79 +1890,6 @@ impl TerrainCorrector {
         Ok((output_image, output_transform))
     }
 
-    /// DEPRECATED: Use range_doppler_terrain_correction instead
-    /// Build optimized orbit lookup table with spatial indexing for faster queries
-    fn build_orbit_lookup_table_optimized(
-        &self,
-        orbit_data: &OrbitData,
-        output_bounds: &BoundingBox,
-    ) -> SarResult<HashMap<u64, StateVector>> {
-        let mut orbit_lut = HashMap::new();
-
-        // Create spatial grid for the bounding box to pre-compute nearest orbit vectors
-        let lat_steps = 20; // 20x20 grid provides good balance of memory vs performance
-        let lon_steps = 20;
-
-        let lat_step = (output_bounds.max_lat - output_bounds.min_lat) / lat_steps as f64;
-        let lon_step = (output_bounds.max_lon - output_bounds.min_lon) / lon_steps as f64;
-
-        // Pre-compute center point for fallback
-        let center_lat = (output_bounds.min_lat + output_bounds.max_lat) / 2.0;
-        let center_lon = (output_bounds.min_lon + output_bounds.max_lon) / 2.0;
-        let _center_ecef = self.latlon_to_ecef(center_lat, center_lon, 0.0);
-
-        // Build spatial hash lookup for each grid cell
-        for i in 0..=lat_steps {
-            for j in 0..=lon_steps {
-                let lat = output_bounds.min_lat + i as f64 * lat_step;
-                let lon = output_bounds.min_lon + j as f64 * lon_step;
-
-                let spatial_key = self.compute_spatial_hash(lat, lon);
-                let test_ecef = self.latlon_to_ecef(lat, lon, 0.0);
-
-                // Find nearest orbit vector for this spatial location
-                let mut min_distance = f64::MAX;
-                let mut best_state_idx = 0;
-
-                for (idx, state_vector) in orbit_data.state_vectors.iter().enumerate() {
-                    let satellite_pos = [
-                        state_vector.position[0],
-                        state_vector.position[1],
-                        state_vector.position[2],
-                    ];
-                    let distance = self.distance_to_point(&satellite_pos, &test_ecef);
-
-                    if distance < min_distance {
-                        min_distance = distance;
-                        best_state_idx = idx;
-                    }
-                }
-
-                if best_state_idx < orbit_data.state_vectors.len() {
-                    orbit_lut.insert(
-                        spatial_key,
-                        orbit_data.state_vectors[best_state_idx].clone(),
-                    );
-                }
-            }
-        }
-
-        // SCIENTIFIC COMPLIANCE: No synthetic or fallback orbit data generation
-        // If real orbit data is insufficient for spatial coverage, the processing must fail
-        // with a clear error message rather than using synthetic approximations
-
-        log::debug!(
-            "Built spatial orbit LUT with {} entries for {}x{} grid covering {:.2}°x{:.2}°",
-            orbit_lut.len(),
-            lat_steps,
-            lon_steps,
-            output_bounds.max_lat - output_bounds.min_lat,
-            output_bounds.max_lon - output_bounds.min_lon
-        );
-
-        Ok(orbit_lut)
-    }
-
     /// Process a 2D tile chunk for better cache locality (OPTIMIZATION: 2D tiles vs row chunks)
     fn process_tile_chunk_optimized(
         &self,
@@ -3200,108 +3127,11 @@ impl TerrainCorrector {
         )
     }
 
-    /// Optimized lat/lon to SAR pixel conversion with pre-computed lookup tables
-    fn latlon_to_sar_pixel_optimized(
-        &self,
-        lat: f64,
-        lon: f64,
-        elevation: f64,
-        orbit_data: &OrbitData,
-        params: &RangeDopplerParams,
-        _orbit_lut: &HashMap<u64, StateVector>,
-    ) -> SarResult<(f64, f64)> {
-        // COMPLETELY REWRITTEN: Correct Range-Doppler coordinate transformation
-        // Convert lat/lon/elevation to ECEF coordinates
-        let target_ecef = self.latlon_to_ecef(lat, lon, elevation);
 
-        // Find the closest orbit state vector (simplified approach)
-        let mut min_distance = f64::MAX;
-        let mut best_state_idx = 0;
-        let mut _best_time_offset = 0.0;
 
-        // Search through orbit data to find the closest approach
-        for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
-            let satellite_pos = [
-                state_vector.position[0],
-                state_vector.position[1],
-                state_vector.position[2],
-            ];
-            let distance = self.distance_to_point(&satellite_pos, &target_ecef);
 
-            if distance < min_distance {
-                min_distance = distance;
-                best_state_idx = i;
-                // Calculate time offset from start of acquisition (simplified)
-                _best_time_offset = i as f64 * 10.0; // Assume 10 second intervals (will be refined)
-            }
-        }
 
-        if best_state_idx >= orbit_data.state_vectors.len() {
-            return Err(SarError::Processing(
-                "No valid orbit state found".to_string(),
-            ));
-        }
 
-        let best_state = &orbit_data.state_vectors[best_state_idx];
-
-        // Calculate slant range from satellite to target
-        let slant_range = self.distance_to_point(&best_state.position, &target_ecef);
-
-        // CORRECTED: Range pixel calculation using proper SAR timing
-        // Two-way travel time
-        let two_way_time = 2.0 * slant_range / params.speed_of_light;
-
-        // Range pixel: convert travel time to pixel index
-        // Formula: pixel = (travel_time - start_time) / time_per_pixel
-        let time_per_range_pixel = (2.0 * params.range_pixel_spacing) / params.speed_of_light;
-        let range_pixel = (two_way_time - params.slant_range_time) / time_per_range_pixel;
-
-        // CORRECTED: Azimuth pixel calculation
-        // For Sentinel-1, azimuth pixels correspond to pulse timing
-        // Simplified: use the state vector index as basis for azimuth position
-        let azimuth_pixel =
-            (best_state_idx as f64 / orbit_data.state_vectors.len() as f64) * 6235.0; // Scale to image height
-
-        Ok((range_pixel, azimuth_pixel))
-    }
-
-    /// Fast spatial hash for orbit vector lookup
-    fn compute_spatial_hash(&self, lat: f64, lon: f64) -> u64 {
-        // Simple spatial hash based on lat/lon grid
-        let lat_grid = ((lat + 90.0) * 100.0) as u64;
-        let lon_grid = ((lon + 180.0) * 100.0) as u64;
-        lat_grid * 36000 + lon_grid
-    }
-
-    /// Fast orbit state vector finder with early termination
-    fn find_nearest_orbit_state_fast<'a>(
-        &self,
-        orbit_data: &'a OrbitData,
-        target_ecef: &[f64; 3],
-    ) -> SarResult<&'a StateVector> {
-        let mut min_distance = f64::MAX;
-        let mut best_idx = 0;
-
-        // Use binary search approximation for time-ordered vectors
-        for (i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
-            let satellite_pos = [
-                state_vector.position[0],
-                state_vector.position[1],
-                state_vector.position[2],
-            ];
-            let distance = self.distance_to_point(&satellite_pos, target_ecef);
-
-            if distance < min_distance {
-                min_distance = distance;
-                best_idx = i;
-            } else if distance > min_distance * 1.5 {
-                // Early termination if we're moving away
-                break;
-            }
-        }
-
-        Ok(&orbit_data.state_vectors[best_idx])
-    }
 
     /// Fast Doppler to azimuth pixel conversion
     /// 
@@ -3655,45 +3485,9 @@ impl TerrainCorrector {
         v1 * (1.0 - dy as f32) + v2 * dy as f32
     }
 
-    /// Find azimuth time using orbit lookup table
-    #[allow(dead_code)]
-    fn find_azimuth_time_with_lut(
-        &self,
-        ground_point: &[f64; 3],
-        orbit_data: &OrbitData,
-        orbit_lut: &[(usize, [f64; 3])],
-    ) -> SarResult<f64> {
-        // Find the closest orbit state vector
-        let mut min_distance = f64::MAX;
-        let mut best_idx = 0;
 
-        for &(idx, sat_pos) in orbit_lut.iter() {
-            let distance = self.distance_to_point(&sat_pos, ground_point);
-            if distance < min_distance {
-                min_distance = distance;
-                best_idx = idx;
-            }
-        }
 
-        // Return time index as simplified azimuth time (in practice would need proper time conversion)
-        Ok(best_idx as f64 / orbit_data.state_vectors.len() as f64)
-    }
 
-    /// Interpolate satellite state at given azimuth time
-    #[allow(dead_code)]
-    fn interpolate_satellite_state(
-        &self,
-        orbit_data: &OrbitData,
-        azimuth_time: f64,
-    ) -> SarResult<StateVector> {
-        let state_idx = (azimuth_time * orbit_data.state_vectors.len() as f64) as usize;
-
-        if state_idx < orbit_data.state_vectors.len() {
-            Ok(orbit_data.state_vectors[state_idx].clone())
-        } else {
-            Err(SarError::Processing("Invalid azimuth time".to_string()))
-        }
-    }
 
     /// Calculate output bounds from SAR bounding box
     fn calculate_output_bounds(&self, sar_bbox: &BoundingBox) -> SarResult<BoundingBox> {
@@ -5111,153 +4905,7 @@ impl TerrainCorrector {
         }
     }
 
-    /// Basic lat/lon to SAR pixel mapping using proper zero-Doppler Range-Doppler
-    fn latlon_to_sar_pixel(
-        &self,
-        lat: f64,
-        lon: f64,
-        elevation: f64,
-        orbit_data: &OrbitData,
-        params: &RangeDopplerParams,
-        sar_nrows: usize, // Real SAR image azimuth dimension
-        sar_ncols: usize, // Real SAR image range dimension
-    ) -> Option<(f64, f64)> {
-        // OPTIMIZATION: Try fast calculation first with real SAR dimensions
-        if let Some(result) = self.fast_range_doppler_calculation(
-            lat,
-            lon,
-            elevation as f32,
-            orbit_data,
-            params,
-            sar_nrows,
-            sar_ncols,
-        ) {
-            return Some(result);
-        }
 
-        // Fallback to full calculation if fast method fails
-        // Convert lat/lon/elevation to ECEF coordinates
-        let target_ecef_array = self.latlon_to_ecef(lat, lon, elevation);
-
-        // Use proper zero-Doppler time finding
-        if let Some(zero_doppler_time) =
-            self.find_zero_doppler_time(&target_ecef_array, orbit_data, params)
-        {
-            // Interpolate orbit state at zero-Doppler time
-            if let Ok((sat_position, _sat_velocity)) =
-                self.interpolate_orbit_state(orbit_data, zero_doppler_time)
-            {
-                // Calculate slant range
-                let range_vector = Vector3 {
-                    x: target_ecef_array[0] - sat_position.x,
-                    y: target_ecef_array[1] - sat_position.y,
-                    z: target_ecef_array[2] - sat_position.z,
-                };
-                let slant_range =
-                    (range_vector.x.powi(2) + range_vector.y.powi(2) + range_vector.z.powi(2))
-                        .sqrt();
-
-                // Calculate range pixel coordinate
-                let _two_way_travel_time = 2.0 * slant_range / params.speed_of_light;
-
-                // FIXED: Scale coordinates to normalized 0-1 range
-                let min_slant_range = 800_000.0; // 800 km
-                let max_slant_range = 1_500_000.0; // 1500 km (extended for our test)
-
-                // Normalize slant range to 0-1 range
-                log::trace!("🔍 CLAMP DEBUG #5: range_normalized.clamp({:.1}, {:.1})", 0.0, 1.0);
-                let range_normalized = diag_clamp(
-                    (slant_range - min_slant_range) / (max_slant_range - min_slant_range),
-                    0.0,
-                    1.0,
-                    "range_normalized",
-                );
-
-                // Normalize time to 0-1 range
-                let min_time = 0.0;
-                let max_time = 80.0; // Based on our 9-vector orbit span
-                let time_normalized =
-                    {
-                        log::trace!("🔍 CLAMP DEBUG #6: time_normalized.clamp({:.1}, {:.1})", 0.0, 1.0);
-                        diag_clamp((zero_doppler_time - min_time) / (max_time - min_time), 0.0, 1.0, "time_normalized")
-                    };
-
-                // Scale normalized coordinates to floating point pixel coordinates
-                // For small test images, use more conservative scaling to ensure coordinates fit
-                let range_pixel = range_normalized * 100.0; // Scale to smaller range for better fit
-                let azimuth_pixel = time_normalized * 100.0; // Scale to smaller range for better fit
-
-                // Debug output suppressed
-
-                // Validate results are reasonable
-                if range_normalized >= 0.0
-                    && range_normalized <= 1.0
-                    && time_normalized >= 0.0
-                    && time_normalized <= 1.0
-                    && slant_range >= 800_000.0
-                    && slant_range <= 1_500_000.0
-                {
-                    // Debug output suppressed
-                    return Some((range_pixel, azimuth_pixel)); // Return floating point coordinates
-                } else {
-                    // Debug output suppressed
-                }
-            } else {
-                // Debug output suppressed
-            }
-        } else {
-            // Debug output suppressed
-        }
-
-        // Fallback: Use closest approach if zero-Doppler fails
-        let mut min_distance = f64::MAX;
-        let mut best_range_pixel = 0.0;
-        let mut best_azimuth_pixel = 0.0;
-
-        // Sample multiple orbit points to find closest approach
-        let num_samples = orbit_data.state_vectors.len().min(20);
-        let sample_step = orbit_data.state_vectors.len() / num_samples.max(1);
-
-        for (sample_idx, state_vector) in orbit_data
-            .state_vectors
-            .iter()
-            .step_by(sample_step)
-            .enumerate()
-        {
-            let distance = self.distance_to_point(&state_vector.position, &target_ecef_array);
-
-            if distance < min_distance && distance >= 800_000.0 && distance <= 950_000.0 {
-                min_distance = distance;
-
-                // Range pixel calculation
-                let two_way_travel_time = 2.0 * distance / params.speed_of_light;
-                let range_sampling_interval = params.range_pixel_spacing / params.speed_of_light;
-                let range_pixel =
-                    (two_way_travel_time - params.slant_range_time) / range_sampling_interval;
-
-                // Azimuth pixel calculation based on orbit position
-                let orbit_fraction = sample_idx as f64 / (num_samples - 1).max(1) as f64;
-                let azimuth_pixel = orbit_fraction * 10000.0;
-
-                best_range_pixel = range_pixel;
-                best_azimuth_pixel = azimuth_pixel;
-            }
-        }
-
-        // Validate final result
-        if min_distance < 950_000.0
-            && best_range_pixel >= 0.0
-            && best_range_pixel < 100000.0
-            && best_azimuth_pixel >= 0.0
-            && best_azimuth_pixel < 100000.0
-        {
-            // Debug output suppressed
-            Some((best_range_pixel, best_azimuth_pixel)) // Return floating point coordinates
-        } else {
-            // Debug output suppressed
-            None
-        }
-    }
 
     /// Calculate Doppler frequency at a specific time with robust orbit interpolation
     /// Returns None if time is outside orbit coverage (no clamping)
@@ -7236,51 +6884,9 @@ impl TerrainCorrector {
         Some(result)
     }
 
-    /// Optimized lat/lon to SAR pixel conversion using orbit LUT
-    fn optimized_latlon_to_sar_pixel(
-        &self,
-        lat: f64,
-        lon: f64,
-        elevation: f32,
-        orbit_lut: &[(usize, [f64; 3])],
-        params: &RangeDopplerParams,
-    ) -> Option<(f64, f64)> {
-        // Convert to ECEF coordinates
-        let target_ecef = self.latlon_to_ecef(lat, lon, elevation as f64);
 
-        // Use optimized range-doppler calculation with LUT
-        self.optimized_range_doppler_calculation(&target_ecef, orbit_lut, params)
-    }
 
-    /// Optimized range-doppler calculation with LUT
-    fn optimized_range_doppler_calculation(
-        &self,
-        target_ecef: &[f64; 3],
-        orbit_lut: &[(usize, [f64; 3])],
-        params: &RangeDopplerParams,
-    ) -> Option<(f64, f64)> {
-        // Use pre-sorted orbit LUT for faster lookup
-        let mut best_range = f64::MAX;
-        let mut best_azimuth_idx = 0;
 
-        // Binary search for closest approach (orbit LUT is sorted by distance to scene center)
-        let low = 0;
-        let high = orbit_lut.len().min(20); // Limit search to nearby points
-
-        for (idx, sat_pos) in orbit_lut.iter().take(high).skip(low) {
-            let range = self.distance_to_point(sat_pos, target_ecef);
-            if range < best_range {
-                best_range = range;
-                best_azimuth_idx = *idx;
-            }
-        }
-
-        // Convert to pixel coordinates with optimized formulas
-        let range_pixel = self.slant_range_to_pixel(best_range, params);
-        let azimuth_pixel = self.azimuth_time_to_pixel(best_azimuth_idx as f64, params);
-
-        Some((range_pixel, azimuth_pixel))
-    }
 }
 
 #[cfg(test)]
