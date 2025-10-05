@@ -92,16 +92,19 @@ fn eval_dc_fm_2d(
 
 /// Evaluate 2D polynomial: f(t, r) = sum(c_ij × t^i × r^j)
 /// Supports time-only (1D) and time-range (2D) polynomials
+/// 
+/// **OPTIMIZATION:** Uses Horner's rule for 1D case to minimize multiplications
 fn eval_poly_2d(coeffs: &[f64], t: f64, r: f64) -> f64 {
     if coeffs.len() <= 3 {
-        // Time-only polynomial: c0 + c1*t + c2*t^2
-        coeffs.iter().enumerate()
-            .map(|(i, &c)| c * t.powi(i as i32))
-            .sum()
+        // Time-only polynomial: Use Horner's rule for efficiency
+        // c0 + c1*t + c2*t^2 becomes ((c2)*t + c1)*t + c0
+        coeffs.iter().rev().fold(0.0, |acc, &c| acc * t + c)
     } else {
         // 2D polynomial expansion
         // Typical format: [c00, c10, c20, c01, c11, c02, ...]
         // where c_ij corresponds to t^i * r^j
+        // 
+        // Note: Could optimize with nested Horner, but 2D case is rare for S1
         let mut result = 0.0;
         let max_order = ((coeffs.len() as f64).sqrt().ceil() as usize).max(1);
         
