@@ -2,7 +2,6 @@
 //!
 //! Helpers to extract ProcessingContext from existing annotation and metadata structures
 
-use chrono::Utc; // DateTime unused
 // use std::collections::HashMap; // Unused import
 
 use crate::core::processing_context::*;
@@ -44,21 +43,26 @@ fn extract_product_info(annotation: &AnnotationRoot) -> SarResult<ProductInfo> {
     let image_info = annotation.image_annotation.as_ref()
         .and_then(|ia| ia.image_information.as_ref());
     
-    // Parse start time
-    let start_time = if let Some(start_str) = &ads_header.start_time {
-        crate::io::annotation::parse_time_robust(start_str)
-            .unwrap_or_else(|| Utc::now())
-    } else {
-        Utc::now()
-    };
+    // Parse start time - MUST be present and valid
+    let start_time = ads_header.start_time.as_ref()
+        .and_then(|s| crate::io::annotation::parse_time_robust(s))
+        .ok_or_else(|| crate::types::SarError::Metadata(
+            "Missing or invalid product start time".to_string()
+        ))?;
     
-    // Parse stop time
-    let stop_time = if let Some(stop_str) = &ads_header.stop_time {
-        crate::io::annotation::parse_time_robust(stop_str)
-            .unwrap_or_else(|| Utc::now())
-    } else {
-        Utc::now()
-    };
+    // Parse stop time - MUST be present and valid
+    let stop_time = ads_header.stop_time.as_ref()
+        .and_then(|s| crate::io::annotation::parse_time_robust(s))
+        .ok_or_else(|| crate::types::SarError::Metadata(
+            "Missing or invalid product stop time".to_string()
+        ))?;
+    
+    // Validate time ordering
+    if stop_time < start_time {
+        return Err(crate::types::SarError::Metadata(
+            format!("Product stop time {:?} is before start time {:?}", stop_time, start_time)
+        ));
+    }
     
     Ok(ProductInfo {
         platform: ads_header.mission_id.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
@@ -87,8 +91,13 @@ fn extract_timing_context(
         .and_then(|ia| ia.image_information.as_ref())
         .ok_or_else(|| crate::types::SarError::Metadata("Missing image_information".to_string()))?;
     
-    // Get orbit reference epoch
+    // Get orbit reference epoch - must be finite
     let orbit_ref_epoch = datetime_to_utc_seconds(orbit_data.reference_time);
+    if !orbit_ref_epoch.is_finite() {
+        return Err(crate::types::SarError::Metadata(
+            "Orbit reference epoch is not finite".to_string()
+        ));
+    }
     
     // Parse product start time
     let product_start_time_abs = {
@@ -100,31 +109,64 @@ fn extract_timing_context(
         (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9
     };
     
-    // Parse product stop time
+    // Parse product stop time - MUST be present and valid
     let product_stop_time_abs = {
         let stop_opt = image_info.product_last_line_utc_time.clone()
             .or_else(|| annotation.ads_header.as_ref().and_then(|h| h.stop_time.clone()));
-        let dt = stop_opt.and_then(|s| crate::io::annotation::parse_time_robust(&s));
-        dt.map(|d| (d.timestamp() as f64) + (d.timestamp_subsec_nanos() as f64) * 1e-9)
-            .unwrap_or(product_start_time_abs)
+        let dt = stop_opt
+            .and_then(|s| crate::io::annotation::parse_time_robust(&s))
+            .ok_or_else(|| crate::types::SarError::Metadata("Missing product stop time".to_string()))?;
+        (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9
     };
     
-    let product_duration = (product_stop_time_abs - product_start_time_abs).max(0.0);
+    // Validate product times are finite
+    if !product_start_time_abs.is_finite() || !product_stop_time_abs.is_finite() {
+        return Err(crate::types::SarError::Metadata(
+            "Product times are not finite".to_string()
+        ));
+    }
+    
+    // Validate time ordering
+    if product_stop_time_abs < product_start_time_abs {
+        return Err(crate::types::SarError::Metadata(
+            format!("Product stop time {} is before start time {}", 
+                product_stop_time_abs, product_start_time_abs)
+        ));
+    }
+    
+    let product_duration = product_stop_time_abs - product_start_time_abs;
     
     // Get PRF
     let prf = annotation.get_pulse_repetition_frequency()
         .ok_or_else(|| crate::types::SarError::Metadata("Missing PRF".to_string()))?;
     
-    // Get azimuth time interval (CRITICAL - from annotation, not 1/PRF!)
+    // Get azimuth time interval (CRITICAL - must be from annotation, not computed!)
     let azimuth_time_interval = image_info.azimuth_time_interval
-        .unwrap_or_else(|| {
-            log::warn!("⚠️ azimuthTimeInterval not in annotation, using 1/PRF fallback");
-            1.0 / prf
-        });
+        .ok_or_else(|| crate::types::SarError::Metadata(
+            "Missing azimuthTimeInterval in annotation - cannot use 1/PRF fallback for TOPS".to_string()
+        ))?;
     
-    // Get range sampling rate (default for Sentinel-1 IW)
-    // TODO: Extract from annotation downlinkInformation if needed
-    let range_sampling_rate = 64e6; // 64 MHz is standard for Sentinel-1 IW mode
+    // Validate azimuth time interval is positive and finite
+    if !azimuth_time_interval.is_finite() || azimuth_time_interval <= 0.0 {
+        return Err(crate::types::SarError::Metadata(
+            format!("Invalid azimuthTimeInterval: {}", azimuth_time_interval)
+        ));
+    }
+    
+    // Get range sampling rate from annotation - MUST be present
+    let range_sampling_rate = annotation.general_annotation.as_ref()
+        .and_then(|ga| ga.product_information.as_ref())
+        .map(|pi| pi.range_sampling_rate)
+        .ok_or_else(|| crate::types::SarError::Metadata(
+            "Missing rangeSamplingRate in productInformation".to_string()
+        ))?;
+    
+    // Validate range sampling rate is positive and finite
+    if !range_sampling_rate.is_finite() || range_sampling_rate <= 0.0 {
+        return Err(crate::types::SarError::Metadata(
+            format!("Invalid rangeSamplingRate: {}", range_sampling_rate)
+        ));
+    }
     
     // Get slant range time
     let slant_range_time = annotation.get_slant_range_time()
@@ -269,13 +311,33 @@ fn extract_burst_context(annotation: &AnnotationRoot) -> SarResult<Option<BurstC
         return Ok(None);
     }
     
+    // Get azimuth time interval for burst duration computation
+    let azimuth_time_interval = annotation.image_annotation.as_ref()
+        .and_then(|ia| ia.image_information.as_ref())
+        .and_then(|ii| ii.azimuth_time_interval)
+        .ok_or_else(|| crate::types::SarError::Metadata(
+            "Missing azimuthTimeInterval for burst duration computation".to_string()
+        ))?;
+    
+    // Get lines per burst
+    let lines_per_burst = swath_timing.lines_per_burst
+        .ok_or_else(|| crate::types::SarError::Metadata(
+            "Missing linesPerBurst in SwathTiming".to_string()
+        ))? as f64;
+    
     // Extract burst metadata
     let mut bursts = Vec::new();
     for (idx, burst) in bursts_data.iter().enumerate() {
-        let sensing_start = Utc::now(); // TODO: Extract from burst.sensing_time when available
+        // MUST have azimuth_time from burst metadata - no synthesis allowed
+        let sensing_start = burst.azimuth_time.as_ref()
+            .and_then(|s| crate::io::annotation::parse_time_robust(s))
+            .ok_or_else(|| crate::types::SarError::Metadata(
+                format!("Missing or invalid azimuth_time for burst {}", idx)
+            ))?;
         
-        // Estimate sensing stop (approximate - 1500 lines typical for Sentinel-1)
-        let sensing_stop = sensing_start + chrono::Duration::milliseconds(3000); // ~1500 lines * 2ms
+        // Compute sensing_stop from lines_per_burst and azimuth_time_interval
+        let burst_duration_s = lines_per_burst * azimuth_time_interval;
+        let sensing_stop = sensing_start + chrono::Duration::milliseconds((burst_duration_s * 1000.0) as i64);
         
         bursts.push(BurstMetadata {
             burst_id: idx,
@@ -352,14 +414,18 @@ pub fn update_with_dem(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Utc, TimeZone};
     
     #[test]
     fn test_heading_estimation() {
-        let mut orbit_data = OrbitData {
-            reference_time: Utc::now(),
+        // Use fixed time instead of Utc::now() for deterministic tests
+        let fixed_time = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        
+        let orbit_data = OrbitData {
+            reference_time: fixed_time,
             state_vectors: vec![
                 crate::types::StateVector {
-                    time: Utc::now(),
+                    time: fixed_time,
                     position: [0.0, 0.0, 7000000.0],
                     velocity: [1000.0, 7000.0, 0.0],
                 },
