@@ -487,6 +487,7 @@ pub struct SarMetadata {
     pub wavelength: Option<f64>,      // meters - must be extracted from annotation
     pub slant_range_time: Option<f64>, // seconds - critical for terrain correction
     pub prf: Option<f64>, // Hz - pulse repetition frequency, critical for terrain correction
+    pub range_sampling_rate: Option<f64>, // Hz - range sampling rate, critical for coordinate conversion
     #[serde(default)]
     pub radar_frequency_extracted: bool, // true when value was parsed from annotation XML
 

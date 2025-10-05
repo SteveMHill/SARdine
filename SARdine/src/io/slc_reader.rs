@@ -918,10 +918,13 @@ impl SlcReader {
             let window = (0, 0);
             let window_size = (width, height);
 
-            // **PROPER COMPLEX READ**: Read complex data directly without width*2 trick
-            // GDAL handles CInt16 internally - we read as i16 and let GDAL give us interleaved data
+            // **PROPER COMPLEX READ**: Read complex data with proper buffer sizing for CInt16
+            // CRITICAL FIX: When reading CInt16 (complex int16) data as i16, we need to account for
+            // the fact that each complex pixel consists of 2 i16 values (real, imag).
+            // GDAL's buffer size refers to output dimensions, so we need buffer_size = (width * 2, height)
+            // to get all width * height * 2 i16 values (interleaved real/imag pairs).
             let complex_data = band
-                .read_as::<i16>(window, window_size, (width, height), None)
+                .read_as::<i16>(window, window_size, (width * 2, height), None)
                 .map_err(|e| {
                     SarError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!(
                         "Failed to read complex CInt16 data from GDAL band: {}",
@@ -930,10 +933,10 @@ impl SlcReader {
                 })?;
 
             // **SAFETY VALIDATION**: Verify data size matches expected complex format
-            let expected_samples = (width * height * 2) as usize; // 2 samples per complex pixel
+            let expected_samples = (width * height * 2) as usize; // 2 i16 samples per complex pixel
             if complex_data.data.len() != expected_samples {
                 return Err(SarError::InvalidFormat(format!(
-                    "GDAL complex data size mismatch: expected {} samples ({}x{}x2), got {} samples. This indicates incorrect complex interpretation.",
+                    "GDAL complex data size mismatch: expected {} i16 samples ({}x{}x2 for interleaved real/imag), got {} samples.",
                     expected_samples, width, height, complex_data.data.len()
                 )));
             }
@@ -1424,6 +1427,7 @@ impl SlcReader {
             wavelength: Some(wavelength),
             slant_range_time: Some(slant_range_time),
             prf: Some(prf),
+            range_sampling_rate: None, // TODO: Extract from annotation XML
             radar_frequency_extracted: true,
             bounding_box,
             coordinate_system: CoordinateSystem::Radar,
@@ -2198,12 +2202,36 @@ impl SlcReader {
         // Read annotation content
         let annotation_content = self.read_file_as_string(first)?;
 
-        // Extract burst information
+        // Extract subswath ID from annotation filename (e.g., "iw1", "iw2", "iw3")
+        let subswath_id = first
+            .to_lowercase()
+            .split('-')
+            .find(|s| s.starts_with("iw"))
+            .map(|s| s.to_uppercase());
+
+        log::debug!("Annotation filename: {}, extracted ID: {:?}", first, subswath_id);
+        log::debug!("Cached metadata available: {}", self.cached_metadata.is_some());
+        if let Some(ref metadata) = self.cached_metadata {
+            log::debug!("Subswaths in metadata: {:?}", metadata.sub_swaths.keys().collect::<Vec<_>>());
+        }
+
+        // Get subswath data from cached metadata if available
+        let subswath = if let (Some(id), Some(ref metadata)) = (subswath_id.as_ref(), &self.cached_metadata) {
+            let sw = metadata.sub_swaths.get(id.as_str());
+            log::info!("Looking up subswath '{}', found: {}", id, sw.is_some());
+            sw
+        } else {
+            log::warn!("Cannot lookup subswath - ID: {:?}, metadata: {}", subswath_id, self.cached_metadata.is_some());
+            None
+        };
+
+        // Extract burst information with optional SubSwath data
         let (total_lines, total_samples) = slc_data.dim();
-        let burst_info = DeburstProcessor::extract_burst_info_from_annotation(
+        let burst_info = DeburstProcessor::extract_burst_info_from_annotation_with_subswath(
             &annotation_content,
             total_lines,
             total_samples,
+            subswath,
         )?;
 
         log::info!(
@@ -2293,12 +2321,36 @@ impl SlcReader {
         // Read annotation content
         let annotation_content = self.read_file_as_string(first)?;
 
-        // Extract burst information with TOPSAR parameters
+        // Extract subswath ID from annotation filename (e.g., "iw1", "iw2", "iw3")
+        let subswath_id = first
+            .to_lowercase()
+            .split('-')
+            .find(|s| s.starts_with("iw"))
+            .map(|s| s.to_uppercase());
+
+        log::debug!("TOPSAR: Annotation filename: {}, extracted ID: {:?}", first, subswath_id);
+        log::debug!("TOPSAR: Cached metadata available: {}", self.cached_metadata.is_some());
+        if let Some(ref metadata) = self.cached_metadata {
+            log::debug!("TOPSAR: Subswaths in metadata: {:?}", metadata.sub_swaths.keys().collect::<Vec<_>>());
+        }
+
+        // Get subswath data from cached metadata if available
+        let subswath = if let (Some(id), Some(ref metadata)) = (subswath_id.as_ref(), &self.cached_metadata) {
+            let sw = metadata.sub_swaths.get(id.as_str());
+            log::info!("TOPSAR: Looking up subswath '{}', found: {}", id, sw.is_some());
+            sw
+        } else {
+            log::warn!("TOPSAR: Cannot lookup subswath - ID: {:?}, metadata: {}", subswath_id, self.cached_metadata.is_some());
+            None
+        };
+
+        // Extract burst information with optional SubSwath data and TOPSAR parameters
         let (total_lines, total_samples) = slc_data.dim();
-        let burst_info = DeburstProcessor::extract_burst_info_from_annotation(
+        let burst_info = DeburstProcessor::extract_burst_info_from_annotation_with_subswath(
             &annotation_content,
             total_lines,
             total_samples,
+            subswath,
         )?;
 
         log::info!(

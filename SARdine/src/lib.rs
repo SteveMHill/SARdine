@@ -775,12 +775,23 @@ fn deburst_topsar_cached(
             total_samples
         );
 
-        // Extract burst information from annotation
+        // Extract burst information from annotation with SubSwath data if available
+        // Get SubSwath from cached metadata using subswath parameter (e.g., "IW1", "IW2", "IW3")
+        let subswath_data = slc_reader.get_cached_metadata().ok()
+            .and_then(|metadata| metadata.sub_swaths.get(&subswath));
+        
+        log::debug!("Cached metadata available: {}", slc_reader.get_cached_metadata().is_ok());
+        if let Ok(metadata) = slc_reader.get_cached_metadata() {
+            log::debug!("Subswaths in metadata: {:?}", metadata.sub_swaths.keys().collect::<Vec<_>>());
+        }
+        log::info!("Looking up subswath '{}', found: {}", subswath, subswath_data.is_some());
+        
         let burst_info =
-            match crate::core::deburst::DeburstProcessor::extract_burst_info_from_annotation(
+            match crate::core::deburst::DeburstProcessor::extract_burst_info_from_annotation_with_subswath(
                 &annotation_data,
                 total_lines,
                 total_samples,
+                subswath_data,
             ) {
                 Ok(info) => info,
                 Err(e) => {
@@ -2867,9 +2878,9 @@ fn apply_speckle_filter(
             "num_looks parameter is required; no fallback values permitted for scientific accuracy",
         )),
     };
-    if num_looks_val <= 0.0 || num_looks_val > 20.0 {
+    if num_looks_val <= 0.0 || num_looks_val > 100.0 {
         return Err(PyValueError::new_err(format!(
-            "Invalid num_looks: {:.2}. Must be between 0.1 and 20.0",
+            "Invalid num_looks: {:.2}. Must be between 0.1 and 100.0 (e.g., 10×10 multilooking = 100 looks)",
             num_looks_val
         )));
     }

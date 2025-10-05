@@ -2235,6 +2235,33 @@ impl ProductRoot {
                                     range_samples
                                 );
 
+                                // CRITICAL FIX: Extract DC polynomials from parsed annotation
+                                // This prevents deburst from falling back to zeros
+                                let dc_polynomial = annotation
+                                    .doppler_centroid
+                                    .as_ref()
+                                    .and_then(|dc| dc.dc_estimate_list.as_ref())
+                                    .and_then(|list| list.dc_estimates.as_ref())
+                                    .and_then(|estimates| {
+                                        if !estimates.is_empty() {
+                                            log::info!("✅ Extracted {} DC polynomial estimates from annotation for subswath {}", 
+                                                      estimates.len(), swath_id);
+                                            // Use first estimate's polynomial (typically one per subswath in annotation)
+                                            let poly = estimates[0].data_dc_polynomial.clone();
+                                            if !poly.is_empty() {
+                                                log::info!("   DC polynomial degree: {} (coefficients: {:?})", 
+                                                          poly.len() - 1, &poly);
+                                                Some(poly)
+                                            } else {
+                                                log::warn!("⚠️  DC polynomial is empty for subswath {}", swath_id);
+                                                None
+                                            }
+                                        } else {
+                                            log::warn!("⚠️  No DC estimates found in annotation for subswath {}", swath_id);
+                                            None
+                                        }
+                                    });
+
                                 let subswath = crate::types::SubSwath {
                                     id: swath_id.clone(),
                                     burst_count,
@@ -2255,7 +2282,7 @@ impl ProductRoot {
                                         .and_then(|dl| dl.downlink_information.as_ref())
                                         .and_then(|vec| vec.first())
                                         .map(|di| di.prf),
-                                    dc_polynomial: None, // DC polynomial extracted during deburst
+                                    dc_polynomial, // Now populated from annotation!
                                     azimuth_time_interval: None, // Timing extracted during deburst
                                 };
                                 subswaths.insert(swath_id.clone(), subswath);

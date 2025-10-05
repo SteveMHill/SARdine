@@ -812,6 +812,16 @@ impl TopSarDeburstProcessor {
                 burst.azimuth_pixel_spacing / self.satellite_velocity
             };
 
+            // Diagnostic logging: Show which polynomial is being used
+            log::debug!(
+                "Deburst: using DC deg={} FM deg={} for burst {} (lines={}, samples={})",
+                burst.dc_polynomial.len().saturating_sub(1),
+                burst.fm_polynomial.len().saturating_sub(1),
+                burst_idx,
+                burst_lines,
+                burst_samples
+            );
+
             // Use range-dependent deramp if enabled, otherwise use fast time-only version
             let deramp_ramps = if self.config.use_range_dependent_deramp {
                 // Full 2D deramp: φ(t,r) with range-dependent DC and FM
@@ -1512,6 +1522,21 @@ impl DeburstProcessor {
         total_lines: usize,
         total_samples: usize,
     ) -> SarResult<Vec<BurstInfo>> {
+        Self::extract_burst_info_from_annotation_with_subswath(
+            annotation_data,
+            total_lines,
+            total_samples,
+            None, // No SubSwath provided - will try to parse from XML
+        )
+    }
+
+    /// Extract burst info with optional SubSwath data (contains pre-parsed DC polynomials)
+    pub fn extract_burst_info_from_annotation_with_subswath(
+        annotation_data: &str,
+        total_lines: usize,
+        total_samples: usize,
+        subswath: Option<&crate::types::SubSwath>,
+    ) -> SarResult<Vec<BurstInfo>> {
         log::info!("🔍 Extracting burst information from Sentinel-1 annotation");
         log::debug!(
             "Total image dimensions: {} x {}",
@@ -1520,7 +1545,7 @@ impl DeburstProcessor {
         );
 
         // Try parsing with the enhanced TOPSAR-aware method
-        match Self::parse_topsar_burst_info(annotation_data, total_lines, total_samples) {
+        match Self::parse_topsar_burst_info_with_subswath(annotation_data, total_lines, total_samples, subswath) {
             Ok(bursts) if !bursts.is_empty() => {
                 log::info!(
                     "✅ Successfully extracted {} TOPSAR bursts from annotation",
@@ -1544,11 +1569,21 @@ impl DeburstProcessor {
         }
     }
 
-    /// Parse TOPSAR burst information with enhanced parameter extraction
+    /// Backward-compatible wrapper for parse_topsar_burst_info
     fn parse_topsar_burst_info(
         annotation_data: &str,
         total_lines: usize,
         total_samples: usize,
+    ) -> SarResult<Vec<BurstInfo>> {
+        Self::parse_topsar_burst_info_with_subswath(annotation_data, total_lines, total_samples, None)
+    }
+
+    /// Parse TOPSAR burst information with enhanced parameter extraction
+    fn parse_topsar_burst_info_with_subswath(
+        annotation_data: &str,
+        total_lines: usize,
+        total_samples: usize,
+        subswath: Option<&crate::types::SubSwath>,
     ) -> SarResult<Vec<BurstInfo>> {
         log::info!("🎯 Parsing TOPSAR burst information with enhanced parameters");
 
@@ -1602,16 +1637,38 @@ impl DeburstProcessor {
             1.0 / 486.486 // Typical Sentinel-1 PRF fallback
         });
 
-        // Extract Doppler polynomials from dcEstimateList (per-burst DC)
-        // CRITICAL FIX: Extract dataDcPolynomial from <dopplerCentroid><dcEstimateList>
-        let dc_polynomial = Self::extract_dc_estimates_from_annotation(annotation_data)
-            .unwrap_or_else(|| {
-                log::error!("❌ CRITICAL: DC polynomial not found in annotation - this will cause azimuth misalignment");
-                log::error!("   Expected: <dopplerCentroid><dcEstimateList><dcEstimate><dataDcPolynomial>");
-                log::error!("   Impact: 6-7% power loss, 5-10% uncovered pixels, broken burst alignment");
-                log::error!("   Using zero fallback (NOT RECOMMENDED for production)");
-                vec![0.0, 0.0]
-            });
+        // Extract Doppler polynomials - prefer pre-parsed SubSwath data
+        let dc_polynomial = if let Some(sw) = subswath {
+            if let Some(ref dc_poly) = sw.dc_polynomial {
+                log::info!("✅ Using pre-parsed DC polynomial from SubSwath with {} coefficients: {:?}", 
+                          dc_poly.len(), dc_poly);
+                dc_poly.clone()
+            } else {
+                log::warn!("⚠️ SubSwath provided but dc_polynomial is None, falling back to XML parsing");
+                Self::extract_dc_estimates_from_annotation(annotation_data)
+                    .ok_or_else(|| {
+                        SarError::Processing(
+                            "CRITICAL: DC polynomial not found in SubSwath or annotation XML. \
+                             Expected: <dopplerCentroid><dcEstimateList><dcEstimate><dataDcPolynomial>. \
+                             Impact: Deburst cannot proceed without DC polynomials to prevent phase misalignment, \
+                             6-7% power loss, and 5-10% uncovered pixels. \
+                             ABORTING to prevent silent data corruption.".to_string()
+                        )
+                    })?
+            }
+        } else {
+            log::warn!("⚠️ No SubSwath provided, falling back to XML parsing for DC polynomial");
+            Self::extract_dc_estimates_from_annotation(annotation_data)
+                .ok_or_else(|| {
+                    SarError::Processing(
+                        "CRITICAL: DC polynomial not found in annotation. \
+                         Expected: <dopplerCentroid><dcEstimateList><dcEstimate><dataDcPolynomial>. \
+                         Impact: Deburst cannot proceed without DC polynomials to prevent phase misalignment, \
+                         6-7% power loss, and 5-10% uncovered pixels. \
+                         ABORTING to prevent silent data corruption.".to_string()
+                    )
+                })?
+        };
 
         let fm_polynomial = Self::extract_polynomial_coefficients(
             annotation_data,

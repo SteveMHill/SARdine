@@ -271,6 +271,21 @@ impl SinglePassXmlParser {
                     self.timing_data = Some(CompactTimingData::new());
                 }
             }
+            // Handle Doppler centroid and FM rate elements
+            "dopplerCentroid" | "dcEstimateList" | "dcEstimate" | "dataDcPolynomial" => {
+                // Track path for Doppler polynomial parsing
+                self.parsing_state.accumulated_text.clear();
+                if self.timing_data.is_none() {
+                    self.timing_data = Some(CompactTimingData::new());
+                }
+            }
+            "fmRate" | "fmRateList" | "fmRateEstimate" | "dataFmratePolynomial" | "dataAzimuthFmRatePolynomial" => {
+                // Track path for FM rate polynomial parsing
+                self.parsing_state.accumulated_text.clear();
+                if self.timing_data.is_none() {
+                    self.timing_data = Some(CompactTimingData::new());
+                }
+            }
             // Handle unit/scale attributes for calibration values
             "sigmaNought" | "betaNought" | "gamma" | "dn" => {
                 self.extract_unit_scale_attributes(attributes)?;
@@ -498,8 +513,58 @@ impl SinglePassXmlParser {
     
     /// Process timing-related XML elements
     fn process_timing_element(&mut self, tag_name: &str, text: &str) -> SarResult<()> {
-        // Implementation processes burst timing and polynomials
-        // ... (abbreviated for brevity)
+        let path = self.current_path.join("/");
+        
+        // Parse data BEFORE mutable borrow to avoid borrow checker issues
+        let coeffs_dc = if (tag_name == "dataDcPolynomial" && 
+                           (path.ends_with("dopplerCentroid/dcEstimateList/dcEstimate/dataDcPolynomial") ||
+                            path.contains("dcEstimate/dataDcPolynomial"))) ||
+                          ((tag_name == "dcPolynomial" || tag_name == "dopplerCentroidCoefficients") &&
+                           path.contains("doppler")) {
+            Some(self.parse_whitespace_separated_f64(text)?)
+        } else {
+            None
+        };
+        
+        let coeffs_fm = if (tag_name == "dataFmratePolynomial" || 
+                           tag_name == "dataAzimuthFmRatePolynomial" || 
+                           tag_name == "fmRatePolynomial") &&
+                          (path.contains("fmRate") || path.contains("azimuthFmRate")) {
+            Some(self.parse_whitespace_separated_f64(text)?)
+        } else {
+            None
+        };
+        
+        let prf_val = if tag_name == "prf" && path.contains("burst") {
+            Some(text.parse::<f64>().map_err(|e|
+                SarError::InvalidMetadata(format!("Invalid PRF '{}': {}", text, e)))?)
+        } else {
+            None
+        };
+        
+        // Now do mutable borrow and update
+        if let Some(ref mut td) = self.timing_data {
+            // Doppler centroid polynomial
+            if let Some(coeffs) = coeffs_dc {
+                if !coeffs.is_empty() {
+                    td.dc_polynomials.push(coeffs);
+                    log::debug!("Parsed DC polynomial with {} coefficients", td.dc_polynomials.last().unwrap().len());
+                }
+            }
+            
+            // FM rate polynomial
+            if let Some(coeffs) = coeffs_fm {
+                if !coeffs.is_empty() {
+                    td.fm_polynomials.push(coeffs);
+                    log::debug!("Parsed FM rate polynomial with {} coefficients", td.fm_polynomials.last().unwrap().len());
+                }
+            }
+            
+            // PRF per-burst
+            if let Some(prf) = prf_val {
+                td.prf_values.push(Hertz::new(prf));
+            }
+        }
         
         Ok(())
     }
@@ -534,6 +599,34 @@ impl SinglePassXmlParser {
         
         if let Some(ref mut geometric_data) = self.geometric_data {
             geometric_data.compute_domain_bounds();
+        }
+        
+        // Validate timing data consistency
+        if let Some(ref mut td) = self.timing_data {
+            log::info!(
+                "Timing parse complete: bursts={}, dc_polys={}, fm_polys={}, prf_values={}",
+                td.num_bursts, td.dc_polynomials.len(), td.fm_polynomials.len(), td.prf_values.len()
+            );
+            
+            // If burst count is known, enforce consistency
+            if td.num_bursts > 0 {
+                if !td.dc_polynomials.is_empty() && td.dc_polynomials.len() != td.num_bursts {
+                    return Err(SarError::InvalidMetadata(format!(
+                        "DC polynomials count ({}) != num_bursts ({})",
+                        td.dc_polynomials.len(), td.num_bursts
+                    )));
+                }
+                if !td.fm_polynomials.is_empty() && td.fm_polynomials.len() != td.num_bursts {
+                    return Err(SarError::InvalidMetadata(format!(
+                        "FM polynomials count ({}) != num_bursts ({})",
+                        td.fm_polynomials.len(), td.num_bursts
+                    )));
+                }
+            } else if !td.dc_polynomials.is_empty() {
+                // Infer burst count from polynomial count if not explicitly set
+                td.num_bursts = td.dc_polynomials.len();
+                log::debug!("Inferred num_bursts={} from DC polynomial count", td.num_bursts);
+            }
         }
         
         Ok(())

@@ -13,6 +13,7 @@ pub mod fast_unit_conversion;
 pub mod global_clamp_debug; // Global diagnostic clamp instrumentation
 pub mod mask_propagation; // Scientifically-valid mask propagation through processing chain
 pub mod memory_optimizations; // Memory allocation and cache optimization utilities
+pub mod memory_optimized; // Zero-copy operations and finite-only statistics
 pub mod metadata_parser; // Single-pass metadata parser with SoA arrays
 pub mod metadata_provenance; // Metadata and provenance tracking module
 pub mod metadata_strictness; // Strict metadata validation with no fallbacks

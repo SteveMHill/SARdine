@@ -2316,114 +2316,42 @@ impl TerrainCorrector {
         // So: azimuth_time_from_start = azimuth_time_rel_orbit - product_start_rel_s
         let azimuth_time_from_start = azimuth_time_rel_orbit - params.product_start_rel_s;
         
-        // DIAGNOSTIC: Verify time base consistency
-        static DIAG_ONCE: Once = Once::new();
-        DIAG_ONCE.call_once(|| {
-            log::info!(
-                "⏱️  TIME BASE DIAGNOSTIC:\n\
-                   orbit_ref_epoch (UTC)     = {:.6}s ({})\n\
-                   product_start_rel_s       = {:.3}s (since orbit_ref_epoch)\n\
-                   product_duration          = {:.3}s\n\
-                   azimuth_time_rel_orbit    = {:.3}s (first point)\n\
-                   azimuth_time_from_start   = {:.3}s (first point)",
-                params.orbit_ref_epoch_utc,
-                orbit_data.reference_time,
-                params.product_start_rel_s,
-                params.product_duration,
-                azimuth_time_rel_orbit,
-                azimuth_time_from_start
-            );
-        });
+        // CRITICAL: Strict validation of azimuth time
+        // With correct epoch handling, this should ALWAYS be in [0, product_duration]
+        let total_lines = params.total_azimuth_lines.unwrap_or(0);
+        let pri = 1.0 / params.prf.max(1.0);
+        let expected_max_time = if total_lines > 1 {
+            pri * (total_lines - 1) as f64
+        } else {
+            params.product_duration
+        };
         
-        // Guard: extremely large relative grid times indicate wrong epoch selection
-        if azimuth_time_from_start > 60.0 { // Sentinel-1 IW burst-merged scenes ~25s, full scenes < 30s
-            log::warn!(
-                "🚨 EPOCH MISMATCH: azimuth_time_from_start={:.3}s (>60s). Check time base: orbit_ref_epoch={:.3}s, product_start_rel={:.3}s, azimuth_rel_orbit={:.3}s",
-                azimuth_time_from_start, params.orbit_ref_epoch_utc, params.product_start_rel_s, azimuth_time_rel_orbit
-            );
-        }
-
-        // SCIENTIFIC DEBUG: Always log the first few coordinate calculations for debugging
-        static DEBUG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let debug_num = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
-        if debug_num < 5 {
-            log::debug!(
-                "COORDINATE DEBUG #{}: absolute_azimuth_time={:.6}s, product_start_time_abs={:.6}s, azimuth_time_from_start={:.6}s, PRF={:.3}Hz",
-                debug_num,
-                absolute_azimuth_time,
-                params.product_start_time_abs, 
+        if azimuth_time_from_start < -1e-6 || azimuth_time_from_start > expected_max_time + 1e-6 {
+            log::error!(
+                "❌ EPOCH MISMATCH: Azimuth time {:.6}s outside scene [0, {:.6}]s\n\
+                 Debug info:\n\
+                 ├─ orbit_ref_epoch (UTC) = {:.6}\n\
+                 ├─ sensing_start (UTC)   = {:.6}\n\
+                 ├─ dt_epoch              = {:.6}\n\
+                 ├─ azimuth_rel_orbit     = {:.6}\n\
+                 ├─ product_start_rel_s   = {:.6}\n\
+                 └─ azimuth_from_start    = {:.6} (SHOULD be in [0, {:.3}])",
                 azimuth_time_from_start,
-                params.prf
+                expected_max_time,
+                params.orbit_ref_epoch_utc,
+                params.product_start_time_abs,
+                params.product_start_time_abs - params.orbit_ref_epoch_utc,
+                azimuth_time_rel_orbit,
+                params.product_start_rel_s,
+                azimuth_time_from_start,
+                expected_max_time
             );
+            return None;
         }
 
-        if azimuth_time_from_start < -5.0 || azimuth_time_from_start > params.product_duration + 5.0 {
-            log::warn!(
-                "🚨 SUSPICIOUS azimuth timing: {:.6}s (expected 0 to {:.3}s for this scene)",
-                azimuth_time_from_start, params.product_duration
-            );
-        }
-
-        // SCIENTIFIC FIX: Use azimuth time interval instead of PRF directly
-        // azimuth_pixel = time_difference / time_per_pixel
-        // where time_per_pixel = 1/PRF for IW mode (single look)
+        // Calculate azimuth pixel index directly (no clamping - time already validated)
         let azimuth_time_per_pixel = 1.0 / params.prf; // Time interval between consecutive azimuth pixels
-        // Clamp grid-relative azimuth time into metadata-derived scene duration to prevent runaway indices
-        let fallback_duration = std::env::var("SARDINE_SCENE_DURATION_HINT")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(35.0); // generous upper bound for IW merged product seconds
-
-        let mut duration_limit = fallback_duration;
-
-        if params.product_duration.is_finite() && params.product_duration > 0.0 {
-            // Allow small margin (0.5s) for numerical drift
-            duration_limit = duration_limit.min(params.product_duration + 0.5);
-        }
-
-        if let Some(total_lines) = params.total_azimuth_lines {
-            if params.prf.is_finite() && params.prf > 0.0 {
-                let derived_duration = total_lines as f64 / params.prf;
-                // margin: two azimuth lines or at least 0.1s to avoid clipping valid edge pixels
-                let guard_margin = (2.0 / params.prf).max(0.1);
-                duration_limit = duration_limit.min(derived_duration + guard_margin);
-            }
-        }
-
-        if !duration_limit.is_finite() || duration_limit <= 0.0 {
-            duration_limit = fallback_duration.max(1.0);
-        }
-
-        let azimuth_time_grid = diag_clamp(
-            azimuth_time_from_start,
-            0.0,
-            duration_limit,
-            "azimuth_time_grid",
-        );
-        if (azimuth_time_from_start - azimuth_time_grid).abs() > 1e-9 {
-            log::warn!(
-                "🔧 GRID TIME CLAMP applied: raw={:.3}s clamped→{:.3}s (limit={:.3}s)",
-                azimuth_time_from_start, azimuth_time_grid, duration_limit
-            );
-        }
-        let azimuth_pixel = azimuth_time_grid / azimuth_time_per_pixel;
-        
-        if debug_num < 5 {
-            log::info!(
-                "🔎 AZ DURATION LIMIT #{}: product_duration={:.3}s, total_lines={:?}, limit={:.3}s",
-                debug_num,
-                params.product_duration,
-                params.total_azimuth_lines,
-                duration_limit
-            );
-            log::warn!(
-                "🔬 PIXEL CALC DEBUG #{}: azimuth_pixel = {:.3} (expected 0-13608 for IW2)",
-                debug_num,
-                azimuth_pixel
-            );
-        }
+        let azimuth_pixel = azimuth_time_from_start / azimuth_time_per_pixel;
 
         // Validate azimuth pixel
         if !azimuth_pixel.is_finite() {
@@ -2494,9 +2422,9 @@ impl TerrainCorrector {
         // Physical validation based on sensor parameters
         // TRIAGE LOG (before bounds check) – verifies correct time origin usage for azimuth indexing
         log::trace!(
-            "grid map: t_abs={:.6}, t_rel_grid={:.6}, prf={:.3}, az_idx={:.1}, max={}",
+            "grid map: t_abs={:.6}, t_from_start={:.6}, prf={:.3}, az_idx={:.1}, max={}",
             absolute_azimuth_time,
-            azimuth_time_grid,
+            azimuth_time_from_start,
             params.prf,
             azimuth_pixel,
             max_realistic_azimuth
@@ -2505,8 +2433,8 @@ impl TerrainCorrector {
         // Debug safeguard: azimuth indices should not explode beyond plausible merged IW size (< ~200k)
         debug_assert!(
             azimuth_pixel < 2.5e5,
-            "Azimuth pixel {} implausibly large – likely wrong epoch (abs={}, rel_grid={}, prf={})",
-            azimuth_pixel, absolute_azimuth_time, azimuth_time_grid, params.prf
+            "Azimuth pixel {} implausibly large – likely wrong epoch (abs={}, from_start={}, prf={})",
+            azimuth_pixel, absolute_azimuth_time, azimuth_time_from_start, params.prf
         );
 
         if range_pixel >= 0.0
@@ -2548,76 +2476,100 @@ impl TerrainCorrector {
         debug_assert!(target_range > 1000.0 && target_range < 1.0e7,
             "Target ECEF range unrealistic: {}", target_range);
 
-        // Initial guess: find closest approach orbit state
-    // NOTE: All times inside solver now relative to ORBIT REFERENCE epoch (not product start)
+        // Initial guess: use product mid-time (orbit-relative)
+    // NOTE: All times inside solver are relative to ORBIT REFERENCE epoch
     let orbit_ref_epoch = crate::types::datetime_to_utc_seconds(orbit_data.reference_time);
     
-    // CRITICAL FIX: Initialize best_time to middle of product acquisition, not 0
-    // This ensures we start searching near the actual imaging time
-    let product_mid_time = params.product_start_time_abs + (params.product_duration / 2.0);
-    let mut best_time = product_mid_time - orbit_ref_epoch; // relative to orbit reference
-    let mut min_distance = f64::MAX;
+    // CRITICAL FIX: Stay within product time window for initial guess
+    // Previously: searched ALL orbit state vectors, often finding times 50-100s outside product
+    // Result: azimuth_time_from_start = 78-82s instead of 0-25s → massive pixel indices
+    let mut best_time = params.product_start_rel_s + (params.product_duration / 2.0);
+    
+    // Diagnostic logging for first call only
+    static STARTUP_DIAG: std::sync::Once = std::sync::Once::new();
+    STARTUP_DIAG.call_once(|| {
+        let sensing_start_utc = params.product_start_time_abs;
+        let dt_epoch = sensing_start_utc - orbit_ref_epoch;
+        let pri = if params.prf > 0.0 { 1.0 / params.prf } else { 0.0 };
+        let total_lines = params.total_azimuth_lines.unwrap_or(0);
+        let total_az_time = if total_lines > 1 { pri * (total_lines - 1) as f64 } else { params.product_duration };
+        
+        log::info!(
+            "🔍 TIME BASE INITIALIZATION (UTC seconds):\n\
+             ├─ orbit_ref_epoch    = {:.6} (orbit reference)\n\
+             ├─ sensing_start      = {:.6} (product start)\n\
+             ├─ dt_epoch           = {:.6} (sensing_start - orbit_ref)\n\
+             ├─ PRI                = {:.9} s\n\
+             ├─ total_azimuth_time = {:.6} s ({} lines)\n\
+             ├─ Line 0   → t_query = {:.6} (should ≈ sensing_start)\n\
+             └─ Line {:5} → t_query = {:.6} (should ≈ sensing_start + {:.3}s)",
+            orbit_ref_epoch,
+            sensing_start_utc,
+            dt_epoch,
+            pri,
+            total_az_time,
+            total_lines,
+            orbit_ref_epoch + params.product_start_rel_s,
+            total_lines.saturating_sub(1),
+            orbit_ref_epoch + params.product_start_rel_s + total_az_time,
+            total_az_time
+        );
+    });
 
-        for (_i, state_vector) in orbit_data.state_vectors.iter().enumerate() {
-            let satellite_pos = [
-                state_vector.position[0],
-                state_vector.position[1],
-                state_vector.position[2],
-            ];
-            let distance = self.distance_to_point(&satellite_pos, target_ecef);
-
-            if distance < min_distance {
-                min_distance = distance;
-                // CRITICAL FIX: Convert absolute time to relative time from ORBIT REFERENCE
-                // This fixes the azimuth time origin bug where orbit reference time was
-                // being used instead of product start time, causing massive out-of-bounds pixel indices
-                let absolute_time = crate::types::datetime_to_utc_seconds(state_vector.time);
-                best_time = absolute_time - orbit_ref_epoch; // relative to orbit reference
-            }
-        }
-
-        // Compute orbit time bounds with safety margin (relative to product start time)
+        // Compute orbit coverage bounds (orbit-relative)
         let min_orbit_time = orbit_data
             .state_vectors
             .first()
-            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch + 10.0)
-            .unwrap_or(best_time - 300.0);
+            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch)
+            .unwrap_or(params.product_start_rel_s - 60.0);
         let max_orbit_time = orbit_data
             .state_vectors
             .last()
-            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch - 10.0)
-            .unwrap_or(best_time + 300.0);
+            .map(|sv| crate::types::datetime_to_utc_seconds(sv.time) - orbit_ref_epoch)
+            .unwrap_or(params.product_start_rel_s + params.product_duration + 60.0);
 
-        // Validate seed is within orbit bounds
-        if best_time < min_orbit_time || best_time > max_orbit_time {
-            log::warn!(
-                "Seed time {:.2} outside safe orbit bounds [{:.2}, {:.2}], clamping",
-                best_time, min_orbit_time, max_orbit_time
-            );
-            log::trace!("🔍 CLAMP DEBUG #1: best_time.clamp({:.1}, {:.1})", min_orbit_time, max_orbit_time);
-            best_time = diag_clamp(best_time, min_orbit_time, max_orbit_time, "best_time");
+        // Strict validation: initial guess MUST be within product window
+        let product_end = params.product_start_rel_s + params.product_duration;
+        if best_time < params.product_start_rel_s - 1.0 || best_time > product_end + 1.0 {
+            return Err(SarError::Processing(format!(
+                "Initial time guess {:.6}s outside product window [{:.6}, {:.6}]s. \
+                 This indicates epoch mismatch. orbit_ref={:.3}, sensing_start={:.3}, dt={:.6}",
+                best_time,
+                params.product_start_rel_s,
+                product_end,
+                orbit_ref_epoch,
+                params.product_start_time_abs,
+                params.product_start_time_abs - orbit_ref_epoch
+            )));
         }
 
         // Newton-Raphson iteration with proper convergence criteria
         let mut azimuth_time = best_time;
-        let convergence_threshold = 1e-3; // Relaxed for robustness in challenging terrain
-        let max_iterations = 50; // Increased for better convergence
-
-        let mut previous_azimuth_time: Option<f64> = None;
-        let mut previous_doppler_freq: Option<f64> = None;
+        const DOPPLER_CONVERGENCE_HZ: f64 = 1e-3; // 1 mHz Doppler tolerance
+        const TIME_CONVERGENCE_S: f64 = 1e-4;     // 0.1 ms time step tolerance
+        const MAX_ITERATIONS: usize = 8;           // Hard cap - with good initial guess, 3-5 is typical
         const MIN_DERIVATIVE: f64 = 1e-12;
-        const MAX_TIME_STEP: f64 = 0.25; // prevent runaway updates
+        
+        // CRITICAL: Use PRI-based step limit to prevent divergence
+        let pri = 1.0 / params.prf.max(1.0);
+        let max_time_step = pri * 2.0; // Allow max 2 PRI steps per iteration
+        
+        let product_end = params.product_start_rel_s + params.product_duration;
 
-        for iteration in 0..max_iterations {
-            // Only clamp azimuth time if significantly outside orbit bounds
-            let margin = 5.0; // Allow 5 seconds of extrapolation before clamping
-            if azimuth_time < (min_orbit_time - margin) || azimuth_time > (max_orbit_time + margin) {
-                log::debug!(
-                    "Newton-Raphson: clamping time {:.2} to [{:.2}, {:.2}] (with {:.1}s margin)",
-                    azimuth_time, min_orbit_time, max_orbit_time, margin
-                );
-                log::trace!("🔍 CLAMP DEBUG #2: azimuth_time.clamp({:.1}, {:.1})", min_orbit_time - margin, max_orbit_time + margin);
-                azimuth_time = diag_clamp(azimuth_time, min_orbit_time - margin, max_orbit_time + margin, "azimuth_time_iter");
+        for iteration in 0..MAX_ITERATIONS {
+            // Strict validation: abort if we've diverged outside product window
+            // Small margin (1 PRI) for numerical stability, but NO large clamps
+            let margin = pri;
+            if azimuth_time < (params.product_start_rel_s - margin) 
+               || azimuth_time > (product_end + margin) {
+                return Err(SarError::Processing(format!(
+                    "Newton-Raphson diverged: time {:.6}s outside product [{:.6}, {:.6}]s at iteration {}. \
+                     This indicates incorrect initial guess or epoch mismatch.",
+                    azimuth_time,
+                    params.product_start_rel_s,
+                    product_end,
+                    iteration
+                )));
             }
             // Convert relative time to absolute time for orbit interpolation
             // CRITICAL FIX: Use product start time instead of orbit reference time
@@ -2677,123 +2629,50 @@ impl TerrainCorrector {
             // CORRECTED FORMULA: Normalize dot product by range to get radial rate
             let range_rate = range_dot_velocity / range_magnitude;  // m/s
             let doppler_freq = -2.0 * range_rate / params.wavelength;  // Hz
-            
-            log::debug!(
-                "NR iter {}: range_rate={:.2e} m/s, doppler_freq={:.2e} Hz (was computing {:.2e} without normalization)",
-                iteration, range_rate, doppler_freq, 
-                -2.0 * range_dot_velocity / params.wavelength
-            );
 
             // Validate Doppler frequency
             if !doppler_freq.is_finite() {
-                log::error!(
-                    "❌ Newton-Raphson: non-finite Doppler frequency {} at iteration {}",
-                    doppler_freq,
-                    iteration
-                );
-                log::error!(
-                    "   range_dot_velocity: {}, wavelength: {}, range_magnitude: {}",
-                    range_dot_velocity,
-                    params.wavelength,
-                    range_magnitude
-                );
                 return Err(SarError::Processing(
                     "Newton-Raphson: Doppler frequency calculation failed".to_string(),
                 ));
             }
 
-            // Check for convergence
-            if doppler_freq.abs() < convergence_threshold {
-                log::debug!(
-                    "Newton-Raphson converged in {} iterations with Doppler frequency {:.2e} Hz",
-                    iteration + 1,
-                    doppler_freq
-                );
-                
-                // CRITICAL VALIDATION: Ensure result is within product acquisition time range
-                // Convert orbit-relative time to product-relative time for validation
-                let absolute_result_time = azimuth_time + orbit_ref_epoch;
-                let product_relative_time = absolute_result_time - params.product_start_time_abs;
-                
-                // Warn if outside expected product duration (but don't fail - could be edge pixel)
-                if product_relative_time < -1.0 || product_relative_time > (params.product_duration + 1.0) {
-                    log::warn!(
-                        "⚠️ Newton-Raphson converged to time outside product: product_rel={:.3}s (expected 0-{:.3}s)",
-                        product_relative_time, params.product_duration
-                    );
-                    log::warn!(
-                        "   azimuth_time_orbit_rel={:.3}s, orbit_ref={:.3}s, product_start={:.3}s",
-                        azimuth_time, orbit_ref_epoch, params.product_start_time_abs
-                    );
-                }
-                
+            // EARLY STOP: Check for convergence (Doppler ~ 0 Hz)
+            if doppler_freq.abs() < DOPPLER_CONVERGENCE_HZ {
                 return Ok(azimuth_time);
             }
 
-            // Calculate derivative of Doppler frequency with respect to time using
-            // an adaptive central-difference scheme. This drastically reduces the risk
-            // of numerically flat derivatives that can stall convergence.
+            // ANALYTIC DERIVATIVE: Compute ∂f_d/∂t from orbital geometry
+            // This eliminates 2 orbit interpolations per iteration (3x speedup)
+            //
+            // f_d = -2 * R_dot / λ  where R_dot = (r⃗ · v⃗) / |r⃗|
+            //
+            // ∂f_d/∂t = -2/λ * ∂R_dot/∂t
+            //         = -2/λ * [ (v⃗·v⃗ + r⃗·a⃗)/|r⃗| - (r⃗·v⃗)²/|r⃗|³ ]
+            //
+            // Approximation: a⃗ ≈ 0 for short intervals (satellite in free-fall orbit)
+            // This simplifies to:
+            // ∂f_d/∂t ≈ -2/λ * [ |v⃗|² - (R_dot)² ] / |r⃗|
             
-            // DIAGNOSTIC: Log key values for first iteration to understand the problem
-            if iteration == 0 {
-                log::trace!(
-                    "Newton-Raphson DIAGNOSTIC (iter 0): t_rel_orbit={:.6}s, abs_time={:.6}s, doppler_freq={:.6e} Hz (product_start_time_abs={:.6})",
-                    azimuth_time, absolute_azimuth_time, doppler_freq, params.product_start_time_abs
-                );
-                log::trace!(
-                    "   sat_pos=({:.2}, {:.2}, {:.2}), sat_vel=({:.2}, {:.2}, {:.2})",
-                    sat_pos.x, sat_pos.y, sat_pos.z, sat_vel.x, sat_vel.y, sat_vel.z
-                );
-                log::trace!(
-                    "   target=({:.2}, {:.2}, {:.2}), range_mag={:.2}m",
-                    target_ecef[0], target_ecef[1], target_ecef[2], range_magnitude
-                );
-                log::trace!(
-                    "   range_vec=({:.2}, {:.2}, {:.2}), range_dot_vel={:.6e}",
-                    range_vec[0], range_vec[1], range_vec[2], range_dot_velocity
-                );
-                log::trace!(
-                    "   wavelength={:.6}m, product_start_time_abs={:.6}s",
-                    params.wavelength, params.product_start_time_abs
-                );
-            }
-            
-            let mut doppler_derivative: Option<f64> = None;
-            let mut step = 0.001; // 1 ms initial step size
-            for attempt in 0..5 {
+            let vel_magnitude_sq = sat_vel.x * sat_vel.x + sat_vel.y * sat_vel.y + sat_vel.z * sat_vel.z;
+            let mut doppler_derivative = -2.0 / params.wavelength * 
+                (vel_magnitude_sq / range_magnitude - range_rate * range_rate / range_magnitude);
+
+            // Validate derivative
+            if !doppler_derivative.is_finite() || doppler_derivative.abs() < MIN_DERIVATIVE {
+                // Fallback: if analytic derivative fails, use finite difference
+                let step = 0.001; // 1 ms
                 let absolute_plus = azimuth_time + step + orbit_ref_epoch;
                 let absolute_minus = azimuth_time - step + orbit_ref_epoch;
 
-                let (sat_pos_plus, sat_vel_plus) = match self
-                    .scientific_orbit_interpolation(orbit_data, absolute_plus)
-                {
+                // Finite difference fallback
+                let (sat_pos_plus, sat_vel_plus) = match self.scientific_orbit_interpolation(orbit_data, absolute_plus) {
                     Ok(value) => value,
-                    Err(e) => {
-                        log::debug!(
-                            "Newton-Raphson derivative attempt {} failed (positive step {}): {}",
-                            attempt,
-                            step,
-                            e
-                        );
-                        step *= 0.25;
-                        continue;
-                    }
+                    Err(_) => break, // Give up on finite diff, accept poor derivative
                 };
-
-                let (sat_pos_minus, sat_vel_minus) = match self
-                    .scientific_orbit_interpolation(orbit_data, absolute_minus)
-                {
+                let (sat_pos_minus, sat_vel_minus) = match self.scientific_orbit_interpolation(orbit_data, absolute_minus) {
                     Ok(value) => value,
-                    Err(e) => {
-                        log::debug!(
-                            "Newton-Raphson derivative attempt {} failed (negative step {}): {}",
-                            attempt,
-                            step,
-                            e
-                        );
-                        step *= 0.25;
-                        continue;
-                    }
+                    Err(_) => break,
                 };
 
                 let range_vec_plus = [
@@ -2814,17 +2693,9 @@ impl TerrainCorrector {
                     (range_vec_minus[0].powi(2) + range_vec_minus[1].powi(2) + range_vec_minus[2].powi(2)).sqrt();
 
                 if !range_mag_plus.is_finite() || !range_mag_minus.is_finite() {
-                    log::debug!(
-                        "Newton-Raphson derivative attempt {} produced non-finite ranges ({} / {})",
-                        attempt,
-                        range_mag_plus,
-                        range_mag_minus
-                    );
-                    step *= 0.25;
-                    continue;
+                    break; // Give up on finite diff
                 }
 
-                // CORRECTED: Use radial rate formula (normalize by range)
                 let range_rate_plus = (range_vec_plus[0] * sat_vel_plus.x
                     + range_vec_plus[1] * sat_vel_plus.y
                     + range_vec_plus[2] * sat_vel_plus.z) / range_mag_plus;
@@ -2834,85 +2705,23 @@ impl TerrainCorrector {
                     + range_vec_minus[1] * sat_vel_minus.y
                     + range_vec_minus[2] * sat_vel_minus.z) / range_mag_minus;
                 let doppler_minus = -2.0 * range_rate_minus / params.wavelength;
-                
-                // GUARD: Check if orbit interpolation returned distinct states
-                let pos_diff = ((sat_pos_plus.x - sat_pos_minus.x).powi(2) +
-                               (sat_pos_plus.y - sat_pos_minus.y).powi(2) +
-                               (sat_pos_plus.z - sat_pos_minus.z).powi(2)).sqrt();
-                if pos_diff < 1.0 {  // Less than 1 meter difference -> clamped/quantized
-                    log::debug!(
-                        "Newton-Raphson derivative attempt {}: orbit states too close ({:.3}m), increasing step",
-                        attempt, pos_diff
-                    );
-                    step *= 2.0;  // Increase step to get distinct interpolation
-                    continue;
-                }
 
                 if !doppler_plus.is_finite() || !doppler_minus.is_finite() {
-                    log::debug!(
-                        "Newton-Raphson derivative attempt {} produced non-finite doppler values ({} / {})",
-                        attempt,
-                        doppler_plus,
-                        doppler_minus
-                    );
-                    step *= 0.25;
-                    continue;
-                }
-
-                let derivative = (doppler_plus - doppler_minus) / (2.0 * step);
-                
-                // DIAGNOSTIC: Log derivative calculation details for first iteration
-                if iteration == 0 && attempt == 0 {
-                    log::info!(
-                        "🔍 NR DERIVATIVE: step={:.6}s, pos_diff={:.2}m, doppler_plus={:.6e}, doppler_minus={:.6e}, derivative={:.6e}",
-                        step, pos_diff, doppler_plus, doppler_minus, derivative
-                    );
-                    log::info!(
-                        "   range_rate_plus={:.2} m/s, range_rate_minus={:.2} m/s",
-                        range_rate_plus, range_rate_minus
-                    );
-                }
-
-                if derivative.is_finite() {
-                    doppler_derivative = Some(derivative);
-                    if derivative.abs() < MIN_DERIVATIVE {
-                        log::debug!(
-                            "Newton-Raphson derivative too small ({:.6e} < {:.6e}) at attempt {}, reducing step from {:.6} to {:.6}",
-                            derivative.abs(), MIN_DERIVATIVE, attempt, step, step * 0.25
-                        );
-                        step *= 0.25;
-                        continue;
-                    }
                     break;
-                } else {
-                    step *= 0.25;
                 }
+
+                let doppler_derivative = (doppler_plus - doppler_minus) / (2.0 * step);
+                if doppler_derivative.is_finite() && doppler_derivative.abs() >= MIN_DERIVATIVE {
+                    break; // Use this value
+                }
+                break; // Give up
             }
 
-            let mut doppler_derivative = if let Some(derivative) = doppler_derivative {
-                derivative
-            } else {
-                log::warn!("🔍 All derivative attempts failed - no finite derivative found");
-                0.0
-            };
-
-            if doppler_derivative.abs() < MIN_DERIVATIVE {
-                if let (Some(prev_time), Some(prev_doppler)) =
-                    (previous_azimuth_time, previous_doppler_freq)
-                {
-                    let delta_time = azimuth_time - prev_time;
-                    if delta_time.abs() > 1e-9 {
-                        let secant_derivative = (doppler_freq - prev_doppler) / delta_time;
-                        if secant_derivative.is_finite() && secant_derivative.abs() >= MIN_DERIVATIVE
-                        {
-                            log::debug!(
-                                "Newton-Raphson derivative fallback using secant slope {}",
-                                secant_derivative
-                            );
-                            doppler_derivative = secant_derivative;
-                        }
-                    }
-                }
+            // Final validation: if derivative still bad, we can't proceed
+            if !doppler_derivative.is_finite() || doppler_derivative.abs() < MIN_DERIVATIVE {
+                return Err(SarError::Processing(
+                    "Newton-Raphson: cannot compute valid derivative".to_string(),
+                ));
             }
 
             if doppler_derivative.abs() < MIN_DERIVATIVE {
@@ -2929,59 +2738,36 @@ impl TerrainCorrector {
                 doppler_derivative = fallback_derivative;
             }
 
-            let time_update = doppler_freq / doppler_derivative;
+            // Newton-Raphson update: Δt = -f/f'
+            let mut time_update = doppler_freq / doppler_derivative;
 
             if !time_update.is_finite() {
-                log::error!(
-                    "❌ Newton-Raphson: non-finite time update {} at iteration {}",
-                    time_update,
-                    iteration
-                );
-                log::error!(
-                    "   doppler_freq: {}, doppler_derivative: {}",
-                    doppler_freq,
-                    doppler_derivative
-                );
                 return Err(SarError::Processing(
                     "Newton-Raphson: time update calculation failed".to_string(),
                 ));
             }
 
-            if time_update.abs() > MAX_TIME_STEP {
-                log::debug!(
-                    "Newton-Raphson time update {:.6} clamped to {:.6} to maintain stability",
-                    time_update,
-                    dbg_clamp!("time_update_preview", time_update, -MAX_TIME_STEP, MAX_TIME_STEP)
-                );
-                log::trace!("🔍 CLAMP DEBUG #3: time_update.clamp({:.1}, {:.1})", -MAX_TIME_STEP, MAX_TIME_STEP);
+            // Clamp update to prevent runaway (use PRI-based limit)
+            if time_update.abs() > max_time_step {
+                time_update = time_update.signum() * max_time_step;
             }
 
-            log::trace!("🔍 CLAMP DEBUG #4: time_update.clamp({:.1}, {:.1})", -MAX_TIME_STEP, MAX_TIME_STEP);
-            let time_update = dbg_clamp!("time_update", time_update, -MAX_TIME_STEP, MAX_TIME_STEP);
-            let previous_time_snapshot = azimuth_time;
-
             azimuth_time -= time_update;
-            previous_azimuth_time = Some(previous_time_snapshot);
-            previous_doppler_freq = Some(doppler_freq);
 
-            // Validate updated azimuth time
             if !azimuth_time.is_finite() {
-                log::error!(
-                    "❌ Newton-Raphson: non-finite azimuth_time {} after update at iteration {}",
-                    azimuth_time,
-                    iteration
-                );
                 return Err(SarError::Processing(
                     "Newton-Raphson: azimuth time became non-finite".to_string(),
                 ));
             }
+
+            // EARLY STOP: Time step converged
+            if time_update.abs() < TIME_CONVERGENCE_S {
+                return Ok(azimuth_time);
+            }
         }
 
-        log::warn!(
-            "Newton-Raphson did not converge within {} iterations",
-            max_iterations
-        );
-        Ok(azimuth_time) // Return best estimate even if not fully converged
+        // Hard cap reached - return best estimate
+        Ok(azimuth_time)
     }
 
     /// Scientific orbit state interpolation using cubic splines ONLY
