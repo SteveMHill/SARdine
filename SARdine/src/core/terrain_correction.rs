@@ -2167,7 +2167,7 @@ impl TerrainCorrector {
         // Inline bounds diagnostics (non-panicking) to surface any inverted logic earlier upstream.
         let diag_bounds = |min_v: f64, max_v: f64, label: &str| {
             if min_v > max_v {
-                log::error!(
+                log::debug!(
                     "🚫 INVERTED BOUNDS at {}: min={:.6} > max={:.6} (lat={:.6}, lon={:.6}, elev={:.2})",
                     label, min_v, max_v, lat, lon, elevation
                 );
@@ -2178,7 +2178,7 @@ impl TerrainCorrector {
         
         // CRITICAL: Validate input coordinates
         if !lat.is_finite() || !lon.is_finite() || !elevation.is_finite() {
-            log::error!(
+            log::debug!(
                 "❌ Invalid input coordinates: lat={}, lon={}, elev={}",
                 lat,
                 lon,
@@ -2226,7 +2226,7 @@ impl TerrainCorrector {
                 time
             }
             Err(e) => {
-                log::error!("❌ Newton-Raphson failed: {}", e);
+                log::debug!("❌ Newton-Raphson failed: {}", e);
                 return None;
             }
         };
@@ -2248,7 +2248,7 @@ impl TerrainCorrector {
             Ok((position, velocity)) => {
                 // Validate satellite position
                 if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
-                    log::error!(
+                    log::debug!(
                         "❌ Invalid satellite position: [{}, {}, {}]",
                         position.x,
                         position.y,
@@ -2259,7 +2259,7 @@ impl TerrainCorrector {
                 (position, velocity)
             }
             Err(e) => {
-                log::error!("❌ Orbit interpolation failed: {}", e);
+                log::debug!("❌ Orbit interpolation failed: {}", e);
                 return None;
             }
         };
@@ -2275,7 +2275,7 @@ impl TerrainCorrector {
 
         // Validate slant range
         if !slant_range.is_finite() || slant_range <= 0.0 {
-            log::error!("❌ Invalid slant range: {}", slant_range);
+            log::debug!("❌ Invalid slant range: {}", slant_range);
             return None;
         }
 
@@ -2285,7 +2285,7 @@ impl TerrainCorrector {
 
         // Validate two-way time
         if !two_way_time.is_finite() {
-            log::error!("❌ Invalid two-way time: {}", two_way_time);
+            log::debug!("❌ Invalid two-way time: {}", two_way_time);
             return None;
         }
 
@@ -2295,7 +2295,7 @@ impl TerrainCorrector {
 
         // Validate range pixel spacing time
         if !range_pixel_spacing_time.is_finite() || range_pixel_spacing_time <= 0.0 {
-            log::error!(
+            log::debug!(
                 "❌ Invalid range pixel spacing time: {}",
                 range_pixel_spacing_time
             );
@@ -2306,7 +2306,7 @@ impl TerrainCorrector {
 
         // Validate range pixel
         if !range_pixel.is_finite() {
-            log::error!("❌ Invalid range pixel: {} (two_way_time={}, slant_range_time={}, spacing_time={})", 
+            log::debug!("❌ Invalid range pixel: {} (two_way_time={}, slant_range_time={}, spacing_time={})", 
                        range_pixel, two_way_time, params.slant_range_time, range_pixel_spacing_time);
             return None;
         }
@@ -2337,7 +2337,7 @@ impl TerrainCorrector {
         
         // Guard: extremely large relative grid times indicate wrong epoch selection
         if azimuth_time_from_start > 60.0 { // Sentinel-1 IW burst-merged scenes ~25s, full scenes < 30s
-            log::error!(
+            log::warn!(
                 "🚨 EPOCH MISMATCH: azimuth_time_from_start={:.3}s (>60s). Check time base: orbit_ref_epoch={:.3}s, product_start_rel={:.3}s, azimuth_rel_orbit={:.3}s",
                 azimuth_time_from_start, params.orbit_ref_epoch_utc, params.product_start_rel_s, azimuth_time_rel_orbit
             );
@@ -2348,8 +2348,8 @@ impl TerrainCorrector {
         let debug_num = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
         if debug_num < 5 {
-            log::warn!(
-                "� COORDINATE DEBUG #{}: absolute_azimuth_time={:.6}s, product_start_time_abs={:.6}s, azimuth_time_from_start={:.6}s, PRF={:.3}Hz",
+            log::debug!(
+                "COORDINATE DEBUG #{}: absolute_azimuth_time={:.6}s, product_start_time_abs={:.6}s, azimuth_time_from_start={:.6}s, PRF={:.3}Hz",
                 debug_num,
                 absolute_azimuth_time,
                 params.product_start_time_abs, 
@@ -2645,7 +2645,7 @@ impl TerrainCorrector {
 
             // Validate intermediate calculations
             if !range_dot_velocity.is_finite() {
-                log::error!(
+                log::debug!(
                     "❌ Newton-Raphson: non-finite range_dot_velocity at iteration {}",
                     iteration
                 );
@@ -2655,7 +2655,7 @@ impl TerrainCorrector {
             }
 
             if range_magnitude <= 0.0 || !range_magnitude.is_finite() || range_magnitude < 1000.0 || range_magnitude > 1.0e7 {
-                log::error!(
+                log::debug!(
                     "❌ Newton-Raphson: invalid range_magnitude {} at iteration {} (realistic range: 1km - 10,000km)",
                     range_magnitude,
                     iteration
@@ -2736,23 +2736,23 @@ impl TerrainCorrector {
             
             // DIAGNOSTIC: Log key values for first iteration to understand the problem
             if iteration == 0 {
-                log::error!(
-                    "🔍 Newton-Raphson DIAGNOSTIC (iter 0): t_rel_orbit={:.6}s, abs_time={:.6}s, doppler_freq={:.6e} Hz (product_start_time_abs={:.6})",
+                log::trace!(
+                    "Newton-Raphson DIAGNOSTIC (iter 0): t_rel_orbit={:.6}s, abs_time={:.6}s, doppler_freq={:.6e} Hz (product_start_time_abs={:.6})",
                     azimuth_time, absolute_azimuth_time, doppler_freq, params.product_start_time_abs
                 );
-                log::error!(
+                log::trace!(
                     "   sat_pos=({:.2}, {:.2}, {:.2}), sat_vel=({:.2}, {:.2}, {:.2})",
                     sat_pos.x, sat_pos.y, sat_pos.z, sat_vel.x, sat_vel.y, sat_vel.z
                 );
-                log::error!(
+                log::trace!(
                     "   target=({:.2}, {:.2}, {:.2}), range_mag={:.2}m",
                     target_ecef[0], target_ecef[1], target_ecef[2], range_magnitude
                 );
-                log::error!(
+                log::trace!(
                     "   range_vec=({:.2}, {:.2}, {:.2}), range_dot_vel={:.6e}",
                     range_vec[0], range_vec[1], range_vec[2], range_dot_velocity
                 );
-                log::error!(
+                log::trace!(
                     "   wavelength={:.6}m, product_start_time_abs={:.6}s",
                     params.wavelength, params.product_start_time_abs
                 );
@@ -3640,50 +3640,18 @@ impl TerrainCorrector {
             );
         }
 
-        // Create geotransform with proper unit conversion based on CRS
-        let (pixel_width, pixel_height) = if self.output_crs == 4326 {
-            // For Geographic (WGS84 EPSG:4326): convert meters to degrees
-            // Using accurate geodetic calculation at the center latitude
-            let center_lat = (proj_min_y + proj_max_y) / 2.0;
-            let center_lat_rad = center_lat.to_radians();
-            
-            // WGS84 ellipsoid parameters
-            let a = 6378137.0; // Semi-major axis (meters)
-            let e2 = 0.00669437999014; // First eccentricity squared
-            
-            // Calculate meters per degree longitude at center latitude
-            let sin_lat = center_lat_rad.sin();
-            let prime_vertical_radius = a / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-            let meters_per_degree_lon = prime_vertical_radius * center_lat_rad.cos() * std::f64::consts::PI / 180.0;
-            
-            // Calculate meters per degree latitude (approximately constant)
-            let meridional_radius = a * (1.0 - e2) / (1.0 - e2 * sin_lat * sin_lat).powf(1.5);
-            let meters_per_degree_lat = meridional_radius * std::f64::consts::PI / 180.0;
-            
-            // Convert output spacing from meters to degrees
-            let pixel_width_deg = self.output_spacing / meters_per_degree_lon;
-            let pixel_height_deg = self.output_spacing / meters_per_degree_lat;
-            
-            log::info!("📐 Converting pixel spacing for geographic CRS (EPSG:4326):");
-            log::info!("   🎯 Target resolution: {:.1}m", self.output_spacing);
-            log::info!("   📏 Pixel width: {:.8}° ({:.4} arcsec)", pixel_width_deg, pixel_width_deg * 3600.0);
-            log::info!("   📏 Pixel height: {:.8}° ({:.4} arcsec)", pixel_height_deg, pixel_height_deg * 3600.0);
-            
-            (pixel_width_deg, -pixel_height_deg) // Negative height for north-up
-        } else {
-            // For projected coordinates (UTM, etc.): use meters directly
-            log::info!("📐 Using meter spacing for projected CRS (EPSG:{}):", self.output_crs);
-            log::info!("   🎯 Pixel spacing: {:.1}m", self.output_spacing);
-            (self.output_spacing, -self.output_spacing) // Negative height for north-up
-        };
+        // For projected coordinates (UTM, etc.): use meters directly
+        // Note: Geographic coordinates (EPSG:4326) are handled by create_geographic_grid()
+        log::debug!("Using meter spacing for projected CRS (EPSG:{}):", self.output_crs);
+        log::debug!("   Pixel spacing: {:.1}m", self.output_spacing);
         
         let transform = GeoTransform {
             top_left_x: proj_min_x,
-            pixel_width,
+            pixel_width: self.output_spacing,
             rotation_x: 0.0,
             top_left_y: proj_max_y, // Start from northern edge
             rotation_y: 0.0,
-            pixel_height,
+            pixel_height: -self.output_spacing, // Negative for north-up orientation
         };
 
         Ok((width, height, transform))
@@ -6022,7 +5990,7 @@ impl TerrainCorrector {
         };
 
         let processed_chunks: Vec<_> = if use_serial {
-            log::error!("🧪 SERIAL MODE: SARDINE_SERIAL_TERRAIN=1 – processing chunks sequentially for deterministic clamp tracing");
+            log::debug!("🧪 SERIAL MODE: SARDINE_SERIAL_TERRAIN=1 – processing chunks sequentially for deterministic clamp tracing");
             chunks.iter().map(|(cy, cx)| process_chunk(*cy, *cx)).collect()
         } else {
             chunks.par_iter().map(|&(cy, cx)| process_chunk(cy, cx)).collect()
