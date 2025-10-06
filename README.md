@@ -7,6 +7,18 @@
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.2.1-brightgreen)](SARdine/Cargo.toml)
 
+---
+
+## ⚠️ EXPERIMENTAL - NOT PRODUCTION READY
+
+**This package is experimental and designed for research, learning, and testing purposes only. It is NOT production-ready and should not be used in operational environments.**
+
+- **Status:** Development/Research Tool
+- **Stability:** Experimental
+- **Support:** Community/Educational Use Only
+
+---
+
 SARdine is a scientifically rigorous, high-performance SAR processing library that combines the speed of Rust with the accessibility of Python. It provides a complete pipeline for processing Sentinel-1 SAR data from raw SLC files to terrain-corrected, analysis-ready GeoTIFF products.
 
 ## ✨ Key Features
