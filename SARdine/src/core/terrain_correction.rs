@@ -1145,6 +1145,10 @@ pub struct RangeDopplerParams {
     pub first_valid_sample: Option<usize>,
     /// Last valid sample (range) - swath boundary
     pub last_valid_sample: Option<usize>,
+    /// CRITICAL FIX: First burst azimuth time (seconds relative to orbit_ref_epoch)
+    /// For TOPS/IW data, the first burst starts 1-2 seconds AFTER product_start_rel_s
+    /// Newton-Raphson solver MUST use this as time base to bracket Doppler zero crossing
+    pub first_burst_time_rel_orbit: Option<f64>,
 }
 
 impl RangeDopplerParams {
@@ -2311,10 +2315,12 @@ impl TerrainCorrector {
             return None;
         }
 
-        // CRITICAL FIX: Compute azimuth time relative to product start
-        // Both azimuth_time_rel_orbit and product_start_rel_s are relative to orbit_ref_epoch
-        // So: azimuth_time_from_start = azimuth_time_rel_orbit - product_start_rel_s
-        let azimuth_time_from_start = azimuth_time_rel_orbit - params.product_start_rel_s;
+        // CRITICAL FIX: Compute azimuth time relative to first burst (for TOPS) or product start
+        // Both azimuth_time_rel_orbit and time_base are relative to orbit_ref_epoch
+        // For TOPS/IW: time_base = first_burst_time_rel_orbit (actual burst start)
+        // For other modes: time_base = product_start_rel_s (manifest start)
+        let time_base = params.first_burst_time_rel_orbit.unwrap_or(params.product_start_rel_s);
+        let azimuth_time_from_start = azimuth_time_rel_orbit - time_base;
         
         // CRITICAL: Strict validation of azimuth time
         // With correct epoch handling, this should ALWAYS be in [0, product_duration]
@@ -2350,6 +2356,8 @@ impl TerrainCorrector {
         }
 
         // Calculate azimuth pixel index directly (no clamping - time already validated)
+        // CRITICAL FOR TOPS: This assumes azimuth_time_from_start is relative to first valid data line
+        // For TOPS/IW: product_start_rel_s should be the FIRST BURST START TIME, not manifest start time
         let azimuth_time_per_pixel = 1.0 / params.prf; // Time interval between consecutive azimuth pixels
         let azimuth_pixel = azimuth_time_from_start / azimuth_time_per_pixel;
 
@@ -2362,6 +2370,26 @@ impl TerrainCorrector {
                 params.prf
             );
             return None;
+        }
+        
+        // DIAGNOSTIC: Log suspicious azimuth times (first 10 pixels only)
+        static AZIMUTH_DIAG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if AZIMUTH_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+            log::info!(
+                "🎯 AZIMUTH TIME DIAGNOSTIC #{}:\n\
+                 ├─ azimuth_time_rel_orbit = {:.6}s (relative to orbit epoch)\n\
+                 ├─ product_start_rel_s    = {:.6}s (manifest start, relative to orbit epoch)\n\
+                 ├─ azimuth_time_from_start= {:.6}s (time since product_start_rel_s)\n\
+                 ├─ azimuth_pixel          = {:.2} (calculated line index)\n\
+                 ├─ azimuth_time_per_pixel = {:.9}s (1/PRF)\n\
+                 └─ ⚠️  For TOPS: product_start_rel_s should be FIRST BURST START TIME, not manifest time!",
+                AZIMUTH_DIAG_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                azimuth_time_rel_orbit,
+                params.product_start_rel_s,
+                azimuth_time_from_start,
+                azimuth_pixel,
+                azimuth_time_per_pixel
+            );
         }
 
         // Parameter-driven bounds validation (no hardcoded Sentinel-1 values)
@@ -2483,7 +2511,41 @@ impl TerrainCorrector {
     // CRITICAL FIX: Stay within product time window for initial guess
     // Previously: searched ALL orbit state vectors, often finding times 50-100s outside product
     // Result: azimuth_time_from_start = 78-82s instead of 0-25s → massive pixel indices
-    let mut best_time = params.product_start_rel_s + (params.product_duration / 2.0);
+    
+    // CRITICAL FIX: Use first_burst_time_rel_orbit for TOPS data instead of product_start_rel_s
+    // For TOPS/IW, the first burst starts 1-2 seconds AFTER product start in manifest
+    let time_base = params.first_burst_time_rel_orbit.unwrap_or(params.product_start_rel_s);
+    
+    if params.first_burst_time_rel_orbit.is_some() {
+        log::info!(
+            "🎯 BURST-AWARE TIME BASE: Using first_burst_time={:.6}s (Δt={:.3}s from product_start)",
+            time_base,
+            time_base - params.product_start_rel_s
+        );
+    }
+    
+    // IMPROVED INITIAL GUESS: Find closest satellite position to target
+    let mut best_time = time_base + (params.product_duration / 2.0);
+    let mut best_distance = f64::INFINITY;
+    
+    // Search in product time window with 10-second sampling
+    let num_samples = ((params.product_duration / 10.0).ceil() as usize).max(5);
+    for i in 0..num_samples {
+        let test_time = time_base + (i as f64 / (num_samples - 1) as f64) * params.product_duration;
+        let test_time_abs = test_time + orbit_ref_epoch;
+        
+        if let Ok((sat_pos, _)) = self.scientific_orbit_interpolation(orbit_data, test_time_abs) {
+            let dx = target_ecef[0] - sat_pos.x;
+            let dy = target_ecef[1] - sat_pos.y;
+            let dz = target_ecef[2] - sat_pos.z;
+            let distance = (dx*dx + dy*dy + dz*dz).sqrt();
+            
+            if distance < best_distance {
+                best_distance = distance;
+                best_time = test_time;
+            }
+        }
+    }
     
     // Diagnostic logging for first call only
     static STARTUP_DIAG: std::sync::Once = std::sync::Once::new();
@@ -2529,19 +2591,120 @@ impl TerrainCorrector {
             .unwrap_or(params.product_start_rel_s + params.product_duration + 60.0);
 
         // Strict validation: initial guess MUST be within product window
-        let product_end = params.product_start_rel_s + params.product_duration;
-        if best_time < params.product_start_rel_s - 1.0 || best_time > product_end + 1.0 {
+        // Use time_base (burst-aware for TOPS) for validation
+        let product_end = time_base + params.product_duration;
+        if best_time < time_base - 1.0 || best_time > product_end + 1.0 {
             return Err(SarError::Processing(format!(
                 "Initial time guess {:.6}s outside product window [{:.6}, {:.6}]s. \
                  This indicates epoch mismatch. orbit_ref={:.3}, sensing_start={:.3}, dt={:.6}",
                 best_time,
-                params.product_start_rel_s,
+                time_base,
                 product_end,
                 orbit_ref_epoch,
                 params.product_start_time_abs,
                 params.product_start_time_abs - orbit_ref_epoch
             )));
         }
+
+        // ============================================================================
+        // GEODETIC SANITY CHECKS (one-time diagnostic)
+        // ============================================================================
+        static GEODETIC_DIAG: std::sync::Once = std::sync::Once::new();
+        GEODETIC_DIAG.call_once(|| {
+            // Convert first target ECEF to geodetic for sanity check
+            let r = (target_ecef[0].powi(2) + target_ecef[1].powi(2)).sqrt();
+            let lon_rad = target_ecef[1].atan2(target_ecef[0]);
+            let lat_rad = target_ecef[2].atan2(r); // Simple approximation
+            let lon_deg = lon_rad.to_degrees();
+            let lat_deg = lat_rad.to_degrees();
+            
+            log::info!(
+                "🌍 GEODETIC SANITY CHECK (scene center):\n\
+                 ├─ ECEF: X={:.1}, Y={:.1}, Z={:.1} m\n\
+                 ├─ Geodetic (approx): lon={:.6}°, lat={:.6}°\n\
+                 ├─ Radians: λ={:.6}, φ={:.6}\n\
+                 └─ Valid ranges: lon ∈ [-180°, 180°], lat ∈ [-90°, 90°]",
+                target_ecef[0], target_ecef[1], target_ecef[2],
+                lon_deg, lat_deg,
+                lon_rad, lat_rad
+            );
+            
+            // Sanity checks for common bugs (log warnings instead of assertions)
+            if lon_deg.abs() > 180.0 {
+                log::warn!("⚠️  Longitude out of range: {}", lon_deg);
+            }
+            if lat_deg.abs() > 90.0 {
+                log::warn!("⚠️  Latitude out of range: {}", lat_deg);
+            }
+            if lon_rad.abs() > std::f64::consts::PI {
+                log::warn!("⚠️  Longitude radians out of range: {}", lon_rad);
+            }
+            if lat_rad.abs() > std::f64::consts::FRAC_PI_2 {
+                log::warn!("⚠️  Latitude radians out of range: {}", lat_rad);
+            }
+        });
+
+        // ============================================================================
+        // DOPPLER RESIDUAL BRACKETING SCAN (for first pixel only)
+        // ============================================================================
+        static BRACKET_DIAG: std::sync::Once = std::sync::Once::new();
+        let mut sign_change_found = false;
+        BRACKET_DIAG.call_once(|| {
+            log::info!("🔍 DOPPLER RESIDUAL BRACKETING SCAN (±1.0s around initial guess):");
+            let mut prev_residual: Option<f64> = None;
+            let mut min_residual = f64::INFINITY;
+            let mut min_residual_time = best_time;
+            
+            for k in -20..=20 {
+                let test_time = best_time + (k as f64) * 0.05; // 0.05s steps
+                let test_time_abs = test_time + orbit_ref_epoch;
+                
+                // Compute Doppler residual at this time
+                if let Ok((sat_pos, sat_vel)) = self.scientific_orbit_interpolation(orbit_data, test_time_abs) {
+                    let dx = target_ecef[0] - sat_pos.x;
+                    let dy = target_ecef[1] - sat_pos.y;
+                    let dz = target_ecef[2] - sat_pos.z;
+                    let range_vec = [dx, dy, dz];
+                    let range = (dx*dx + dy*dy + dz*dz).sqrt();
+                    
+                    // Doppler frequency: f_d = -(2/λ) * (v⃗ · r̂)
+                    let range_rate = (sat_vel.x * dx + sat_vel.y * dy + sat_vel.z * dz) / range;
+                    let doppler_hz = -2.0 * range_rate / params.wavelength;
+                    
+                    if doppler_hz.abs() < min_residual {
+                        min_residual = doppler_hz.abs();
+                        min_residual_time = test_time;
+                    }
+                    
+                    if k % 5 == 0 { // Log every 0.25s
+                        log::debug!("  k={:3}, t={:.3}s, f_d={:.3} Hz", k, test_time, doppler_hz);
+                    }
+                    
+                    // Check for sign change
+                    if let Some(prev) = prev_residual {
+                        if prev * doppler_hz < 0.0 {
+                            sign_change_found = true;
+                            log::info!("  ✅ Sign change detected between t={:.3}s and t={:.3}s", 
+                                     test_time - 0.05, test_time);
+                        }
+                    }
+                    prev_residual = Some(doppler_hz);
+                }
+            }
+            
+            if !sign_change_found {
+                log::warn!(
+                    "⚠️  NO SIGN CHANGE IN DOPPLER RESIDUAL!\n\
+                     ├─ Scanned: [{:.3}, {:.3}] s\n\
+                     ├─ Min |f_d|: {:.3} Hz at t={:.3}s\n\
+                     └─ Likely cause: orbit-time mismatch, burst timing error, or geodetic order bug",
+                    best_time - 1.0, best_time + 1.0,
+                    min_residual, min_residual_time
+                );
+            } else {
+                log::info!("  ✅ Doppler residual brackets zero - Newton-Raphson should converge");
+            }
+        });
 
         // Newton-Raphson iteration with proper convergence criteria
         let mut azimuth_time = best_time;
@@ -2572,8 +2735,9 @@ impl TerrainCorrector {
                 )));
             }
             // Convert relative time to absolute time for orbit interpolation
-            // CRITICAL FIX: Use product start time instead of orbit reference time
-            let absolute_azimuth_time = azimuth_time + orbit_ref_epoch; // convert orbit-relative to absolute
+            // CRITICAL FIX: azimuth_time is relative to product_start_rel_s, which is already relative to orbit_ref_epoch
+            // So we need: absolute_time = orbit_ref_epoch + azimuth_time (since azimuth_time already accounts for product_start_rel_s)
+            let absolute_azimuth_time = orbit_ref_epoch + azimuth_time;
 
             // Interpolate satellite position and velocity at current time estimate
             let (sat_pos, sat_vel) =
@@ -2766,8 +2930,34 @@ impl TerrainCorrector {
             }
         }
 
-        // Hard cap reached - return best estimate
-        Ok(azimuth_time)
+        // Hard cap reached - check if we're close enough to accept
+        // Re-compute final Doppler to validate solution
+        let absolute_azimuth_time = azimuth_time + orbit_ref_epoch;
+        if let Ok((sat_pos, sat_vel)) = self.scientific_orbit_interpolation(orbit_data, absolute_azimuth_time) {
+            let range_vec = [
+                target_ecef[0] - sat_pos.x,
+                target_ecef[1] - sat_pos.y,
+                target_ecef[2] - sat_pos.z,
+            ];
+            let range_magnitude = (range_vec[0].powi(2) + range_vec[1].powi(2) + range_vec[2].powi(2)).sqrt();
+            let range_dot_velocity = range_vec[0] * sat_vel.x + range_vec[1] * sat_vel.y + range_vec[2] * sat_vel.z;
+            let radial_rate = range_dot_velocity / range_magnitude;
+            let final_doppler = -2.0 * radial_rate / params.wavelength;
+            
+            // Accept if Doppler is within 10 Hz (relaxed tolerance for edge cases)
+            if final_doppler.abs() < 10.0 {
+                log::debug!("✅ Newton-Raphson converged with relaxed tolerance: final_doppler={:.3} Hz", final_doppler);
+                return Ok(azimuth_time);
+            }
+        }
+        
+        // Failed to converge - return error
+        Err(SarError::Processing(format!(
+            "Newton-Raphson failed to converge after {} iterations (product window: [{:.3}, {:.3}]s)",
+            MAX_ITERATIONS,
+            params.product_start_rel_s,
+            params.product_start_rel_s + params.product_duration
+        )))
     }
 
     /// Scientific orbit state interpolation using cubic splines ONLY
@@ -3053,7 +3243,8 @@ impl TerrainCorrector {
         initial_guess: usize,
     ) -> SarResult<f64> {
         // Newton-Raphson iteration for zero-Doppler condition
-        let mut azimuth_time = initial_guess as f64 / params.prf;
+        // CRITICAL FIX: Use azimuth_time_interval (not 1/PRF) for TOPS mode
+        let mut azimuth_time = initial_guess as f64 * params.azimuth_time_interval;
         let mut iteration = 0;
 
         while iteration < self.config.max_iterations {
@@ -3081,7 +3272,8 @@ impl TerrainCorrector {
                     iteration + 1,
                     doppler_freq.abs()
                 );
-                return Ok(azimuth_time * params.prf);
+                // CRITICAL FIX: Convert azimuth_time → line number using azimuth_time_interval
+                return Ok(azimuth_time / params.azimuth_time_interval);
             }
 
             // Calculate proper derivative for Newton-Raphson update using numerical differentiation
@@ -5605,6 +5797,175 @@ impl TerrainCorrector {
         let output_bounds = self.calculate_output_bounds(sar_bbox)?;
         let (output_width, output_height, output_transform) =
             self.create_output_grid(&output_bounds)?;
+        
+        // DIAGNOSTIC: Output grid details for CRS/bbox debugging
+        log::error!("📐 ════════════════════════════════════════════════════════════");
+        log::error!("📐 OUTPUT GRID CONFIGURATION");
+        log::error!("📐 ════════════════════════════════════════════════════════════");
+        log::error!("📐 CRS: EPSG:4326 (WGS84 geographic)");
+        log::error!("📐 Grid dimensions: {}x{} pixels", output_width, output_height);
+        log::error!("📐 Pixel size: {:.6}° x {:.6}° (~{:.1}m x {:.1}m at scene center)", 
+                   output_transform.pixel_width.abs(), 
+                   output_transform.pixel_height.abs(),
+                   output_transform.pixel_width.abs() * 111_320.0,
+                   output_transform.pixel_height.abs() * 111_320.0);
+        log::error!("📐 Bbox (degrees): [{:.6}, {:.6}] × [{:.6}, {:.6}]", 
+                   output_transform.top_left_x,
+                   output_transform.top_left_x + (output_width as f64) * output_transform.pixel_width,
+                   output_transform.top_left_y + (output_height as f64) * output_transform.pixel_height,
+                   output_transform.top_left_y);
+        log::error!("📐 GeoTransform: origin=({:.6}, {:.6}), pixel=({:.8}, {:.8})", 
+                   output_transform.top_left_x,
+                   output_transform.top_left_y,
+                   output_transform.pixel_width,
+                   output_transform.pixel_height);
+        log::error!("📐 ════════════════════════════════════════════════════════════");
+        
+        // DIAGNOSTIC: DEM coverage information
+        let dem_bbox_min_x = self.dem_transform.top_left_x;
+        let dem_bbox_max_x = self.dem_transform.top_left_x + (self.dem.dim().1 as f64) * self.dem_transform.pixel_width;
+        let dem_bbox_min_y = self.dem_transform.top_left_y + (self.dem.dim().0 as f64) * self.dem_transform.pixel_height;
+        let dem_bbox_max_y = self.dem_transform.top_left_y;
+        
+        log::error!("🗺️  ════════════════════════════════════════════════════════════");
+        log::error!("🗺️  DEM CONFIGURATION");
+        log::error!("🗺️  ════════════════════════════════════════════════════════════");
+        log::error!("🗺️  CRS: EPSG:{}", self.dem_crs);
+        log::error!("🗺️  Grid dimensions: {}x{} pixels", self.dem.dim().1, self.dem.dim().0);
+        log::error!("🗺️  Pixel size: {:.6} x {:.6}", 
+                   self.dem_transform.pixel_width.abs(), 
+                   self.dem_transform.pixel_height.abs());
+        log::error!("🗺️  Bbox: [{:.6}, {:.6}] × [{:.6}, {:.6}]", 
+                   dem_bbox_min_x, dem_bbox_max_x, dem_bbox_min_y, dem_bbox_max_y);
+        log::error!("🗺️  NoData value: {}", self.dem_nodata);
+        
+        // Check for overlap between output and DEM
+        let output_bbox_min_x = output_transform.top_left_x;
+        let output_bbox_max_x = output_transform.top_left_x + (output_width as f64) * output_transform.pixel_width;
+        let output_bbox_min_y = output_transform.top_left_y + (output_height as f64) * output_transform.pixel_height;
+        let output_bbox_max_y = output_transform.top_left_y;
+        
+        let overlap_x = output_bbox_min_x < dem_bbox_max_x && output_bbox_max_x > dem_bbox_min_x;
+        let overlap_y = output_bbox_min_y < dem_bbox_max_y && output_bbox_max_y > dem_bbox_min_y;
+        
+        if overlap_x && overlap_y {
+            log::error!("🗺️  ✅ DEM covers output area");
+        } else {
+            log::error!("🗺️  ⚠️  WARNING: DEM may not cover output area!");
+            log::error!("🗺️     Output: [{:.6}, {:.6}] × [{:.6}, {:.6}]", 
+                       output_bbox_min_x, output_bbox_max_x, output_bbox_min_y, output_bbox_max_y);
+            log::error!("🗺️     DEM:    [{:.6}, {:.6}] × [{:.6}, {:.6}]", 
+                       dem_bbox_min_x, dem_bbox_max_x, dem_bbox_min_y, dem_bbox_max_y);
+        }
+        log::error!("🗺️  ════════════════════════════════════════════════════════════");
+        
+        // ============================================================================
+        // 🔬 EXPERT 5-POINT DIAGNOSTIC SUITE
+        // ============================================================================
+        log::error!("🔬 ════════════════════════════════════════════════════════════");
+        log::error!("🔬 EXPERT 5-POINT DIAGNOSTIC SUITE");
+        log::error!("🔬 ════════════════════════════════════════════════════════════");
+        
+        // CHECK 1: DEM metadata dump
+        log::error!("🔬 CHECK 1: DEM Metadata Summary");
+        log::error!("🔬   - DEM CRS: EPSG:{}", self.dem_crs);
+        log::error!("🔬   - DEM bbox: [{:.6}, {:.6}, {:.6}, {:.6}]", 
+                   dem_bbox_min_x, dem_bbox_min_y, dem_bbox_max_x, dem_bbox_max_y);
+        log::error!("🔬   - DEM pixel_size: ({:.8}, {:.8})", 
+                   self.dem_transform.pixel_width, self.dem_transform.pixel_height);
+        log::error!("🔬   - NoData: {}", self.dem_nodata);
+        log::error!("🔬   - Output CRS: EPSG:4326");
+        if self.dem_crs != 4326 {
+            log::error!("🔬   ⚠️  CRS MISMATCH: DEM is EPSG:{}, output is EPSG:4326", self.dem_crs);
+            log::error!("🔬   ⚠️  Coordinate transformations REQUIRED for all lookups");
+        } else {
+            log::error!("🔬   ✅ CRS MATCH: Both use EPSG:4326");
+        }
+        
+        // CHECK 2: Grid math consistency
+        log::error!("🔬 CHECK 2: Grid Math Consistency");
+        let dem_computed_px_w = (dem_bbox_max_x - dem_bbox_min_x) / (self.dem.dim().1 as f64);
+        // FIX: For north-up rasters, pixel_height is negative, so compute (min_y - max_y) / height
+        let dem_computed_px_h = (dem_bbox_min_y - dem_bbox_max_y) / (self.dem.dim().0 as f64);
+        let px_w_diff = (dem_computed_px_w - self.dem_transform.pixel_width).abs();
+        let px_h_diff = (dem_computed_px_h - self.dem_transform.pixel_height).abs();
+        log::error!("🔬   - DEM stored pixel_width: {:.12}", self.dem_transform.pixel_width);
+        log::error!("🔬   - DEM computed pixel_width: {:.12}", dem_computed_px_w);
+        log::error!("🔬   - Difference: {:.2e} (threshold: 1e-9)", px_w_diff);
+        log::error!("🔬   - DEM stored pixel_height: {:.12}", self.dem_transform.pixel_height);
+        log::error!("🔬   - DEM computed pixel_height: {:.12}", dem_computed_px_h);
+        log::error!("🔬   - Difference: {:.2e} (threshold: 1e-9)", px_h_diff);
+        if px_w_diff > 1e-9 || px_h_diff > 1e-9 {
+            log::error!("🔬   ❌ GRID MATH INCONSISTENCY DETECTED!");
+        } else {
+            log::error!("🔬   ✅ Grid math is consistent");
+        }
+        
+        // CHECK 3: Axis order sanity
+        log::error!("🔬 CHECK 3: Axis Order Sanity");
+        let scene_center_lon = (output_bbox_min_x + output_bbox_max_x) / 2.0;
+        let scene_center_lat = (output_bbox_min_y + output_bbox_max_y) / 2.0;
+        log::error!("🔬   - Scene center (lon, lat): ({:.6}, {:.6})", scene_center_lon, scene_center_lat);
+        log::error!("🔬   - Expected: lon ≈ 11.2-11.3°E, lat ≈ 54.7-54.9°N (Germany)");
+        if scene_center_lon >= 11.0 && scene_center_lon <= 12.0 && 
+           scene_center_lat >= 54.0 && scene_center_lat <= 55.0 {
+            log::error!("🔬   ✅ Axis order correct: (x=lon, y=lat)");
+        } else {
+            log::error!("🔬   ⚠️  Axis order may be wrong or scene location unexpected");
+        }
+        
+        // CHECK 4: Positive vs negative pixel height
+        log::error!("🔬 CHECK 4: Pixel Height Sign Convention");
+        log::error!("🔬   - DEM pixel_height: {:.8}", self.dem_transform.pixel_height);
+        if self.dem_transform.pixel_height < 0.0 {
+            log::error!("🔬   ✅ North-up DEM (negative pixel_height)");
+            log::error!("🔬   ✅ Row index increases SOUTHWARD");
+        } else {
+            log::error!("🔬   ⚠️  UNUSUAL: Positive pixel_height (South-up DEM?)");
+            log::error!("🔬   ⚠️  Row index increases NORTHWARD - may cause indexing errors");
+        }
+        
+        // CHECK 5: NoData handling - Sample center pixels
+        log::error!("🔬 CHECK 5: NoData Handling - Sample Scene Center");
+        let test_samples = vec![
+            (scene_center_lon, scene_center_lat, "Scene center"),
+            (scene_center_lon - 0.01, scene_center_lat, "West of center"),
+            (scene_center_lon + 0.01, scene_center_lat, "East of center"),
+            (scene_center_lon, scene_center_lat - 0.01, "South of center"),
+            (scene_center_lon, scene_center_lat + 0.01, "North of center"),
+        ];
+        
+        let mut nodata_count = 0;
+        for (test_lon, test_lat, label) in &test_samples {
+            let elevation_opt = self.get_elevation_at_latlon(*test_lat, *test_lon);
+            match elevation_opt {
+                Some(elev) => {
+                    if (elev - self.dem_nodata as f64).abs() < 1e-3 {
+                        log::debug!("🔬   ❌ {}: NoData ({:.1})", label, elev);
+                        nodata_count += 1;
+                    } else {
+                        log::debug!("🔬   ✅ {}: {:.1}m", label, elev);
+                    }
+                }
+                None => {
+                    log::debug!("🔬   ❌ {}: LOOKUP FAILED (returned None)", label);
+                    nodata_count += 1;
+                }
+            }
+        }
+        
+        if nodata_count == test_samples.len() {
+            log::warn!("🔬   ❌ CRITICAL: ALL samples are NoData or failed!");
+            log::warn!("🔬   ❌ Root cause: CRS mismatch, bbox wrong, or NoData value not recognized");
+        } else if nodata_count > 0 {
+            log::debug!("🔬   ⚠️  {}/{} samples are NoData or failed", nodata_count, test_samples.len());
+        } else {
+            log::debug!("🔬   ✅ All samples returned valid elevations");
+        }
+        
+        log::debug!("🔬 ════════════════════════════════════════════════════════════");
+        // ============================================================================
+        
         log::info!("Output grid: {}x{} pixels", output_width, output_height);
 
         // Step 2: Create orbit lookup table for fast access
@@ -5627,6 +5988,13 @@ impl TerrainCorrector {
         let range_doppler_failures = std::sync::atomic::AtomicUsize::new(0);
         let bounds_failures = std::sync::atomic::AtomicUsize::new(0);
         let successful_pixels = std::sync::atomic::AtomicUsize::new(0);
+        
+        // G0-G4 SURVIVAL GATES (systematic debugging)
+        let g0_geometry_inbounds = std::sync::atomic::AtomicUsize::new(0);  // Mapped to output grid
+        let g1_dem_ok = std::sync::atomic::AtomicUsize::new(0);             // DEM lookup succeeded
+        let g2_angles_ok = std::sync::atomic::AtomicUsize::new(0);          // Angles finite & sane
+        let g3_radiometry_ok = std::sync::atomic::AtomicUsize::new(0);      // Backscatter valid
+        let g4_write_ok = std::sync::atomic::AtomicUsize::new(0);           // Successfully written
 
         // Step 5: Process in chunks for memory efficiency
         let chunk_size = chunk_size.ok_or_else(|| {
@@ -5682,16 +6050,22 @@ impl TerrainCorrector {
                     // Convert map coordinates to lat/lon
                     match self.map_to_geographic(map_x, map_y) {
                         Ok((lat, lon)) => {
+                            // G0: Geometry in-bounds (mapped to output grid successfully)
+                            g0_geometry_inbounds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            
                             if should_log {
-                                log::error!("✅ Coordinate conversion successful: map({:.6},{:.6}) -> lat_lon({:.6},{:.6})", 
+                                log::debug!("✅ G0: Coordinate conversion successful: map({:.6},{:.6}) -> lat_lon({:.6},{:.6})", 
                                          map_x, map_y, lat, lon);
                             }
                             
                             // Get elevation using cached or interpolated DEM lookup
                             match self.get_elevation_with_interpolation(lat, lon, &mut None) {
                                 Some(elevation) => {
+                                    // G1: DEM ok (elevation lookup succeeded, not NoData)
+                                    g1_dem_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    
                                     if should_log {
-                                        log::error!("✅ Elevation lookup successful: lat_lon({:.6},{:.6}) -> elevation={:.1}m", 
+                                        log::debug!("✅ G1: Elevation lookup successful: lat_lon({:.6},{:.6}) -> elevation={:.1}m", 
                                                  lat, lon, elevation);
                                     }
                                     
@@ -5705,13 +6079,17 @@ impl TerrainCorrector {
                                         lat, lon, elevation as f64, orbit_data, params
                                     ) {
                                         Some((sar_range, sar_azimuth)) => {
+                                            // G2: Physical angles ok (Range-Doppler solved, coordinates finite)
+                                            g2_angles_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            
                                             if should_log {
-                                                log::error!("✅ Range-Doppler transformation successful: lat_lon_elev({:.6},{:.6},{:.1}) -> sar_coords({},{})", 
+                                                log::debug!("✅ G2: Range-Doppler transformation successful: lat_lon_elev({:.6},{:.6},{:.1}) -> sar_coords({},{})", 
                                                          lat, lon, elevation, sar_range, sar_azimuth);
                                             }
                                             
                                             // Check bounds
-                                            if sar_range < sar_image.dim().1 as f64 && sar_azimuth < sar_image.dim().0 as f64 {
+                                            if sar_range < sar_image.dim().1 as f64 && sar_azimuth < sar_image.dim().0 as f64 && 
+                                               sar_range >= 0.0 && sar_azimuth >= 0.0 {
                                                 // Apply selected interpolation method
                                                 let value = self.interpolate_sar_value(
                                                     sar_image, 
@@ -5720,18 +6098,31 @@ impl TerrainCorrector {
                                                     interpolation_method
                                                 );
                                                 
-                                                if should_log {
-                                                    log::info!("✅ SAR interpolation successful: sar_coords({},{}) -> value={:.6}", 
-                                                             sar_range, sar_azimuth, value);
+                                                // G3: Radiometry ok (backscatter value is finite)
+                                                if value.is_finite() {
+                                                    g3_radiometry_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                    
+                                                    if should_log {
+                                                        log::info!("✅ G3: SAR interpolation successful: sar_coords({},{}) -> value={:.6}", 
+                                                                 sar_range, sar_azimuth, value);
+                                                    }
+                                                    
+                                                    chunk_data[[i, j]] = value;
+                                                    
+                                                    // G4: Write ok (successfully written to output)
+                                                    g4_write_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                    successful_pixels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                } else {
+                                                    if should_log {
+                                                        log::warn!("❌ G3 FAILED: Non-finite backscatter value: {}", value);
+                                                    }
+                                                    chunk_data[[i, j]] = f32::NAN;
                                                 }
-                                                
-                                                chunk_data[[i, j]] = value;
-                                                successful_pixels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             } else {
                                                 failure_stage = "bounds_check";
                                                 bounds_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 if should_log || (global_i == 0 && global_j == 0) {
-                                                    log::error!("❌ TERRAIN CORRECTION FAILURE: Bounds check failed for pixel ({},{}): sar_range={}, sar_azimuth={}, image_dim=({},{})", 
+                                                    log::debug!("❌ TERRAIN CORRECTION FAILURE: Bounds check failed for pixel ({},{}): sar_range={}, sar_azimuth={}, image_dim=({},{})", 
                                                         global_i, global_j, sar_range, sar_azimuth, sar_image.dim().0, sar_image.dim().1);
                                                 }
                                                 chunk_data[[i, j]] = f32::NAN;
@@ -5741,7 +6132,7 @@ impl TerrainCorrector {
                                             failure_stage = "range_doppler";
                                             range_doppler_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if should_log || (global_i == 0 && global_j == 0) {
-                                                log::error!("❌ TERRAIN CORRECTION FAILURE: Range-Doppler transformation failed for pixel ({},{}): lat={:.6}, lon={:.6}, elevation={:.1}", 
+                                                log::debug!("❌ TERRAIN CORRECTION FAILURE: Range-Doppler transformation failed for pixel ({},{}): lat={:.6}, lon={:.6}, elevation={:.1}", 
                                                     global_i, global_j, lat, lon, elevation);
                                             }
                                             chunk_data[[i, j]] = f32::NAN;
@@ -5752,7 +6143,7 @@ impl TerrainCorrector {
                                     failure_stage = "elevation";
                                     elevation_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if should_log || (global_i == 0 && global_j == 0) {
-                                        log::error!("❌ TERRAIN CORRECTION FAILURE: Elevation lookup failed for pixel ({},{}): lat={:.6}, lon={:.6}", 
+                                        log::debug!("❌ TERRAIN CORRECTION FAILURE: Elevation lookup failed for pixel ({},{}): lat={:.6}, lon={:.6}", 
                                                    global_i, global_j, lat, lon);
                                     }
                                     chunk_data[[i, j]] = f32::NAN;
@@ -5763,7 +6154,7 @@ impl TerrainCorrector {
                             failure_stage = "coordinate_conversion";
                             coord_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if should_log || (global_i == 0 && global_j == 0) {
-                                log::error!("❌ TERRAIN CORRECTION FAILURE: Coordinate conversion failed for pixel ({},{}): map_x={:.6}, map_y={:.6}, error={}", 
+                                log::debug!("❌ TERRAIN CORRECTION FAILURE: Coordinate conversion failed for pixel ({},{}): map_x={:.6}, map_y={:.6}, error={}", 
                                     global_i, global_j, map_x, map_y, e);
                             }
                             chunk_data[[i, j]] = f32::NAN;
@@ -5801,33 +6192,78 @@ impl TerrainCorrector {
         let range_doppler_fails = range_doppler_failures.load(std::sync::atomic::Ordering::Relaxed);
         let bounds_fails = bounds_failures.load(std::sync::atomic::Ordering::Relaxed);
 
-        log::error!("📊 TERRAIN CORRECTION DIAGNOSTIC SUMMARY:");
-        log::error!("📊 Total pixels: {}", total_pixels);
-        log::error!(
-            "📊 Successful pixels: {} ({:.1}%)",
-            successful,
-            (successful as f64 / total_pixels as f64) * 100.0
+        // Load G0-G4 survival counters
+        let g0 = g0_geometry_inbounds.load(std::sync::atomic::Ordering::Relaxed);
+        let g1 = g1_dem_ok.load(std::sync::atomic::Ordering::Relaxed);
+        let g2 = g2_angles_ok.load(std::sync::atomic::Ordering::Relaxed);
+        let g3 = g3_radiometry_ok.load(std::sync::atomic::Ordering::Relaxed);
+        let g4 = g4_write_ok.load(std::sync::atomic::Ordering::Relaxed);
+        
+        log::warn!("📊 ═══════════════════════════════════════════════════════════");
+        log::warn!("📊 TERRAIN CORRECTION DIAGNOSTIC SUMMARY");
+        log::warn!("📊 ═══════════════════════════════════════════════════════════");
+        log::warn!("📊 Total output pixels: {}", total_pixels);
+        log::warn!("📊 ");
+        log::warn!("📊 🔍 SURVIVAL GATES (G0→G4):");
+        log::warn!(
+            "📊   G0 - Geometry in-bounds:    {} ({:.1}%) [maps to output grid]",
+            g0,
+            (g0 as f64 / total_pixels as f64) * 100.0
         );
+        log::warn!(
+            "📊   G1 - DEM ok:                 {} ({:.1}%) [DEM lookup succeeded, {} lost]",
+            g1,
+            (g1 as f64 / total_pixels as f64) * 100.0,
+            g0.saturating_sub(g1)
+        );
+        log::warn!(
+            "📊   G2 - Physical angles ok:     {} ({:.1}%) [angles finite, {} lost]",
+            g2,
+            (g2 as f64 / total_pixels as f64) * 100.0,
+            g1.saturating_sub(g2)
+        );
+        log::warn!(
+            "📊   G3 - Radiometry ok:          {} ({:.1}%) [backscatter valid, {} lost]",
+            g3,
+            (g3 as f64 / total_pixels as f64) * 100.0,
+            g2.saturating_sub(g3)
+        );
+        log::warn!(
+            "📊   G4 - Write ok:               {} ({:.1}%) [successfully written, {} lost]",
+            g4,
+            (g4 as f64 / total_pixels as f64) * 100.0,
+            g3.saturating_sub(g4)
+        );
+        log::error!("📊 ");
+        log::error!("📊 📉 FAILURE BREAKDOWN:");
         log::error!(
-            "📊 Coordinate conversion failures: {} ({:.1}%)",
+            "📊   Coordinate conversion: {} ({:.1}%)",
             coord_fails,
             (coord_fails as f64 / total_pixels as f64) * 100.0
         );
         log::error!(
-            "📊 Elevation lookup failures: {} ({:.1}%)",
+            "📊   Elevation lookup:      {} ({:.1}%)",
             elevation_fails,
             (elevation_fails as f64 / total_pixels as f64) * 100.0
         );
         log::error!(
-            "📊 Range-Doppler failures: {} ({:.1}%)",
+            "📊   Range-Doppler:         {} ({:.1}%)",
             range_doppler_fails,
             (range_doppler_fails as f64 / total_pixels as f64) * 100.0
         );
         log::error!(
-            "📊 Bounds check failures: {} ({:.1}%)",
+            "📊   Bounds check:          {} ({:.1}%)",
             bounds_fails,
             (bounds_fails as f64 / total_pixels as f64) * 100.0
         );
+        log::error!("📊 ");
+        log::error!(
+            "📊 ✅ Final success rate: {} / {} ({:.1}%)",
+            successful,
+            total_pixels,
+            (successful as f64 / total_pixels as f64) * 100.0
+        );
+        log::error!("📊 ═══════════════════════════════════════════════════════════");
 
         if successful == 0 {
             log::error!(
@@ -6385,20 +6821,7 @@ impl TerrainCorrector {
             let count = DEM_BOUNDS_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 10 {
                 log::error!(
-                    "❌ DEM bounds failure: lat={:.6}, lon={:.6}, dem_x={:.3}, dem_y={:.3}, width={}, height={}, origin=({:.6}, {:.6}), pixel_size=({:.8}, {:.8})",
-                    lat,
-                    lon,
-                    dem_x,
-                    dem_y,
-                    self.dem.dim().1,
-                    self.dem.dim().0,
-                    self.dem_transform.top_left_x,
-                    self.dem_transform.top_left_y,
-                    self.dem_transform.pixel_width,
-                    self.dem_transform.pixel_height
-                );
-                eprintln!(
-                    "❌ DEM bounds failure: lat={:.6}, lon={:.6}, dem_x={:.3}, dem_y={:.3}, width={}, height={}, origin=({:.6}, {:.6}), pixel_size=({:.8}, {:.8})",
+                    "❌ ELEVATION LOOKUP FAILED - Outside DEM coverage: lat={:.6}, lon={:.6}, dem_x={:.3}, dem_y={:.3}, width={}, height={}, origin=({:.6}, {:.6}), pixel_size=({:.8}, {:.8})",
                     lat,
                     lon,
                     dem_x,
@@ -6411,6 +6834,7 @@ impl TerrainCorrector {
                     self.dem_transform.pixel_height
                 );
             }
+            // NO FALLBACK - return None for coordinates outside DEM coverage
             return None;
         }
 
@@ -6437,7 +6861,7 @@ impl TerrainCorrector {
         let v10 = self.dem[[y1, x0]];
         let v11 = self.dem[[y1, x1]];
 
-        // Check for no-data values
+        // Check for no-data values - NO FALLBACK, return None for invalid data
         if v00 == self.dem_nodata
             || v01 == self.dem_nodata
             || v10 == self.dem_nodata
@@ -6447,19 +6871,7 @@ impl TerrainCorrector {
             let count = DEM_NODATA_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 10 {
                 log::error!(
-                    "❌ DEM nodata failure: lat={:.6}, lon={:.6}, samples=({:.1}, {:.1}, {:.1}, {:.1}), nodata={}, indices=({}, {})",
-                    lat,
-                    lon,
-                    v00,
-                    v01,
-                    v10,
-                    v11,
-                    self.dem_nodata,
-                    x0,
-                    y0
-                );
-                eprintln!(
-                    "❌ DEM nodata failure: lat={:.6}, lon={:.6}, samples=({:.1}, {:.1}, {:.1}, {:.1}), nodata={}, indices=({}, {})",
+                    "❌ ELEVATION LOOKUP FAILED - DEM no-data value: lat={:.6}, lon={:.6}, samples=({:.1}, {:.1}, {:.1}, {:.1}), nodata={}, indices=({}, {})",
                     lat,
                     lon,
                     v00,
@@ -6471,6 +6883,7 @@ impl TerrainCorrector {
                     y0
                 );
             }
+            // NO FALLBACK - return None for no-data pixels
             return None;
         }
 
@@ -7597,6 +8010,7 @@ impl MetadataFirstTerrainProcessor {
             last_valid_line: None,
             first_valid_sample: None,
             last_valid_sample: None,
+            first_burst_time_rel_orbit: None, // Not available in MetadataFirst processor mode
         };
 
         // Create terrain corrector using validated DEM configuration

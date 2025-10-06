@@ -1223,9 +1223,30 @@ class BackscatterProcessor:
                                 print("   🔃 Flipped DEM horizontally to match metadata orientation")
 
                         self.dem_geo_transform = tuple(dem_geo_transform)
-                        if dem_bbox_meta is not None:
-                            self.dem_bbox = tuple(dem_bbox_meta)
-
+                        
+                        # CRITICAL FIX: Compute ACTUAL DEM bbox from geo_transform, not the requested bbox
+                        # dem_bbox_meta contains the REQUESTED bbox, but we need the ACTUAL DEM coverage
+                        dem_rows, dem_cols = dem_data.shape
+                        dem_origin_lon = dem_geo_transform[0]
+                        dem_origin_lat = dem_geo_transform[3]
+                        dem_pixel_width = dem_geo_transform[1]
+                        dem_pixel_height = dem_geo_transform[5]  # Negative for north-up
+                        
+                        # Compute actual DEM extent from origin + size * pixel_spacing
+                        dem_min_lon = dem_origin_lon
+                        dem_max_lon = dem_origin_lon + (dem_cols - 1) * dem_pixel_width
+                        dem_max_lat = dem_origin_lat  # Origin is top-left for north-up DEM
+                        dem_min_lat = dem_origin_lat + (dem_rows - 1) * dem_pixel_height  # Pixel_height is negative
+                        
+                        # Ensure min < max
+                        if dem_min_lon > dem_max_lon:
+                            dem_min_lon, dem_max_lon = dem_max_lon, dem_min_lon
+                        if dem_min_lat > dem_max_lat:
+                            dem_min_lat, dem_max_lat = dem_max_lat, dem_min_lat
+                        
+                        # Store ACTUAL DEM coverage bbox (not the requested bbox)
+                        self.dem_bbox = (dem_min_lon, dem_min_lat, dem_max_lon, dem_max_lat)
+                        
                         print(
                             "   🌐 DEM geo_transform: origin=(%.6f, %.6f), pixel_size=(%.8f, %.8f)"
                             % (
@@ -1234,6 +1255,10 @@ class BackscatterProcessor:
                                 dem_geo_transform[1],
                                 dem_geo_transform[5],
                             )
+                        )
+                        print(
+                            "   📍 ACTUAL DEM coverage bbox: lon=(%.6f, %.6f), lat=(%.6f, %.6f)"
+                            % (dem_min_lon, dem_max_lon, dem_min_lat, dem_max_lat)
                         )
 
                     # Ensure DEM matches SAR data dimensions
@@ -1565,11 +1590,32 @@ class BackscatterProcessor:
                     
                     # Extract real geocoding parameters from metadata
                     if hasattr(self, 'metadata') and self.metadata and isinstance(self.metadata, dict):
-                        # Get real bounding box coordinates from parsed metadata
-                        min_lat = float(self.metadata.get('min_latitude'))
-                        max_lat = float(self.metadata.get('max_latitude'))
-                        min_lon = float(self.metadata.get('min_longitude'))
-                        max_lon = float(self.metadata.get('max_longitude'))
+                        # CRITICAL FIX: Use DEM coverage bbox instead of full-scene metadata
+                        # The full-scene metadata includes ALL subswaths (IW1+IW2+IW3) side-by-side,
+                        # making it 4-5° wide (~300-400km), but the DEM only covers the actual data area (~1°).
+                        # Using the DEM bbox ensures terrain correction works within the available elevation data.
+                        
+                        if hasattr(self, 'dem_bbox') and self.dem_bbox is not None:
+                            # Use DEM's actual coverage bbox (from load_dem_for_bbox result)
+                            # Format: [min_lon, min_lat, max_lon, max_lat]
+                            min_lon, min_lat, max_lon, max_lat = self.dem_bbox
+                            bbox_width_deg = max_lon - min_lon
+                            bbox_width_km = bbox_width_deg * 111.0  # Approximate conversion
+                            print(f"   ✅ Using DEM coverage bbox (actual terrain data)")
+                            print(f"      Lat: ({min_lat:.6f}, {max_lat:.6f}), Lon: ({min_lon:.6f}, {max_lon:.6f})")
+                            print(f"      Width: {bbox_width_deg:.6f}° (~{bbox_width_km:.1f}km)")
+                        else:
+                            # Fallback to metadata bounds (full scene - too wide, will cause DEM coverage failures)
+                            min_lat = float(self.metadata.get('min_latitude'))
+                            max_lat = float(self.metadata.get('max_latitude'))
+                            min_lon = float(self.metadata.get('min_longitude'))
+                            max_lon = float(self.metadata.get('max_longitude'))
+                            bbox_width_deg = max_lon - min_lon
+                            bbox_width_km = bbox_width_deg * 111.0
+                            print(f"   ⚠️  WARNING: DEM bbox not available, using full-scene metadata")
+                            print(f"      This may cause terrain correction failures if DEM doesn't cover full scene!")
+                            print(f"      Metadata bbox: lat=({min_lat:.6f}, {max_lat:.6f}), lon=({min_lon:.6f}, {max_lon:.6f})")
+                            print(f"      Width: {bbox_width_deg:.6f}° (~{bbox_width_km:.1f}km) - likely TOO WIDE")
 
                         # Ensure bounding box is properly ordered (min <= max)
                         lat_bounds = sorted([min_lat, max_lat])
@@ -1583,7 +1629,7 @@ class BackscatterProcessor:
                         min_lat, max_lat = lat_bounds
                         min_lon, max_lon = lon_bounds
                         
-                        print(f"   ✅ GEOCODING COORDINATES: lat=({min_lat:.6f}, {max_lat:.6f}), lon=({min_lon:.6f}, {max_lon:.6f})")
+                        print(f"   ✅ FINAL GEOCODING BBOX: lat=({min_lat:.6f}, {max_lat:.6f}), lon=({min_lon:.6f}, {max_lon:.6f})")
                         
                         base_bbox = [float(min_lon), float(min_lat), float(max_lon), float(max_lat)]
 
@@ -1617,46 +1663,69 @@ class BackscatterProcessor:
                         else:
                             sar_bbox = base_bbox
                         
-                        # Extract orbit data using the EXACT same method as terrain flattening
-                        vector_indices = [int(key.split('_')[3]) for key in self.metadata.keys() 
-                                        if key.startswith('orbit_state_vector_') and key.endswith('_time')]
-                        
+                        # CRITICAL FIX: Use .EOF orbit data if available (9361 vectors), not sparse metadata (17 vectors)
+                        # This ensures sufficient temporal coverage for Range-Doppler convergence
                         orbit_times_str = []
-                        orbit_positions = []
-                        orbit_velocities = []
+                        orbit_positions_geocoding = []
+                        orbit_velocities_geocoding = []
                         
-                        for i in sorted(vector_indices):
-                            time_key = f'orbit_state_vector_{i}_time'
-                            pos_x_key = f'orbit_state_vector_{i}_x_position'
-                            pos_y_key = f'orbit_state_vector_{i}_y_position' 
-                            pos_z_key = f'orbit_state_vector_{i}_z_position'
-                            vel_x_key = f'orbit_state_vector_{i}_x_velocity'
-                            vel_y_key = f'orbit_state_vector_{i}_y_velocity'
-                            vel_z_key = f'orbit_state_vector_{i}_z_velocity'
+                        # Check if we already loaded dense .EOF orbit data earlier
+                        if 'orbit_times' in locals() and len(orbit_times) > 100:
+                            # We have dense .EOF orbit data - use it!
+                            print(f"   ✅ Using {len(orbit_times)} dense .EOF orbit vectors for terrain correction")
                             
-                            if all(key in self.metadata for key in [time_key, pos_x_key, pos_y_key, pos_z_key]):
-                                # Convert time from seconds since reference to ISO format
-                                time_val = float(self.metadata[time_key])
-                                # Use epoch time conversion for proper formatting
-                                dt = datetime.fromtimestamp(time_val, tz=timezone.utc)
-                                time_iso = dt.isoformat()
-                                orbit_times_str.append(time_iso)
+                            # Convert timestamps to ISO format strings for Rust interface
+                            for i in range(len(orbit_times)):
+                                dt = datetime.fromtimestamp(orbit_times[i], tz=timezone.utc)
+                                orbit_times_str.append(dt.isoformat())
+                            
+                            # Reshape flat position/velocity arrays into list of triplets
+                            orbit_positions_geocoding = [
+                                [orbit_positions[i*3], orbit_positions[i*3+1], orbit_positions[i*3+2]]
+                                for i in range(len(orbit_positions) // 3)
+                            ]
+                            orbit_velocities_geocoding = [
+                                [orbit_velocities[i*3], orbit_velocities[i*3+1], orbit_velocities[i*3+2]]
+                                for i in range(len(orbit_velocities) // 3)
+                            ]
+                            
+                        else:
+                            # Fall back to sparse metadata extraction (17 vectors from annotation)
+                            print(f"   ⚠️  No dense .EOF orbit data - falling back to sparse metadata extraction")
+                            vector_indices = [int(key.split('_')[3]) for key in self.metadata.keys() 
+                                            if key.startswith('orbit_state_vector_') and key.endswith('_time')]
+                            
+                            for i in sorted(vector_indices):
+                                time_key = f'orbit_state_vector_{i}_time'
+                                pos_x_key = f'orbit_state_vector_{i}_x_position'
+                                pos_y_key = f'orbit_state_vector_{i}_y_position' 
+                                pos_z_key = f'orbit_state_vector_{i}_z_position'
+                                vel_x_key = f'orbit_state_vector_{i}_x_velocity'
+                                vel_y_key = f'orbit_state_vector_{i}_y_velocity'
+                                vel_z_key = f'orbit_state_vector_{i}_z_velocity'
                                 
-                                orbit_positions.append([
-                                    float(self.metadata[pos_x_key]),
-                                    float(self.metadata[pos_y_key]), 
-                                    float(self.metadata[pos_z_key])
-                                ])
-                                orbit_velocities.append([
-                                    float(self.metadata.get(vel_x_key, 0.0)),
-                                    float(self.metadata.get(vel_y_key, 0.0)),
-                                    float(self.metadata.get(vel_z_key, 0.0))
-                                ])
-                        
-                        if len(orbit_times_str) == 0:
-                            raise ValueError("No orbit data found for geocoding - ensure orbit file has been applied")
-                        
-                        print(f"   ✅ Extracted {len(orbit_times_str)} orbit state vectors for geocoding")
+                                if all(key in self.metadata for key in [time_key, pos_x_key, pos_y_key, pos_z_key]):
+                                    # Convert time from seconds since reference to ISO format
+                                    time_val = float(self.metadata[time_key])
+                                    dt = datetime.fromtimestamp(time_val, tz=timezone.utc)
+                                    time_iso = dt.isoformat()
+                                    orbit_times_str.append(time_iso)
+                                    
+                                    orbit_positions_geocoding.append([
+                                        float(self.metadata[pos_x_key]),
+                                        float(self.metadata[pos_y_key]), 
+                                        float(self.metadata[pos_z_key])
+                                    ])
+                                    orbit_velocities_geocoding.append([
+                                        float(self.metadata.get(vel_x_key, 0.0)),
+                                        float(self.metadata.get(vel_y_key, 0.0)),
+                                        float(self.metadata.get(vel_z_key, 0.0))
+                                    ])
+                            
+                            if len(orbit_times_str) == 0:
+                                raise ValueError("No orbit data found for geocoding - ensure orbit file has been applied")
+                            
+                            print(f"   ⚠️  Using {len(orbit_times_str)} sparse orbit state vectors (insufficient for Range-Doppler)")
                         
                         # Extract real SLC metadata - MUST use annotation data, NO hardcoded values
                         range_spacing = float(self.get_current_range_spacing())
@@ -1777,6 +1846,43 @@ class BackscatterProcessor:
                                 print(f"⚠️ Warning: Could not parse timing from metadata: {e}")
                                 product_duration = 0.0
                         
+                        # CRITICAL FIX: Use FIRST ORBIT TIME as reference epoch, not product start
+                        # The orbit state vectors span a wider time range than the product
+                        # Using first orbit time ensures all interpolation requests are within coverage
+                        if orbit_times and len(orbit_times) > 0:
+                            orbit_ref_epoch_utc = min(orbit_times)  # First orbit vector time
+                            print(f"   🛰️  Orbit reference epoch set to first orbit vector: {orbit_ref_epoch_utc:.6f}")
+                            print(f"   📅 Product start time: {product_start_time_abs:.6f} ({product_start_time_abs - orbit_ref_epoch_utc:.2f}s after orbit start)")
+                        else:
+                            # Fallback if no orbit data
+                            orbit_ref_epoch_utc = product_start_time_abs
+                            print(f"   ⚠️  No orbit times available, using product start as reference: {product_start_time_abs:.6f}")
+                        
+                        # CRITICAL FIX: Extract first burst azimuth time for TOPS/IW data
+                        # The first burst starts 1-2 seconds AFTER product_start in the manifest
+                        # Newton-Raphson solver needs this to search the correct time window
+                        first_burst_time_rel_orbit = None
+                        try:
+                            import glob
+                            annotation_files = glob.glob(os.path.join(self.input_path, 'annotation', 's1*-iw*-slc-*.xml'))
+                            if annotation_files:
+                                import xml.etree.ElementTree as ET
+                                tree = ET.parse(annotation_files[0])
+                                root = tree.getroot()
+                                
+                                # Find first burst azimuthTime in swathTiming/burstList
+                                burst = root.find('.//swathTiming/burstList/burst')
+                                if burst is not None:
+                                    azimuth_time_elem = burst.find('azimuthTime')
+                                    if azimuth_time_elem is not None:
+                                        from dateutil import parser as date_parser
+                                        burst_dt = date_parser.parse(azimuth_time_elem.text)
+                                        first_burst_time_abs = burst_dt.timestamp()
+                                        first_burst_time_rel_orbit = first_burst_time_abs - orbit_ref_epoch_utc
+                                        print(f"   🎯 BURST TIME FIX: First burst at t={first_burst_time_rel_orbit:.3f}s (orbit-relative), Δt={first_burst_time_rel_orbit - (product_start_time_abs - orbit_ref_epoch_utc):.3}s from product_start")
+                        except Exception as e:
+                            print(f"   ⚠️  Could not extract first burst time: {e}")
+                        
                         real_metadata = {
                             'range_pixel_spacing': range_spacing,
                             'azimuth_pixel_spacing': azimuth_spacing,
@@ -1788,7 +1894,11 @@ class BackscatterProcessor:
                             'product_start_time_abs': product_start_time_abs,
                             'product_stop_time_abs': product_stop_time_abs,
                             'product_duration': product_duration,
-                            'total_azimuth_lines': working_data.shape[0] if working_data is not None else None
+                            'total_azimuth_lines': working_data.shape[0] if working_data is not None else None,
+                            # CRITICAL FIX: Must set orbit reference epoch for proper time coordination
+                            'orbit_ref_epoch_utc': orbit_ref_epoch_utc if orbit_ref_epoch_utc is not None else product_start_time_abs,
+                            # CRITICAL FIX: First burst time for TOPS data (Range-Doppler solver needs this)
+                            'first_burst_time_rel_orbit': first_burst_time_rel_orbit
                         }
                         
                         # ============================================================
@@ -1886,8 +1996,8 @@ class BackscatterProcessor:
                                     input_array,
                                     bbox,
                                     orbit_times_str,
-                                    orbit_positions,
-                                    orbit_velocities,
+                                    orbit_positions_geocoding,
+                                    orbit_velocities_geocoding,
                                     geocoding_cache,
                                     float(self.target_resolution),
                                     real_metadata,

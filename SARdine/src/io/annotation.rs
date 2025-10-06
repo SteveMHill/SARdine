@@ -2308,6 +2308,40 @@ impl ProductRoot {
             "🔍 DEBUGGING: extract_subswaths returning {} subswaths",
             subswaths.len()
         );
+        
+        // CRITICAL FIX: Calculate first_sample_global from slant range physics
+        // The burst-derived first_valid_sample is LOCAL coordinates (0-100), not global grid position
+        // For IW merge, we need range offsets based on slant_range_time differences
+        if !subswaths.is_empty() {
+            // Find reference slant range (typically IW1 has shortest range)
+            let ref_srt = subswaths.values()
+                .map(|sw| sw.slant_range_time)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+            
+            log::info!("🔧 GRID ALIGNMENT FIX: Calculating first_sample_global from slant range physics");
+            log::info!("   Reference slant_range_time: {:.9} s", ref_srt);
+            
+            for (swath_id, swath) in subswaths.iter_mut() {
+                let delta_tau = swath.slant_range_time - ref_srt;
+                let delta_range_m = delta_tau * (SPEED_OF_LIGHT_M_S as f64 / 2.0); // Two-way time
+                let range_offset_pixels = (delta_range_m / swath.range_pixel_spacing).round() as usize;
+                
+                log::info!("   {} → slant_range_time={:.9}s, Δτ={:.6}ms, Δrange={:.1}m → first_sample_global={}",
+                    swath_id,
+                    swath.slant_range_time,
+                    delta_tau * 1000.0,
+                    delta_range_m,
+                    range_offset_pixels
+                );
+                
+                swath.first_sample_global = range_offset_pixels;
+                swath.last_sample_global = range_offset_pixels + swath.range_samples;
+            }
+            
+            log::info!("✅ Grid alignment fix applied - first_sample_global now based on slant range physics");
+        }
+        
         Ok(subswaths)
     }
 
@@ -2455,6 +2489,40 @@ impl ProductRoot {
                 (None, None, None, None)
             };
         
+        // CRITICAL FIX: Extract first burst azimuth time for TOPS/IW data
+        // This is the actual start time of the first burst, which is 1-2 seconds AFTER product_start
+        // Newton-Raphson solver needs this to search the correct time window
+        let first_burst_time_rel_orbit = self
+            .swath_timing
+            .as_ref()
+            .and_then(|st| st.burst_list.as_ref())
+            .and_then(|bl| bl.bursts.as_ref())
+            .and_then(|bursts| bursts.first())
+            .and_then(|first_burst| {
+                first_burst.azimuth_time.as_ref().or(first_burst.sensing_time.as_ref())
+            })
+            .and_then(|time_str| {
+                // Parse ISO 8601 timestamp: "2020-12-30T16:52:47.123456"
+                use chrono::NaiveDateTime;
+                NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S%.f")
+                    .ok()
+                    .map(|dt| {
+                        let burst_time_abs = dt.and_utc().timestamp() as f64 
+                            + (dt.and_utc().timestamp_subsec_nanos() as f64) * 1e-9;
+                        let burst_time_rel = burst_time_abs - orbit_ref_epoch_utc;
+                        log::info!(
+                            "✅ BURST TIME FIX: First burst at t={:.6}s (orbit-relative), Δt from product_start = {:.3}s",
+                            burst_time_rel,
+                            burst_time_rel - product_start_rel_s
+                        );
+                        burst_time_rel
+                    })
+            });
+        
+        if first_burst_time_rel_orbit.is_none() {
+            log::warn!("⚠️  Could not extract first burst time from annotation - falling back to product_start (may cause Range-Doppler failures for TOPS data)");
+        }
+        
         Ok(crate::core::terrain_correction::RangeDopplerParams {
             range_pixel_spacing: range_ps,
             azimuth_pixel_spacing: az_ps,
@@ -2476,6 +2544,7 @@ impl ProductRoot {
             last_valid_line,
             first_valid_sample,
             last_valid_sample,
+            first_burst_time_rel_orbit,  // CRITICAL: Burst-aware time base for Range-Doppler solver
         })
     }
 

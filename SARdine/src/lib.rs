@@ -3129,12 +3129,30 @@ fn terrain_correction(
         });
     }
 
-    let orbit_data_struct = OrbitData {
-        state_vectors: state_vectors.clone(),
-        reference_time: state_vectors
+    // CRITICAL FIX: Use product start time as orbit reference, not first state vector
+    // This must match the orbit_ref_epoch_utc passed in metadata
+    let orbit_reference_time = if let Some(orbit_ref) = real_metadata.get("orbit_ref_epoch_utc") {
+        let ref_time = DateTime::from_timestamp(*orbit_ref as i64, ((*orbit_ref).fract() * 1e9) as u32)
+            .ok_or_else(|| PyValueError::new_err(format!("Invalid orbit reference time: {}", orbit_ref)))?;
+        log::error!("🔍 ORBIT TIMING FIX APPLIED:");
+        log::error!("   📡 orbit_ref_epoch_utc from metadata: {:.6} s", orbit_ref);
+        log::error!("   🕐 Converted to DateTime: {}", ref_time.to_rfc3339());
+        log::error!("   ⚠️  First state vector time: {}", state_vectors.first().unwrap().time.to_rfc3339());
+        log::error!("   ⏱️  Time difference: {:.2} seconds", 
+            (state_vectors.first().unwrap().time.timestamp() as f64 - *orbit_ref).abs());
+        ref_time
+    } else {
+        let fallback_time = state_vectors
             .first()
             .ok_or_else(|| PyValueError::new_err("No orbit state vectors available"))?
-            .time,
+            .time;
+        log::warn!("⚠️  orbit_ref_epoch_utc NOT found in metadata - using first state vector: {}", fallback_time.to_rfc3339());
+        fallback_time
+    };
+
+    let orbit_data_struct = OrbitData {
+        state_vectors: state_vectors.clone(),
+        reference_time: orbit_reference_time,
     };
 
     // Load DEM using the same pattern as the working function
@@ -3236,6 +3254,7 @@ fn terrain_correction(
         last_valid_line: real_metadata.get("last_valid_line").map(|v| *v as usize),
         first_valid_sample: real_metadata.get("first_valid_sample").map(|v| *v as usize),
         last_valid_sample: real_metadata.get("last_valid_sample").map(|v| *v as usize),
+        first_burst_time_rel_orbit: real_metadata.get("first_burst_time_rel_orbit").copied(),  // Extracted from annotation XML in Python
     };
 
     // *** CRITICAL ADDITION: Comprehensive Parameter Validation ***
