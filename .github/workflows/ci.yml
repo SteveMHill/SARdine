@@ -1,0 +1,104 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        working-directory: new_pipeline
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: new_pipeline
+      # Note: -D warnings is intentionally NOT set yet. There are pre-existing
+      # warnings unrelated to the CI bring-up; they will be tightened in a
+      # follow-up PR once the codebase is warning-clean.
+      - name: cargo clippy
+        working-directory: new_pipeline
+        run: cargo clippy --workspace --all-targets --no-default-features
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: new_pipeline
+      # 19 unit tests reference Sentinel-1 SAFE products by absolute path
+      # (notably the S1A test scene). These are integration-grade tests that
+      # depend on data not currently shipped with the repository. Skip them
+      # in CI until a proper test-data fixture (download script + cache or
+      # git-lfs pointer) is in place. Tracked as A4 follow-up.
+      - name: cargo test (workspace, default features)
+        working-directory: new_pipeline
+        run: |
+          cargo test --workspace --no-default-features -- \
+            --skip slc_reader::tests:: \
+            --skip deburst::tests:: \
+            --skip merge_subswaths::tests::merge_s1a_iw_vv_smoke_test \
+            --skip apply_calibration::tests::sigma0_s1a_iw1_vv_smoke_test
+
+  guard:
+    name: no-silent-fallbacks guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scripts/check_no_silent_fallbacks.sh
+        run: ./scripts/check_no_silent_fallbacks.sh
+
+  validate:
+    name: end-to-end radiometric validation
+    runs-on: ubuntu-latest
+    # Opt-in only: this job needs an out-of-tree directory of scene
+    # configs that point at SAFE products, orbit files, DEM tiles and
+    # ASF reference rasters.  Set the SARDINE_VALIDATION_SCENES_DIR
+    # repository variable (Settings → Secrets and variables → Actions
+    # → Variables) to enable.  Locally, run the binary directly with
+    # `--scenes-dir new_pipeline/validation/scenes` against the bundled
+    # munich_s1b_utm32n scene.
+    if: ${{ vars.SARDINE_VALIDATION_SCENES_DIR != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: new_pipeline
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install python dependencies
+        run: pip install --no-cache-dir numpy rasterio
+      - name: build sardine + sardine-validate
+        working-directory: new_pipeline
+        run: cargo build --release --no-default-features -p sardine-scene -p sardine-validation
+      - name: sardine-validate
+        env:
+          SARDINE_VALIDATION_SCENES_DIR: ${{ vars.SARDINE_VALIDATION_SCENES_DIR }}
+        run: |
+          new_pipeline/target/release/sardine-validate \
+            --sardine-bin new_pipeline/target/release/sardine \
+            --multilook-compare scripts/multilook_compare.py

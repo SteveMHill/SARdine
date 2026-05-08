@@ -1,0 +1,29 @@
+# Legacy virtualenv (hundreds of MB of Python packages)
+legacy/old_package_copy/SARdine/.venv/
+
+# Rust build outputs
+new_pipeline/scene/target/
+new_pipeline/sardine-py/target/
+new_pipeline/validation/target/
+target/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Large binary data (SLC, DEM, reference products)
+data/SLC/
+data/dem/
+data/ASF/
+data/MPC/
+
+# Output TIFFs / working files
+*.tiff
+*.tif
+*.json
+!data/**/*.xml
+
+# IDE
+.vscode/settings.json
+.idea/

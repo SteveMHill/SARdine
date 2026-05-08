@@ -1,0 +1,34 @@
+# Scene config: S1B Munich, 2019-01-23, UTM 32N, 10 m
+#
+# Reference: ASF RTC10 GAMMA processor product
+#   S1B_IW_20190123T053348_DVP_RTC10_G_gpufem_6EC9
+#
+# Validated post-fix (2026-04-27):
+#   median_bias = +0.0283 dB
+#   std_dev     = 2.9572 dB
+#   n_samples   = 4,098,547
+
+name = "munich_s1b_utm32n"
+safe = "data/SLC/S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833.SAFE"
+orbit = "data/SLC/S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833.SAFE/orbit_cache/S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833_POEORB.EOF"
+dem = "data/dem/srtm1"
+asf_reference = "data/ASF/S1B_IW_20190123T053348_DVP_RTC10_G_gpufem_6EC9/S1B_IW_20190123T053348_DVP_RTC10_G_gpufem_6EC9_VV.tif"
+polarization = "VV"
+crs = "auto"
+pixel_spacing_m = 10.0
+geoid = "zero"
+
+[thresholds]
+# Calibration target.  The post-fix observed bias is +0.0283 dB; setting
+# the gate at ±0.10 dB allows for run-to-run jitter from speckle and
+# inter-processor resampling without admitting a real regression.
+median_bias_db_max = 0.10
+
+# Inter-processor spatial-registration residual (SRTM1 vs ASF's GLO-30).
+# Observed 2.96 dB; gate at 3.50 dB so we catch a sudden jump but tolerate
+# normal noise.
+std_dev_db_max = 3.50
+
+# A drop below this means the scene was over-masked.  Observed 4.1M; floor
+# at 1.0M to keep the comparison statistically powerful.
+min_joint_samples = 1_000_000

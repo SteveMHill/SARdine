@@ -1,0 +1,35 @@
+[package]
+name = "sardine-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Python bindings for the SARdine Sentinel-1 backscatter pipeline"
+publish = false
+
+[lib]
+# `_sardine` is the import name used inside the Python `sardine/` wrapper
+# package; the public Python API lives in the wrapper, which re-exports
+# from this extension module.
+name = "_sardine"
+crate-type = ["cdylib"]
+
+[features]
+# Forward the optional fetch features from `sardine-scene`.  These are
+# build-time opt-ins because each one pulls in `ureq` (TLS + HTTP) and
+# enables network I/O.  Enable from the command line with e.g.:
+#     maturin develop --release --features fetch-all
+# or pick individual features:
+#     maturin develop --release --features geoid-fetch
+geoid-fetch = ["sardine-scene/geoid-fetch"]
+orbit-fetch = ["sardine-scene/orbit-fetch"]
+slc-fetch   = ["sardine-scene/slc-fetch"]
+fetch-all   = ["geoid-fetch", "orbit-fetch", "slc-fetch"]
+
+[dependencies]
+sardine-scene = { path = "../scene" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+anyhow = "1"

@@ -1,0 +1,22 @@
+[package]
+name = "sardine-validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "End-to-end radiometric regression harness for SARdine"
+publish = false
+
+[[bin]]
+name = "sardine-validate"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive", "env"] }
