@@ -241,6 +241,72 @@ fn lut_cursor_eval(pixels: &[u32], values: &[f32], cur: usize, tiff_col: u32) ->
 /// the LUT cursor is advanced monotonically (total advances ≤ N_lut), so no
 /// binary search is performed per column.  This is ~6× faster than a per-column
 /// binary search for typical S-1 geometry (N_cols ≈ 22 k, N_lut ≈ 50).
+
+// ─── Vectorizable row kernels ─────────────────────────────────────────────────
+//
+// Both functions are structured so that LLVM can autovectorise the inner loop:
+//
+//   • `dn_to_power_row`: simple element-wise i16 widening + multiply-add.
+//     No branches, no memory aliasing.
+//
+//   • `apply_cal_row`: branchless f32 arithmetic.  The "k² > 0" guard is
+//     implemented as a floating-point select (multiply by 0.0 / 1.0) rather
+//     than a branch, removing the per-lane divergence that prevents SIMD.
+//
+// On x86-64 with -C target-cpu=native (or explicit +avx2) LLVM typically
+// emits 8-wide AVX2 vectors.  On aarch64 it emits NEON/SVE.  No unsafe or
+// platform-specific intrinsics are used: portability and safety are preserved.
+
+/// Convert a row of CInt16 DN samples to f32 power values in-place.
+///
+/// `power[c] = (i_dn[c]² + q_dn[c]²) as f32`
+///
+/// Uses i32 intermediate arithmetic to prevent i16 overflow before the
+/// conversion to f32 (`i16::MAX² + i16::MAX² = 2 × 32767² ≈ 2.1 × 10⁹`,
+/// which fits in i32 but not i16).
+#[inline(always)]
+fn dn_to_power_row(in_row: &[[i16; 2]], power: &mut [f32]) {
+    debug_assert_eq!(in_row.len(), power.len());
+    for (iq, p) in in_row.iter().zip(power.iter_mut()) {
+        let [i, q] = *iq;
+        *p = (i as i32 * i as i32 + q as i32 * q as i32) as f32;
+    }
+}
+
+/// Apply calibration and noise to one row, writing σ⁰ and NESZ.
+///
+/// ```text
+/// σ⁰[c] = max(power[c] − noise[c] × az_factor, 0) / k[c]²
+/// nesz[c] = noise[c] × az_factor / k[c]²
+/// ```
+///
+/// When `k[c] = 0` both outputs are set to 0.0 via branchless f32 selection
+/// so that the loop body contains no data-dependent branches and LLVM can
+/// autovectorise the whole operation.
+#[inline(always)]
+fn apply_cal_row(
+    power: &[f32],
+    noise: &[f32],
+    k: &[f32],
+    az_factor: f32,
+    out: &mut [f32],
+    nesz: &mut [f32],
+) {
+    debug_assert_eq!(power.len(), noise.len());
+    debug_assert_eq!(power.len(), k.len());
+    debug_assert_eq!(power.len(), out.len());
+    debug_assert_eq!(power.len(), nesz.len());
+    for idx in 0..power.len() {
+        let k2 = k[idx] * k[idx];
+        // Branchless: when k2 == 0 the selector is 0.0, zeroing both outputs.
+        let valid = (k2 > 0.0) as u32 as f32;
+        let inv_k2 = if k2 > 0.0 { 1.0 / k2 } else { 0.0 };
+        let noise_val = noise[idx] * az_factor;
+        out[idx] = (power[idx] - noise_val).max(0.0) * inv_k2 * valid;
+        nesz[idx] = noise_val * inv_k2 * valid;
+    }
+}
+
 fn bilinear_row_into(
     vecs_lines: &[i64],
     vecs_pixels: &[&[u32]],
@@ -428,6 +494,8 @@ pub fn apply_calibration(
     // Reuse these across lines to avoid per-line heap allocations.
     let mut k_row = vec![0.0f32; out_cols];
     let mut nr_row = vec![0.0f32; out_cols];
+    // Scratch buffer for i16 DN → f32 power conversion (reused per line).
+    let mut power_row = vec![0.0f32; out_cols];
 
     // ── Main loop ──────────────────────────────────────────────────────────────
     for out_line in 0..out_lines {
@@ -459,25 +527,16 @@ pub fn apply_calibration(
             1.0
         };
 
-        // Apply formula per pixel.
+        // Apply formula per pixel (two vectorizable passes).
         let in_row = &deburst.data[out_line * out_cols..(out_line + 1) * out_cols];
         let out_row = &mut out[out_line * out_cols..(out_line + 1) * out_cols];
+        let nesz_row = &mut nesz_out[out_line * out_cols..(out_line + 1) * out_cols];
 
-        for c in 0..out_cols {
-            let [i_dn, q_dn] = in_row[c];
-            let power = (i_dn as i32 * i_dn as i32 + q_dn as i32 * q_dn as i32) as f32;
-            let noise_val = nr_row[c] * az_factor;
-            let k = k_row[c];
-            let k2 = k * k;
-            // Clamp to zero: noise floor subtraction can produce negative power.
-            out_row[c] = if k2 > 0.0 {
-                (power - noise_val).max(0.0) / k2
-            } else {
-                0.0
-            };
-            // NESZ = N / K² — noise floor expressed in calibrated σ⁰ units.
-            nesz_out[out_line * out_cols + c] = if k2 > 0.0 { noise_val / k2 } else { 0.0 };
-        }
+        // Pass 1: i16 DN → f32 power  (enables i16→i32 widening SIMD).
+        dn_to_power_row(in_row, &mut power_row);
+
+        // Pass 2: branchless σ⁰ and NESZ  (pure f32, no data-dependent branches).
+        apply_cal_row(&power_row, &nr_row, &k_row, az_factor, out_row, nesz_row);
     }
 
     Ok(Sigma0Array {
@@ -496,6 +555,73 @@ pub fn apply_calibration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Vectorizable row kernel tests ─────────────────────────────────────────
+
+    #[test]
+    fn dn_to_power_row_known_values() {
+        let in_row: Vec<[i16; 2]> = vec![[3, 4], [0, 0], [i16::MAX, i16::MAX]];
+        let mut power = vec![0.0f32; 3];
+        dn_to_power_row(&in_row, &mut power);
+        assert!((power[0] - 25.0).abs() < 1e-6, "3²+4²=25, got {}", power[0]);
+        assert_eq!(power[1], 0.0);
+        let expected_max = (i16::MAX as i32 * i16::MAX as i32 * 2) as f32;
+        assert!((power[2] - expected_max).abs() < 1.0, "MAX² + MAX², got {}", power[2]);
+    }
+
+    #[test]
+    fn apply_cal_row_zero_k_gives_zero_output() {
+        let power = vec![100.0f32; 4];
+        let noise = vec![10.0f32; 4];
+        let k = vec![0.0f32; 4]; // all-zero → both outputs must be zero
+        let mut out = vec![f32::NAN; 4];
+        let mut nesz = vec![f32::NAN; 4];
+        apply_cal_row(&power, &noise, &k, 1.0, &mut out, &mut nesz);
+        for i in 0..4 {
+            assert_eq!(out[i], 0.0, "out[{i}] should be 0 when k=0");
+            assert_eq!(nesz[i], 0.0, "nesz[{i}] should be 0 when k=0");
+        }
+    }
+
+    #[test]
+    fn apply_cal_row_known_sigma0() {
+        // power=125, noise=25, k=10, az=1 → σ⁰ = (125-25)/100 = 1.0, NESZ = 25/100 = 0.25
+        let power = vec![125.0f32];
+        let noise = vec![25.0f32];
+        let k = vec![10.0f32];
+        let mut out = vec![0.0f32];
+        let mut nesz = vec![0.0f32];
+        apply_cal_row(&power, &noise, &k, 1.0, &mut out, &mut nesz);
+        assert!((out[0] - 1.0).abs() < 1e-5, "sigma0 mismatch: {}", out[0]);
+        assert!((nesz[0] - 0.25).abs() < 1e-5, "nesz mismatch: {}", nesz[0]);
+    }
+
+    #[test]
+    fn apply_cal_row_negative_power_clamps_to_zero() {
+        // power < noise → clamped to 0, but NESZ is still noise/k²
+        let power = vec![5.0f32];
+        let noise = vec![50.0f32];
+        let k = vec![10.0f32];
+        let mut out = vec![f32::NAN];
+        let mut nesz = vec![0.0f32];
+        apply_cal_row(&power, &noise, &k, 1.0, &mut out, &mut nesz);
+        assert_eq!(out[0], 0.0, "negative power should clamp to 0");
+        assert!((nesz[0] - 0.5).abs() < 1e-5, "nesz mismatch: {}", nesz[0]);
+    }
+
+    #[test]
+    fn apply_cal_row_az_factor_scales_noise() {
+        // noise=10, az_factor=3 → effective noise = 30
+        // power=130, k=10 → σ⁰ = (130-30)/100 = 1.0
+        let power = vec![130.0f32];
+        let noise = vec![10.0f32];
+        let k = vec![10.0f32];
+        let mut out = vec![0.0f32];
+        let mut nesz = vec![0.0f32];
+        apply_cal_row(&power, &noise, &k, 3.0, &mut out, &mut nesz);
+        assert!((out[0] - 1.0).abs() < 1e-5, "sigma0 with az_factor: {}", out[0]);
+        assert!((nesz[0] - 0.3).abs() < 1e-5, "nesz with az_factor: {}", nesz[0]);
+    }
 
     // ── Interpolation unit tests ───────────────────────────────────────────────
 
