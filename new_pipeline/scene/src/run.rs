@@ -26,6 +26,7 @@
 //! `tracing::info!` / `tracing::warn!`; callers must initialise a
 //! [`tracing_subscriber`] to see output (the CLI binary does this automatically).
 
+#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
