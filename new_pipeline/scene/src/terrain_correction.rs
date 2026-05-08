@@ -190,6 +190,12 @@ pub struct TerrainCorrectionConfig {
     /// the merged image.  Where the merged NESZ is NaN (swath gap), the
     /// pixel is passed through without masking.
     pub noise_floor_margin_db: f32,
+
+    /// Resampling kernel for the σ⁰ image interpolation step.
+    ///
+    /// Default: [`ResamplingKernel::Bilinear`].  See
+    /// [`crate::pipeline_options::ResamplingKernel`] for the tradeoffs.
+    pub resampling: crate::pipeline_options::ResamplingKernel,
 }
 
 impl TerrainCorrectionConfig {
@@ -219,6 +225,7 @@ impl TerrainCorrectionConfig {
             geoid,
             compute_lia: false,
             noise_floor_margin_db: f32::NEG_INFINITY,
+            resampling: crate::pipeline_options::ResamplingKernel::Bilinear,
         }
     }
 }
@@ -443,7 +450,10 @@ pub(crate) fn cardinal_neighbour_step_deg(
 ) -> f64 {
     match crs {
         OutputCrs::Wgs84LatLon => crs_spacing,
-        OutputCrs::UtmNorth { .. } | OutputCrs::UtmSouth { .. } => {
+        OutputCrs::UtmNorth { .. }
+        | OutputCrs::UtmSouth { .. }
+        | OutputCrs::EtrsLaea
+        | OutputCrs::WebMercator => {
             crs_spacing / METRES_PER_DEGREE_LATITUDE
         }
     }
@@ -746,6 +756,93 @@ fn bilinear_sample_slice(data: &[f32], n_lines: usize, n_samples: usize, line: f
 /// Bilinear interpolation of a value in the merged sigma0 image.
 fn bilinear_sample(merged: &MergedSigma0, line: f64, sample: f64) -> f32 {
     bilinear_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
+}
+
+// ── Bicubic (Keys, α = −0.5) interpolation ─────────────────────────
+
+/// Keys cubic kernel weight for parameter `t` (distance from the knot).
+///
+/// Uses the Keys (1989) piecewise polynomial with α = −0.5 (also known
+/// as the Catmull-Rom / cubic Hermite spline):
+///
+/// ```text
+///   |t| < 1:  (α+2)|t|³ − (α+3)|t|² + 1  = 1.5|t|³ − 2.5|t|² + 1
+///   |t| < 2:  α|t|³ − 5α|t|² + 8α|t| − 4α = −0.5|t|³ + 2.5|t|² − 4|t| + 2
+///   else:     0
+/// ```
+///
+/// `t` must already be in [−2, 2]; the caller is responsible for clamping.
+#[inline(always)]
+fn keys_weight(t: f64) -> f64 {
+    let t = t.abs();
+    if t < 1.0 {
+        1.5 * t * t * t - 2.5 * t * t + 1.0
+    } else if t < 2.0 {
+        -0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// 16-tap bicubic interpolation over a flat row-major `f32` slice.
+///
+/// Samples the 4×4 neighbourhood centred on `(line, sample)`.  Returns NaN if
+/// any of the 16 taps is NaN (propagates nodata cleanly).  For locations within
+/// 1 pixel of the image boundary the kernel is clamped to the nearest valid
+/// row/column.
+///
+/// **Note on SAR use**: bicubic can introduce mild Gibbs ringing near high-
+/// contrast edges (bright point targets, ship returns).  Bilinear remains the
+/// default for SAR backscatter.  Bicubic is useful when the output is
+/// resampled to a much coarser grid than the input.
+fn bicubic_sample_slice(
+    data: &[f32],
+    n_lines: usize,
+    n_samples: usize,
+    line: f64,
+    sample: f64,
+) -> f32 {
+    let max_l = (n_lines as isize) - 1;
+    let max_s = (n_samples as isize) - 1;
+
+    let l_floor = line.floor() as isize;
+    let s_floor = sample.floor() as isize;
+
+    let dl = line - l_floor as f64;
+    let ds = sample - s_floor as f64;
+
+    let mut acc = 0.0_f64;
+    for li in -1_isize..=2 {
+        let row = (l_floor + li).clamp(0, max_l) as usize;
+        let wl = keys_weight(li as f64 - dl);
+        for si in -1_isize..=2 {
+            let col = (s_floor + si).clamp(0, max_s) as usize;
+            let v = data[row * n_samples + col];
+            if v.is_nan() {
+                return f32::NAN;
+            }
+            acc += v as f64 * wl * keys_weight(si as f64 - ds);
+        }
+    }
+    acc as f32
+}
+
+/// Resample the merged sigma0 image at fractional coordinates using the
+/// configured [`crate::pipeline_options::ResamplingKernel`].
+fn resample_merged(
+    merged: &MergedSigma0,
+    line: f64,
+    sample: f64,
+    kernel: crate::pipeline_options::ResamplingKernel,
+) -> f32 {
+    match kernel {
+        crate::pipeline_options::ResamplingKernel::Bilinear => {
+            bilinear_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
+        }
+        crate::pipeline_options::ResamplingKernel::Bicubic => {
+            bicubic_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
+        }
+    }
 }
 
 // ── Zero-Doppler solver ────────────────────────────────────────────
@@ -1320,8 +1417,8 @@ pub fn terrain_correction(
                         }
                     };
 
-                // 6. Bilinear resample from the merged σ⁰ image.
-                let mut sigma0 = bilinear_sample(merged, frac_line, frac_sample);
+                // 6. Resample from the merged σ⁰ image.
+                let mut sigma0 = resample_merged(merged, frac_line, frac_sample, config.resampling);
                 if sigma0.is_nan() {
                     // The radar pixel exists but the source value is itself NaN
                     // (merge seam gap, deburst nodata, or invalid calibration).
@@ -2117,6 +2214,61 @@ mod tests {
             let b = bilinear_sample_slice(&merged.data, merged.lines, merged.samples, line, sample);
             assert!((a - b).abs() < 1e-6, "mismatch at ({line},{sample}): {a} vs {b}");
         }
+    }
+
+    // ── Bicubic kernel tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn keys_weight_unit_interval() {
+        // At t=0 the weight must be 1.0 (centre tap).
+        assert!((keys_weight(0.0) - 1.0).abs() < 1e-12);
+        // At t=1 and t=-1 the weight must be 0.0 (Catmull-Rom knot condition).
+        assert!(keys_weight(1.0).abs() < 1e-12);
+        assert!(keys_weight(-1.0).abs() < 1e-12);
+        // Beyond |t| >= 2 the weight must be 0.0.
+        assert_eq!(keys_weight(2.0), 0.0);
+        assert_eq!(keys_weight(-2.5), 0.0);
+    }
+
+    #[test]
+    fn keys_weights_sum_to_one_at_exact_pixel() {
+        // At exact pixel centres ds = 0.0 → only the centre tap contributes.
+        // The four weights for offsets -1, 0, 1, 2 at ds=0 are:
+        //   keys_weight(-1) = 0, keys_weight(0) = 1, keys_weight(1) = 0, keys_weight(2) = 0
+        // Confirm partition-of-unity: sum of all 16 = 1.0.
+        let ds = 0.0_f64;
+        let dl = 0.0_f64;
+        let sum: f64 = (-1_isize..=2).flat_map(|li| {
+            (-1_isize..=2).map(move |si| keys_weight(li as f64 - dl) * keys_weight(si as f64 - ds))
+        }).sum();
+        assert!((sum - 1.0).abs() < 1e-12, "partition-of-unity at exact pixel: sum={sum}");
+    }
+
+    #[test]
+    fn bicubic_sample_constant_image_returns_constant() {
+        // On a uniform field bicubic must return the constant value regardless
+        // of fractional position (partition-of-unity property).
+        let data = vec![7.0_f32; 5 * 5];
+        for (l, s) in [(0.5_f64, 0.5_f64), (1.7, 2.3), (3.9, 3.9)] {
+            let v = bicubic_sample_slice(&data, 5, 5, l, s);
+            assert!((v - 7.0).abs() < 1e-4, "constant field: got {v} at ({l},{s})");
+        }
+    }
+
+    #[test]
+    fn bicubic_at_exact_grid_node_returns_value() {
+        // At exact integer coordinates the bicubic result must equal the grid value.
+        let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let v = bicubic_sample_slice(&data, 4, 4, 2.0, 3.0);
+        assert!((v - data[2 * 4 + 3]).abs() < 1e-4, "exact node: got {v}, expected {}", data[2*4+3]);
+    }
+
+    #[test]
+    fn bicubic_nan_tap_propagates_nan() {
+        let mut data = vec![1.0_f32; 4 * 4];
+        data[1 * 4 + 1] = f32::NAN; // a tap that will be hit
+        let v = bicubic_sample_slice(&data, 4, 4, 1.5, 1.5);
+        assert!(v.is_nan(), "NaN tap must propagate to NaN result");
     }
 
     #[test]

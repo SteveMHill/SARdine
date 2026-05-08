@@ -61,6 +61,33 @@ enum Commands {
     /// non-georeferenced TIFF — radar geometry cannot be honestly
     /// expressed in EPSG:4326.
     Grd(GrdArgs),
+
+    /// Process multiple scenes from a JSON batch file.
+    ///
+    /// Each scene is processed sequentially.  A failure in one scene is
+    /// recorded and reported at the end; it does not abort later scenes.
+    ///
+    /// # Batch file format
+    ///
+    /// A JSON array of objects.  Each object has the same fields as the
+    /// `process` subcommand flags (snake_case, types as below).  Fields
+    /// with defaults may be omitted.
+    ///
+    /// Required fields per entry:
+    ///   `safe` (string or array of strings), `dem`, `output`, `geoid`
+    ///
+    /// Example:
+    /// ```json
+    /// [
+    ///   {
+    ///     "safe": "/data/S1A.SAFE",
+    ///     "dem": "/data/dem",
+    ///     "output": "/out/scene1.tif",
+    ///     "geoid": "auto"
+    ///   }
+    /// ]
+    /// ```
+    Batch(BatchArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +253,13 @@ struct ProcessArgs {
     ///   `nrb`: RTC with mandatory LIA, quality mask, and STAC sidecars (NRB profile).
     #[arg(long, value_name = "MODE", default_value = "rtc")]
     mode: String,
+
+    /// Resampling kernel for the σ⁰ image interpolation during terrain correction.
+    ///   `bilinear` (default): 4-tap bilinear — low-pass, no overshoot.
+    ///   `bicubic`           : 16-tap Keys kernel (α=−0.5) — sharper but
+    ///                         can ring near bright point targets.
+    #[arg(long, value_name = "KERNEL", default_value = "bilinear")]
+    resampling: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +271,18 @@ struct ProcessArgs {
 fn parse_iw_selection(iw: &str, burst_range: Option<&str>) -> Result<IwSelection> {
     sardine_scene::run::parse_iw_selection(iw, burst_range)
         .with_context(|| format!("--iw / --burst-range: invalid selection (iw={iw:?})"))
+}
+
+/// Parse `--resampling bilinear|bicubic`.
+fn parse_resampling(s: &str) -> Result<sardine_scene::run::ResamplingKernel> {
+    use sardine_scene::run::ResamplingKernel;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "bilinear" => Ok(ResamplingKernel::Bilinear),
+        "bicubic"  => Ok(ResamplingKernel::Bicubic),
+        other      => anyhow::bail!(
+            "unknown resampling kernel '{other}'; valid values: bilinear, bicubic"
+        ),
+    }
 }
 
 impl ProcessArgs {
@@ -255,6 +301,9 @@ impl ProcessArgs {
 
         let mode = sardine_scene::run::parse_output_mode(&self.mode)
             .with_context(|| "--mode")?;
+
+        let resampling = parse_resampling(&self.resampling)
+            .with_context(|| "--resampling")?;
 
         Ok(ProcessOptions {
             safe: primary_safe,
@@ -283,6 +332,7 @@ impl ProcessArgs {
             iw_selection,
             mode,
             speckle_order,
+            resampling,
         })
     }
 }
@@ -547,6 +597,212 @@ fn cmd_grd(args: GrdArgs) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// batch subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct BatchArgs {
+    /// Path to the JSON batch file (array of process-spec objects).
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+}
+
+/// Mirror of `ProcessArgs` fields, owned as plain strings / numbers for
+/// JSON deserialisation.  All fields with CLI defaults are `Option<T>` so
+/// they can be omitted from the JSON file and the defaults will be applied.
+///
+/// Fields that have no CLI default (`safe`, `dem`, `output`, `geoid`) are
+/// non-optional.  `safe` may be a JSON string (single SAFE path) or a JSON
+/// array of strings (multiple slices for slice-assembly).
+#[derive(serde::Deserialize)]
+struct BatchEntry {
+    /// Primary (or only) SAFE path.  May be a string or array of strings
+    /// (first element = primary, remainder = extra slices, ascending time order).
+    safe: OneOrMany,
+    /// Directory containing SRTM1 DEM tiles.
+    dem: PathBuf,
+    /// Output path for the dB GeoTIFF.
+    output: PathBuf,
+    /// Geoid: `"auto"`, `"zero"`, or path to EGM96 `.bin`/`.gtx`/`.GRD` file.
+    geoid: String,
+    // --- optional fields (same defaults as the CLI) ---
+    #[serde(default)]
+    orbit: Option<PathBuf>,
+    #[serde(default = "default_polarization")]
+    polarization: String,
+    #[serde(default)]
+    no_flatten: bool,
+    #[serde(default)]
+    noise_floor_db: f32,
+    #[serde(default = "default_pixel_spacing_deg")]
+    pixel_spacing_deg: f64,
+    #[serde(default = "default_pixel_spacing_m")]
+    pixel_spacing_m: f64,
+    #[serde(default = "default_crs")]
+    crs: String,
+    #[serde(default)]
+    write_mask: bool,
+    #[serde(default)]
+    write_lia: bool,
+    #[serde(default)]
+    no_provenance: bool,
+    #[serde(default)]
+    cog: bool,
+    #[serde(default)]
+    threads: usize,
+    #[serde(default = "default_speckle")]
+    speckle: String,
+    #[serde(default = "default_speckle_window")]
+    speckle_window: usize,
+    #[serde(default = "default_enl")]
+    enl: f32,
+    #[serde(default = "default_frost_damping")]
+    frost_damping: f32,
+    #[serde(default = "default_multilook")]
+    multilook_range: usize,
+    #[serde(default = "default_multilook")]
+    multilook_azimuth: usize,
+    #[serde(default = "default_iw")]
+    iw: String,
+    #[serde(default)]
+    burst_range: Option<String>,
+    #[serde(default = "default_mode")]
+    mode: String,
+    #[serde(default = "default_speckle_order")]
+    speckle_order: String,
+    #[serde(default = "default_resampling")]
+    resampling: String,
+}
+
+/// Accepts either a JSON string `"path"` or a JSON array `["path1", "path2"]`.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(PathBuf),
+    Many(Vec<PathBuf>),
+}
+
+impl OneOrMany {
+    fn into_parts(self) -> (PathBuf, Vec<PathBuf>) {
+        match self {
+            OneOrMany::One(p) => (p, vec![]),
+            OneOrMany::Many(mut v) => {
+                if v.is_empty() {
+                    // Caller will get a descriptive error from the pipeline,
+                    // not a silent success.
+                    (PathBuf::new(), vec![])
+                } else {
+                    let primary = v.remove(0);
+                    (primary, v)
+                }
+            }
+        }
+    }
+}
+
+// Default-value functions required by `#[serde(default = "...")]`.
+fn default_polarization() -> String { "VV".to_owned() }
+fn default_pixel_spacing_deg() -> f64 { 0.0001 }
+fn default_pixel_spacing_m() -> f64 { 10.0 }
+fn default_crs() -> String { "wgs84".to_owned() }
+fn default_speckle() -> String { "none".to_owned() }
+fn default_speckle_window() -> usize { 7 }
+fn default_enl() -> f32 { 1.0 }
+fn default_frost_damping() -> f32 { 1.0 }
+fn default_multilook() -> usize { 1 }
+fn default_iw() -> String { String::new() }
+fn default_mode() -> String { "rtc".to_owned() }
+fn default_speckle_order() -> String { "after-tc".to_owned() }
+fn default_resampling() -> String { "bilinear".to_owned() }
+
+impl BatchEntry {
+    fn into_options(self) -> Result<ProcessOptions> {
+        let (primary_safe, extra_safe_paths) = self.safe.into_parts();
+        if primary_safe.as_os_str().is_empty() {
+            anyhow::bail!("batch entry has an empty 'safe' array — at least one SAFE path is required");
+        }
+
+        let iw_selection = parse_iw_selection(&self.iw, self.burst_range.as_deref())?;
+        let speckle_order = sardine_scene::run::parse_speckle_order(&self.speckle_order)
+            .with_context(|| "speckle_order")?;
+        let mode = sardine_scene::run::parse_output_mode(&self.mode)
+            .with_context(|| "mode")?;
+        let resampling = parse_resampling(&self.resampling)
+            .with_context(|| "resampling")?;
+
+        Ok(ProcessOptions {
+            safe: primary_safe,
+            extra_safe_paths,
+            dem: self.dem,
+            output: self.output,
+            orbit: self.orbit,
+            polarization: self.polarization,
+            no_flatten: self.no_flatten,
+            noise_floor_db: self.noise_floor_db,
+            pixel_spacing_deg: self.pixel_spacing_deg,
+            pixel_spacing_m: self.pixel_spacing_m,
+            crs: self.crs,
+            write_mask: self.write_mask,
+            write_lia: self.write_lia,
+            no_provenance: self.no_provenance,
+            cog: self.cog,
+            threads: self.threads,
+            speckle: self.speckle,
+            speckle_window: self.speckle_window,
+            enl: self.enl,
+            frost_damping: self.frost_damping,
+            geoid: self.geoid,
+            multilook_range: self.multilook_range,
+            multilook_azimuth: self.multilook_azimuth,
+            iw_selection,
+            mode,
+            speckle_order,
+            resampling,
+        })
+    }
+}
+
+fn cmd_batch(args: BatchArgs) -> Result<()> {
+    let json_text = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("reading batch file: {}", args.file.display()))?;
+
+    let entries: Vec<BatchEntry> = serde_json::from_str(&json_text)
+        .with_context(|| format!("parsing batch file: {}", args.file.display()))?;
+
+    if entries.is_empty() {
+        anyhow::bail!("batch file contains an empty array — nothing to do");
+    }
+
+    let opts: Vec<ProcessOptions> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            e.into_options()
+                .with_context(|| format!("batch entry {} (output: {}): invalid options", i, ""))
+        })
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| "one or more batch entries have invalid options")?;
+
+    let results = sardine_scene::run::run_process_batch(&opts);
+
+    let mut failed = 0usize;
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(()) => tracing::info!("batch scene {} OK", i + 1),
+            Err(e) => {
+                tracing::error!("batch scene {} FAILED: {:#}", i + 1, e);
+                failed += 1;
+            }
+        }
+    }
+
+    if failed > 0 {
+        anyhow::bail!("{} of {} batch scene(s) failed", failed, opts.len());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -569,6 +825,7 @@ fn main() -> ExitCode {
         Commands::DownloadSlc(args) => cmd_download_slc(args),
         Commands::Inspect(args) => cmd_inspect(args),
         Commands::Grd(args) => cmd_grd(args),
+        Commands::Batch(args) => cmd_batch(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

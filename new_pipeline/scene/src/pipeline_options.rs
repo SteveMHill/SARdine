@@ -61,6 +61,27 @@ impl Default for SpeckleOrder {
     }
 }
 
+/// Resampling kernel used when interpolating the merged σ⁰ image during
+/// terrain correction (step 6 of the backward Range-Doppler algorithm).
+///
+/// The default ([`ResamplingKernel::Bilinear`]) is appropriate for most
+/// Sentinel-1 backscatter products.  [`ResamplingKernel::Bicubic`] can
+/// slightly reduce aliasing at the cost of mild overshoot (Gibbs ringing)
+/// near bright point targets and specular returns — use with care on scenes
+/// with strong urban or ship targets.
+///
+/// CLI flag: `--resampling bilinear` (default) or `--resampling bicubic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResamplingKernel {
+    /// 4-tap bilinear interpolation.  Low-pass, no overshoot.  Default.
+    #[default]
+    Bilinear,
+    /// 16-tap bicubic Keys kernel (parameter α = −0.5, also known as
+    /// Catmull-Rom / cubic Hermite spline).  Sharper than bilinear but
+    /// can introduce ringing artefacts near high-contrast edges.
+    Bicubic,
+}
+
 /// Plain (non-clap) input set for [`crate::run::run_process`].
 ///
 /// Every field mirrors a `sardine process` CLI flag of the same name.
@@ -109,6 +130,11 @@ pub struct ProcessOptions {
     pub mode: OutputMode,
     /// Where to apply the speckle filter: `BeforeTc` (slant-range) or `AfterTc` (default).
     pub speckle_order: SpeckleOrder,
+    /// Resampling kernel for the σ⁰ image interpolation in terrain correction.
+    /// Default: [`ResamplingKernel::Bilinear`].  Set to
+    /// [`ResamplingKernel::Bicubic`] for sharper output at the risk of
+    /// mild ringing near bright point targets.
+    pub resampling: ResamplingKernel,
 }
 
 impl ProcessOptions {
@@ -142,6 +168,7 @@ impl ProcessOptions {
             iw_selection: IwSelection::default(),
             mode: OutputMode::default(),
             speckle_order: SpeckleOrder::default(),
+            resampling: ResamplingKernel::default(),
         }
     }
 
@@ -225,7 +252,8 @@ pub fn resolve_crs(
     if trimmed.is_empty() {
         bail!(
             "--crs SPEC must not be empty.  Use 'wgs84' (default), 'auto', \
-             'EPSG:4326', or 'EPSG:326NN' (UTM)."
+             'EPSG:4326', 'EPSG:326NN' (UTM), 'laea' / 'EPSG:3035' \
+             (ETRS89 LAEA Europe), or 'webmercator' / 'EPSG:3857'."
         );
     }
     if trimmed.eq_ignore_ascii_case("auto") {

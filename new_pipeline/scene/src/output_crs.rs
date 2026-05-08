@@ -42,15 +42,15 @@ use proj4rs::transform::transform;
 #[derive(Debug, thiserror::Error)]
 pub enum OutputCrsError {
     /// The EPSG code is not in the supported set.  Currently we accept
-    /// `4326` and the WGS84 UTM zone codes 32601..32660 and
-    /// 32701..32760.  Anything else is rejected explicitly rather than
+    /// `4326`, `3035`, `3857`, and the WGS84 UTM zone codes 32601..32660
+    /// and 32701..32760.  Anything else is rejected explicitly rather than
     /// silently degrading to "no CRS".
-    #[error("unsupported EPSG code {code} (supported: 4326, 32601-32660, 32701-32760)")]
+    #[error("unsupported EPSG code {code} (supported: 4326, 3035, 3857, 32601-32660, 32701-32760)")]
     UnsupportedEpsg { code: u32 },
 
     /// The supplied string does not match the `EPSG:NNNN` form (case
     /// insensitive, optional whitespace).
-    #[error("invalid CRS spec '{spec}': expected 'EPSG:<code>' or 'auto'")]
+    #[error("invalid CRS spec '{spec}': expected 'EPSG:<code>', 'laea', 'webmercator', or 'auto'")]
     InvalidSpec { spec: String },
 
     /// `proj4rs` failed to construct or run a projection.  The wrapped
@@ -76,15 +76,39 @@ pub enum OutputCrs {
     /// WGS84 / UTM zone S (south hemisphere).  `zone` is in 1..=60.
     /// EPSG = 32700 + zone.
     UtmSouth { zone: u8 },
+    /// ETRS89 / Lambert Azimuthal Equal-Area (LAEA), centred at
+    /// lat=52°N lon=10°E.  EPSG:3035.  Recommended for pan-European
+    /// Sentinel-1 analysis: equal-area property preserves radiometric
+    /// integrity across large swaths.  Produces strongly distorted
+    /// output outside Europe — use UTM or WGS84 for non-European scenes.
+    ///
+    /// Spec string accepted by [`from_spec`]: `"EPSG:3035"` or `"laea"`.
+    EtrsLaea,
+    /// WGS84 / Web Mercator (Pseudo-Mercator).  EPSG:3857.  Used by
+    /// web tile servers (OSM, Google Maps, etc.).  **Not equal-area**:
+    /// pixel footprints grow toward the poles, so this CRS is
+    /// appropriate for display tiles but not for radiometric
+    /// analysis.  Pixels above ~60° are significantly enlarged.
+    ///
+    /// Spec string accepted by [`from_spec`]: `"EPSG:3857"` or
+    /// `"webmercator"`.
+    WebMercator,
 }
 
 impl OutputCrs {
     /// Parse `"EPSG:NNNN"` (case insensitive) or `"4326"` (bare digits)
-    /// into an [`OutputCrs`].  `"auto"` is **not** accepted here — auto
-    /// requires scene context (the centre lon/lat) and is built via
-    /// [`OutputCrs::auto_for_lon_lat`] by the caller.
+    /// into an [`OutputCrs`].  Convenience aliases `"laea"` and
+    /// `"webmercator"` are also accepted.  `"auto"` is **not** accepted
+    /// here — auto requires scene context (the centre lon/lat) and is
+    /// built via [`OutputCrs::auto_for_lon_lat`] by the caller.
     pub fn from_spec(spec: &str) -> Result<Self, OutputCrsError> {
         let trimmed = spec.trim();
+        // Named aliases (case-insensitive).
+        match trimmed.to_ascii_lowercase().as_str() {
+            "laea" => return Ok(OutputCrs::EtrsLaea),
+            "webmercator" | "web_mercator" | "web mercator" => return Ok(OutputCrs::WebMercator),
+            _ => {}
+        }
         let digits = match trimmed
             .strip_prefix("EPSG:")
             .or_else(|| trimmed.strip_prefix("epsg:"))
@@ -101,10 +125,12 @@ impl OutputCrs {
 
     /// Build an [`OutputCrs`] from a numeric EPSG code.  Errors on
     /// codes outside the supported set; the supported set is
-    /// `{4326}` ∪ `32601..=32660` ∪ `32701..=32760`.
+    /// `{4326, 3035, 3857}` ∪ `32601..=32660` ∪ `32701..=32760`.
     pub fn from_epsg(code: u32) -> Result<Self, OutputCrsError> {
         match code {
             4326 => Ok(OutputCrs::Wgs84LatLon),
+            3035 => Ok(OutputCrs::EtrsLaea),
+            3857 => Ok(OutputCrs::WebMercator),
             32601..=32660 => Ok(OutputCrs::UtmNorth { zone: (code - 32600) as u8 }),
             32701..=32760 => Ok(OutputCrs::UtmSouth { zone: (code - 32700) as u8 }),
             _ => Err(OutputCrsError::UnsupportedEpsg { code }),
@@ -143,6 +169,8 @@ impl OutputCrs {
             OutputCrs::Wgs84LatLon => 4326,
             OutputCrs::UtmNorth { zone } => 32600 + *zone as u32,
             OutputCrs::UtmSouth { zone } => 32700 + *zone as u32,
+            OutputCrs::EtrsLaea => 3035,
+            OutputCrs::WebMercator => 3857,
         }
     }
 
@@ -150,11 +178,17 @@ impl OutputCrs {
     /// Used by the CLI to interpret `--pixel-spacing` (degrees vs metres)
     /// and by the GeoTIFF writer to decide which GeoKeys to emit.
     pub fn is_metric(&self) -> bool {
-        matches!(self, OutputCrs::UtmNorth { .. } | OutputCrs::UtmSouth { .. })
+        matches!(
+            self,
+            OutputCrs::UtmNorth { .. }
+                | OutputCrs::UtmSouth { .. }
+                | OutputCrs::EtrsLaea
+                | OutputCrs::WebMercator
+        )
     }
 
     /// Default pixel spacing for this CRS in its native units.  10 m
-    /// for UTM (matches Sentinel-1 IW pixel spacing in azimuth) and
+    /// for metric projected CRSs (UTM, LAEA, Web Mercator) and
     /// 1×10⁻⁴ deg ≈ 11 m at 50°N for WGS84.  This is purely a help
     /// convenience for the CLI default; the real value comes from
     /// `--pixel-spacing` whenever the user supplies it.
@@ -179,6 +213,21 @@ impl OutputCrs {
             OutputCrs::UtmSouth { zone } => format!(
                 "+proj=utm +zone={zone} +south +datum=WGS84 +units=m +no_defs +type=crs",
             ),
+            OutputCrs::EtrsLaea => {
+                // EPSG:3035 — ETRS89-extended / LAEA Europe.
+                // Central point: lat=52°N lon=10°E; false easting/northing
+                // 4321000 / 3210000 m (official EPSG parameters).
+                "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 \
+                 +ellps=GRS80 +units=m +no_defs +type=crs"
+                    .to_owned()
+            }
+            OutputCrs::WebMercator => {
+                // EPSG:3857 — WGS84 Pseudo-Mercator (Web Mercator).
+                // Sphere of radius 6378137 m; longitude clipped to ±180°.
+                "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 \
+                 +x_0=0 +y_0=0 +k=1 +units=m +no_defs +type=crs"
+                    .to_owned()
+            }
         }
     }
 
@@ -210,8 +259,8 @@ impl OutputCrs {
     ///
     /// * `Wgs84LatLon` → 16 SHORTs (3 keys: GTModelType=Geographic,
     ///   GTRasterType=PixelIsArea, GeographicType=4326).
-    /// * `UtmNorth { zone }` / `UtmSouth { zone }` → 20 SHORTs (4
-    ///   keys: GTModelType=Projected, GTRasterType=PixelIsArea,
+    /// * `UtmNorth { zone }` / `UtmSouth { zone }` / `EtrsLaea` / `WebMercator`
+    ///   → 20 SHORTs (4 keys: GTModelType=Projected, GTRasterType=PixelIsArea,
     ///   ProjectedCSType=EPSG, ProjLinearUnits=Linear_Meter=9001).
     pub fn geo_key_directory(&self) -> Vec<u16> {
         match self {
@@ -221,13 +270,16 @@ impl OutputCrs {
                 1025, 0, 1, 1,     // GTRasterTypeGeoKey = RasterPixelIsArea
                 2048, 0, 1, 4326,  // GeographicTypeGeoKey = GCS_WGS_84
             ],
-            OutputCrs::UtmNorth { .. } | OutputCrs::UtmSouth { .. } => {
-                let epsg = self.epsg() as u16; // 32601..32660 / 32701..32760 all fit in u16
+            OutputCrs::UtmNorth { .. }
+            | OutputCrs::UtmSouth { .. }
+            | OutputCrs::EtrsLaea
+            | OutputCrs::WebMercator => {
+                let epsg = self.epsg() as u16; // all supported projected EPSG codes fit in u16
                 vec![
                     1, 1, 0, 4,        // header: version=1, revision=1.0, n_keys=4
                     1024, 0, 1, 1,     // GTModelTypeGeoKey = ModelTypeProjected
                     1025, 0, 1, 1,     // GTRasterTypeGeoKey = RasterPixelIsArea
-                    3072, 0, 1, epsg,  // ProjectedCSTypeGeoKey = WGS 84 / UTM zone N
+                    3072, 0, 1, epsg,  // ProjectedCSTypeGeoKey
                     3076, 0, 1, 9001,  // ProjLinearUnitsGeoKey = Linear_Meter
                 ]
             }
@@ -400,8 +452,90 @@ mod tests {
 
     #[test]
     fn unsupported_epsg_is_rejected() {
-        let err = OutputCrs::from_spec("EPSG:3857").expect_err("must reject");
-        assert!(matches!(err, OutputCrsError::UnsupportedEpsg { code: 3857 }));
+        let err = OutputCrs::from_spec("EPSG:27700").expect_err("must reject");
+        assert!(matches!(err, OutputCrsError::UnsupportedEpsg { code: 27700 }));
+    }
+
+    #[test]
+    fn parse_epsg_3035_and_alias() {
+        assert_eq!(OutputCrs::from_spec("EPSG:3035").unwrap(), OutputCrs::EtrsLaea);
+        assert_eq!(OutputCrs::from_spec("laea").unwrap(), OutputCrs::EtrsLaea);
+        assert_eq!(OutputCrs::from_spec("LAEA").unwrap(), OutputCrs::EtrsLaea);
+        assert_eq!(OutputCrs::from_spec("3035").unwrap(), OutputCrs::EtrsLaea);
+    }
+
+    #[test]
+    fn parse_epsg_3857_and_alias() {
+        assert_eq!(OutputCrs::from_spec("EPSG:3857").unwrap(), OutputCrs::WebMercator);
+        assert_eq!(OutputCrs::from_spec("webmercator").unwrap(), OutputCrs::WebMercator);
+        assert_eq!(OutputCrs::from_spec("WebMercator").unwrap(), OutputCrs::WebMercator);
+        assert_eq!(OutputCrs::from_spec("3857").unwrap(), OutputCrs::WebMercator);
+    }
+
+    #[test]
+    fn laea_is_metric_and_epsg_is_3035() {
+        assert!(OutputCrs::EtrsLaea.is_metric());
+        assert_eq!(OutputCrs::EtrsLaea.epsg(), 3035);
+    }
+
+    #[test]
+    fn web_mercator_is_metric_and_epsg_is_3857() {
+        assert!(OutputCrs::WebMercator.is_metric());
+        assert_eq!(OutputCrs::WebMercator.epsg(), 3857);
+    }
+
+    #[test]
+    fn geo_key_directory_laea_uses_projected_layout() {
+        let keys = OutputCrs::EtrsLaea.geo_key_directory();
+        assert_eq!(keys.len(), 20, "LAEA GeoKey block must be 20 SHORTs");
+        assert_eq!(keys[3], 4, "n_keys=4");
+        assert_eq!(keys[4], 1024, "GTModelTypeGeoKey");
+        assert_eq!(keys[7], 1, "ModelTypeProjected=1");
+        assert_eq!(keys[12], 3072, "ProjectedCSTypeGeoKey");
+        assert_eq!(keys[15], 3035, "EPSG:3035");
+        assert_eq!(keys[19], 9001, "Linear_Meter");
+    }
+
+    #[test]
+    fn geo_key_directory_web_mercator_uses_projected_layout() {
+        let keys = OutputCrs::WebMercator.geo_key_directory();
+        assert_eq!(keys.len(), 20, "WebMercator GeoKey block must be 20 SHORTs");
+        assert_eq!(keys[15], 3857, "EPSG:3857");
+        assert_eq!(keys[19], 9001, "Linear_Meter");
+    }
+
+    #[test]
+    fn laea_projector_round_trips_european_location() {
+        // Berlin \u2248 (13.405°E, 52.52°N). EPSG:3035 origin is 52°N 10°E with
+        // false origin 4321000 E / 3210000 N, so Berlin should be near
+        // easting > 4321000 m and northing > 3210000 m.
+        let proj = OutputCrs::EtrsLaea.projector().unwrap();
+        let (x, y) = proj.lonlat_to_xy(13.405, 52.52).unwrap();
+        // Rough sanity: easting should be east of central meridian.
+        assert!(x > 4_321_000.0, "Berlin LAEA easting {x} should exceed false easting");
+        // Round-trip tolerance < 1 m.
+        let (lon, lat) = proj.xy_to_lonlat(x, y).unwrap();
+        assert!(
+            (lon - 13.405).abs() < 1e-5 && (lat - 52.52).abs() < 1e-5,
+            "LAEA round-trip: ({lon}, {lat}) vs (13.405, 52.52)",
+        );
+    }
+
+    #[test]
+    fn web_mercator_projector_round_trips_london() {
+        // London \u2248 (-0.1276°E, 51.5074°N).
+        // Web Mercator easting near 0; northing large positive.
+        let proj = OutputCrs::WebMercator.projector().unwrap();
+        let (x, y) = proj.lonlat_to_xy(-0.1276, 51.5074).unwrap();
+        // Easting near zero (within ~20 km).
+        assert!(x.abs() < 20_000.0, "London Web Mercator easting {x} expected near 0");
+        // Northing > 6 500 000 m (known rough value for ~51.5°N).
+        assert!(y > 6_500_000.0, "London Web Mercator northing {y} expected > 6.5e6");
+        let (lon, lat) = proj.xy_to_lonlat(x, y).unwrap();
+        assert!(
+            (lon - (-0.1276)).abs() < 1e-5 && (lat - 51.5074).abs() < 1e-5,
+            "WebMercator round-trip: ({lon}, {lat}) vs (-0.1276, 51.5074)",
+        );
     }
 
     #[test]
@@ -412,7 +546,7 @@ mod tests {
 
     #[test]
     fn epsg_round_trip_through_from_epsg_and_method() {
-        for code in [4326_u32, 32601, 32632, 32660, 32701, 32760] {
+        for code in [4326_u32, 3035, 3857, 32601, 32632, 32660, 32701, 32760] {
             let crs = OutputCrs::from_epsg(code).unwrap();
             assert_eq!(crs.epsg(), code, "epsg() for {code}");
         }

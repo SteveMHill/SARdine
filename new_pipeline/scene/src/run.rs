@@ -39,7 +39,7 @@ use crate::types::Polarization;
 pub use crate::pipeline_options::{
     derive_pol_output_path, parse_iw_selection, parse_output_mode, parse_polarizations,
     parse_speckle_order, resolve_crs, resolve_geoid, resolve_speckle, sidecar_path, GrdOptions,
-    IwSelection, OutputMode, ProcessOptions, SpeckleOrder,
+    IwSelection, OutputMode, ProcessOptions, ResamplingKernel, SpeckleOrder,
 };
 pub use crate::run_provenance::speckle_provenance_fields;
 pub(crate) use crate::run_provenance::collect_quality_flags;
@@ -119,6 +119,37 @@ pub fn apply_speckle_step(
         .with_context(|| format!("speckle filter {filter:?}"))?;
     *data = out;
     Ok(())
+}
+
+/// Run the full backscatter pipeline for each entry in `batch` sequentially,
+/// returning a `Vec` of per-scene results.
+///
+/// Scenes are processed one after the other in the order they appear in the
+/// slice.  Each scene is independent: a failure in scene `i` does not prevent
+/// scenes `i+1…` from being attempted.  The caller can zip the results with
+/// the input slice to identify which scenes succeeded.
+///
+/// # Why sequential?
+///
+/// `run_process` itself runs multi-threaded (rayon) within each scene.
+/// Running two scenes simultaneously would create two rayon thread pools
+/// competing for the same physical cores, degrading both.  Sequential batch
+/// processing keeps core utilisation clean and makes the progress log readable
+/// (one scene's log stream at a time).
+pub fn run_process_batch(batch: &[ProcessOptions]) -> Vec<Result<()>> {
+    batch
+        .iter()
+        .enumerate()
+        .map(|(i, opts)| {
+            tracing::info!(
+                "batch scene {}/{}: {}",
+                i + 1,
+                batch.len(),
+                opts.output.display(),
+            );
+            crate::multi_pol::run_process_multi(opts)
+        })
+        .collect()
 }
 
 pub fn run_process(opts: &ProcessOptions) -> Result<()> {
@@ -270,6 +301,7 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     tc_config.crs = output_crs;
     tc_config.pixel_spacing_deg = spacing;
     tc_config.flatten = !opts.no_flatten;
+    tc_config.resampling = opts.resampling;
     // NRB mode forces LIA and mask computation.
     let effective_write_lia = opts.write_lia || opts.mode == OutputMode::Nrb;
     let effective_write_mask = opts.write_mask || opts.mode == OutputMode::Nrb;
@@ -832,6 +864,7 @@ mod multipol_tests {
             iw_selection: crate::run::IwSelection::default(),
             mode: crate::run::OutputMode::default(),
             speckle_order: crate::run::SpeckleOrder::default(),
+            resampling: crate::run::ResamplingKernel::default(),
         };
         let err = run_process_multi(&opts).unwrap_err().to_string();
         assert!(
