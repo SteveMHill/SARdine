@@ -390,25 +390,32 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
         .output
         .to_str()
         .ok_or_else(|| anyhow!("output path contains non-UTF-8 characters"))?;
-    tracing::info!("writing GeoTIFF → {}", output_str);
     let t_export = Instant::now();
-    write_geotiff_with_crs(
-        output_str,
-        &geocoded.data,
-        geocoded.cols,
-        geocoded.rows,
-        geocoded.geotransform,
-        &geocoded.crs,
-    )
-    .with_context(|| format!("writing GeoTIFF: {}", output_str))?;
-    report_timing("export_geotiff", t_export);
-
     if opts.cog {
-        tracing::info!("converting to COG via gdal_translate ...");
-        crate::cog::convert_to_cog(&opts.output)
-            .with_context(|| format!("COG conversion of {output_str}"))?;
-        tracing::info!("COG conversion done.");
+        tracing::info!("writing COG → {}", output_str);
+        crate::export::write_cog_with_crs(
+            output_str,
+            &geocoded.data,
+            geocoded.cols,
+            geocoded.rows,
+            geocoded.geotransform,
+            &geocoded.crs,
+            512,
+        )
+        .with_context(|| format!("writing COG: {}", output_str))?;
+    } else {
+        tracing::info!("writing GeoTIFF → {}", output_str);
+        write_geotiff_with_crs(
+            output_str,
+            &geocoded.data,
+            geocoded.cols,
+            geocoded.rows,
+            geocoded.geotransform,
+            &geocoded.crs,
+        )
+        .with_context(|| format!("writing GeoTIFF: {}", output_str))?;
     }
+    report_timing("export_geotiff", t_export);
 
     if !opts.no_provenance {
         let prov = crate::run_provenance::build_provenance(
