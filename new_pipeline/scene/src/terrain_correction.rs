@@ -1574,10 +1574,9 @@ pub fn terrain_correction(
         })
         .collect();
 
-    let row_results: Vec<RowResult> = chunk_results?.into_iter().flatten().collect();
-
     // Assemble: copy each row's data into the flat output buffer and sum
-    // the diagnostic counters.
+    // the diagnostic counters.  We flatten the nested chunk structure directly
+    // without collecting into an intermediate Vec<RowResult>.
     let mut data = vec![f32::NAN; total];
     let (mut cos_lia_buf, mut mask_buf) = if config.compute_lia {
         (vec![f32::NAN; total], vec![mask_code::OUTSIDE_FOOTPRINT; total])
@@ -1593,7 +1592,7 @@ pub fn terrain_correction(
     let mut noise_masked = 0usize;
     let mut newton_iter_histogram = [0u64; NEWTON_ITER_HIST_SIZE];
 
-    for (row, result) in row_results.into_iter().enumerate() {
+    for (row, result) in chunk_results?.into_iter().flatten().enumerate() {
         data[row * n_cols..(row + 1) * n_cols].copy_from_slice(&result.row_data);
         if config.compute_lia {
             cos_lia_buf[row * n_cols..(row + 1) * n_cols]

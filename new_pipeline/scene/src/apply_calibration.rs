@@ -477,14 +477,14 @@ pub fn apply_calibration(
     );
     let az_noise_available = !noise.azimuth_vectors.is_empty();
     let az_lines: Vec<i64>;
-    let az_values: Vec<f32>;
+    let az_values: &[f32];
     if az_noise_available {
         let av = &noise.azimuth_vectors[0];
         az_lines = av.lines.iter().map(|&l| l as i64).collect();
-        az_values = av.noise_azimuth_lut.clone();
+        az_values = &av.noise_azimuth_lut;
     } else {
         az_lines = Vec::new();
-        az_values = Vec::new();
+        az_values = &[];
     }
 
     // ── Output buffer + reusable row scratch buffers ───────────────────────────

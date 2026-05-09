@@ -28,9 +28,9 @@ use std::path::PathBuf;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use sardine_scene::run::{
+use sardine_scene::run::
     parse_iw_selection, parse_output_mode, parse_speckle_order,
-    run_grd_multi, run_process_multi, GrdOptions, ProcessOptions,
+    run_grd_multi, run_process_multi, GrdOptions, ProcessOptions, ResamplingKernel,
 };
 
 /// Convert an `anyhow::Error` into a Python `RuntimeError` with the
@@ -141,6 +141,7 @@ fn process(
         iw_selection,
         mode,
         speckle_order,
+        resampling: ResamplingKernel::default(),
     };
     py.allow_threads(|| run_process_multi(&opts)).map_err(py_err)
 }
