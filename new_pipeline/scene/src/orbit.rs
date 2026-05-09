@@ -437,11 +437,13 @@ pub fn interpolate_orbit(
         });
     }
 
-    // Time values for the window points (seconds relative to t_ref)
-    let times: Vec<f64> = window
-        .iter()
-        .map(|sv| (sv.time - t_ref).num_microseconds().unwrap_or(0) as f64 / 1e6) // SAFETY-OK: chrono microseconds cannot overflow for orbit-window durations
-        .collect();
+    // Time values for the window points (seconds relative to t_ref).
+    // Stack array avoids an 8-element heap allocation on every call;
+    // LAGRANGE_DEGREE is a compile-time constant so this is zero-cost.
+    let mut times = [0.0_f64; LAGRANGE_DEGREE];
+    for (i, sv) in window.iter().enumerate() {
+        times[i] = (sv.time - t_ref).num_microseconds().unwrap_or(0) as f64 / 1e6; // SAFETY-OK: chrono microseconds cannot overflow for orbit-window durations
+    }
 
     // Lagrange interpolation for each coordinate
     let mut pos = [0.0_f64; 3];
