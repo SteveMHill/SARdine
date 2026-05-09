@@ -547,6 +547,55 @@ pub(crate) fn compute_terrain_geometry(
     target_ecef: [f64; 3],
     spacing_deg: f64,
 ) -> TerrainGeometryOutcome {
+    // Flat-earth reference cell area at this latitude (4 ECEF calls).
+    let flat_area = flat_cell_area(lat, lon, spacing_deg);
+    compute_terrain_geometry_with_flat_area(
+        lat, lon, h_east, h_west, h_north, h_south,
+        sat_pos_ecef, target_ecef, spacing_deg, flat_area,
+    )
+}
+
+/// Precompute the flat-earth reference cell area `|flat_normal|` at a given
+/// (lat, lon) for the given grid spacing.
+///
+/// This is the denominator used in the σ⁰→γ⁰ flattening weight
+/// `w = (terrain_normal · look) / flat_area`.
+///
+/// On the WGS84 ellipsoid, `flat_area` depends only on latitude and
+/// `spacing_deg` (it is symmetric in longitude by construction of the
+/// centred-difference stencil), so callers that process many pixels at the
+/// same latitude can call this once per row and pass the result to
+/// [`compute_terrain_geometry_with_flat_area`], saving 4 ECEF calls per pixel.
+#[inline]
+pub(crate) fn flat_cell_area(lat: f64, lon: f64, spacing_deg: f64) -> f64 {
+    let f_east  = geodetic_to_ecef(lat,                lon + spacing_deg, 0.0);
+    let f_west  = geodetic_to_ecef(lat,                lon - spacing_deg, 0.0);
+    let f_north = geodetic_to_ecef(lat + spacing_deg,  lon,               0.0);
+    let f_south = geodetic_to_ecef(lat - spacing_deg,  lon,               0.0);
+    let flat_normal = cross3(sub3(f_east, f_west), sub3(f_north, f_south));
+    norm3(flat_normal)
+}
+
+/// Compute the σ⁰→γ⁰ flattening weight `w` and the local-incidence-angle
+/// cosine using a caller-supplied precomputed `flat_area` (= `|flat_normal|`).
+///
+/// This is the hot-path variant called from the terrain-correction inner loop
+/// after [`flat_cell_area`] has been precomputed once per output row.
+/// It requires only 4 ECEF calls (terrain neighbours) instead of 8.
+///
+/// See [`compute_terrain_geometry`] for the full derivation.
+pub(crate) fn compute_terrain_geometry_with_flat_area(
+    lat: f64,
+    lon: f64,
+    h_east: f64,
+    h_west: f64,
+    h_north: f64,
+    h_south: f64,
+    sat_pos_ecef: [f64; 3],
+    target_ecef: [f64; 3],
+    spacing_deg: f64,
+    flat_area: f64,
+) -> TerrainGeometryOutcome {
     // Terrain facet via centred differences over the four cardinal DEM
     // neighbours.  Tangent vectors are E−W (east axis) and N−S (north axis);
     // their cross product is the outward facet normal, whose magnitude is
@@ -558,17 +607,6 @@ pub(crate) fn compute_terrain_geometry(
     let terrain_normal = cross3(
         sub3(p_east,  p_west),
         sub3(p_north, p_south),
-    );
-
-    // Flat-earth reference facet (h = 0 on WGS84 ellipsoid) using the same
-    // centred-difference stencil, so the area-scaling factor cancels exactly.
-    let f_east  = geodetic_to_ecef(lat,                lon + spacing_deg, 0.0);
-    let f_west  = geodetic_to_ecef(lat,                lon - spacing_deg, 0.0);
-    let f_north = geodetic_to_ecef(lat + spacing_deg,  lon,               0.0);
-    let f_south = geodetic_to_ecef(lat - spacing_deg,  lon,               0.0);
-    let flat_normal = cross3(
-        sub3(f_east,  f_west),
-        sub3(f_north, f_south),
     );
 
     // Illumination direction: vector from target toward satellite.
@@ -596,7 +634,6 @@ pub(crate) fn compute_terrain_geometry(
     // cancel the cos(θ_inc) factor and give w = 1 on flat terrain (σ⁰/w = σ⁰).
     // Using |flat_normal| gives w = cos(θ_inc) on flat terrain so that
     // σ⁰/w = σ⁰/cos(θ_inc) = γ⁰, the standard terrain-flattened gamma-naught.
-    let flat_area = norm3(flat_normal);
     let w = local_proj / flat_area;
     if w < LAYOVER_SHADOW_MIN_W {
         TerrainGeometryOutcome::Foreshortening { cos_lia }
@@ -1257,6 +1294,12 @@ pub fn terrain_correction(
     // ordering guarantees needed).
     let rows_done = AtomicUsize::new(0);
 
+    // The cardinal-neighbour step in degrees is the same for every pixel —
+    // it depends only on `spacing` and the output CRS.  Hoist it out of
+    // the per-pixel loop so the flat_area precomputation can use it once
+    // per row instead of recomputing it per pixel.
+    let step_deg_for_flat_area = cardinal_neighbour_step_deg(spacing, &config.crs);
+
     // Process rows in parallel, in chunks of `row_chunk_size`.  Every
     // reference captured by the closure is a shared immutable borrow of
     // a Send+Sync value; all mutation is local to the row body.  Within
@@ -1330,6 +1373,36 @@ pub fn terrain_correction(
                         TerrainCorrectionError::Projection(format!("row {row}: {e}"))
                     })?
                 }
+            };
+
+            // Precompute the flat-earth reference cell area for this row.
+            // On the WGS84 ellipsoid |flat_normal| is a function of latitude
+            // and spacing only — it is independent of longitude (WGS84 is
+            // rotationally symmetric in longitude, so the E-W and N-S tangent
+            // vectors at h=0 produce the same cross-product magnitude for all
+            // longitudes at a fixed latitude).  Computing this once per row
+            // eliminates 4 geodetic_to_ecef calls per pixel when flatten or
+            // compute_lia is active.  For UTM rows, row_lat_seed is the
+            // mid-row latitude; the latitude variation across a single row
+            // (~0.5°) changes flat_area by < 0.01%, which is negligible
+            // compared to DEM and orbit uncertainties.
+            let row_flat_area: f64 = if config.flatten || config.compute_lia {
+                let mid_lon = lon_west + (n_cols as f64 / 2.0) * spacing;
+                let row_ref_lon = if projector.is_some() {
+                    // UTM: mid_lon is a northing, not a geodetic lon.
+                    // Use mid-row lonlat if available, else fall back to
+                    // a centre-scene longitude estimate.
+                    if !row_lonlat.is_empty() {
+                        row_lonlat[n_cols / 2].0
+                    } else {
+                        mid_lon
+                    }
+                } else {
+                    mid_lon
+                };
+                flat_cell_area(row_lat_seed, row_ref_lon, step_deg_for_flat_area)
+            } else {
+                0.0 // unused
             };
 
             for col in 0..n_cols {
@@ -1456,7 +1529,10 @@ pub fn terrain_correction(
                     // pixel without this conversion — see
                     // `cardinal_neighbour_step_deg` for the defect history
                     // (silent `valid=0` baseline output prior to the fix).
-                    let step_deg = cardinal_neighbour_step_deg(spacing, &config.crs);
+                    // `step_deg_for_flat_area` is the same value, hoisted
+                    // out of this loop so the flat_area is precomputed once
+                    // per row instead of 4 ECEF calls per pixel.
+                    let step_deg = step_deg_for_flat_area;
                     let h_neighbours = (
                         dem.elevation_at(lat, lon + step_deg),
                         dem.elevation_at(lat, lon - step_deg),
@@ -1483,12 +1559,13 @@ pub fn terrain_correction(
                             }
                         }
                         Some((h_east, h_west, h_north, h_south)) => {
-                            let geom = compute_terrain_geometry(
+                            let geom = compute_terrain_geometry_with_flat_area(
                                 lat, lon,
                                 h_east, h_west, h_north, h_south,
                                 sat_sv.position_m,
                                 target,
                                 step_deg,
+                                row_flat_area,
                             );
                             match geom {
                                 TerrainGeometryOutcome::Valid { w, cos_lia } => {

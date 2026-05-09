@@ -14,7 +14,9 @@
 //!   annotation explaining why it is correct.
 
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::output_crs::OutputCrs;
@@ -62,24 +64,33 @@ pub fn to_db_inplace(
         return Err(ExportError::InvalidNoiseFloor(noise_floor_linear));
     }
 
-    let mut noise_masked = 0usize;
-    let mut converted = 0usize;
+    // Parallel chunk size: 256 Ki elements keeps each chunk in L2 cache
+    // while giving Rayon enough work units to saturate available cores.
+    const CHUNK: usize = 256 * 1024;
 
-    for v in data.iter_mut() {
-        if v.is_nan() {
-            // already masked upstream — keep as NaN, skip both counters
-            continue;
-        }
-        if *v <= noise_floor_linear {
-            *v = f32::NAN;
-            noise_masked += 1;
-        } else {
-            *v = 10.0 * v.log10();
-            converted += 1;
-        }
-    }
+    let noise_masked_total = AtomicUsize::new(0);
+    let converted_total = AtomicUsize::new(0);
 
-    Ok((converted, noise_masked))
+    data.par_chunks_mut(CHUNK).for_each(|chunk| {
+        let mut noise_masked = 0usize;
+        let mut converted = 0usize;
+        for v in chunk.iter_mut() {
+            if v.is_nan() {
+                continue;
+            }
+            if *v <= noise_floor_linear {
+                *v = f32::NAN;
+                noise_masked += 1;
+            } else {
+                *v = 10.0 * v.log10();
+                converted += 1;
+            }
+        }
+        noise_masked_total.fetch_add(noise_masked, Ordering::Relaxed);
+        converted_total.fetch_add(converted, Ordering::Relaxed);
+    });
+
+    Ok((converted_total.load(Ordering::Relaxed), noise_masked_total.load(Ordering::Relaxed)))
 }
 
 // ── GeoTIFF writer ────────────────────────────────────────────────────────────
