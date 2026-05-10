@@ -43,6 +43,20 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+/// Deserialize space-separated f64 values (e.g. polynomial coefficients).
+///
+/// Used for `<dataDcPolynomial count="3">a b c</dataDcPolynomial>` where the
+/// `count` attribute is ignored and the text content is parsed as floats.
+pub(crate) fn de_space_f64<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.split_whitespace()
+        .map(|t| t.parse::<f64>().map_err(serde::de::Error::custom))
+        .collect()
+}
+
 // ── Root ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +69,11 @@ pub(crate) struct ProductXml {
 
     #[serde(rename = "imageAnnotation")]
     pub image_annotation: ImageAnnotationXml,
+
+    /// Top-level `<dopplerCentroid>` block.  Present in all IW/EW SLC products
+    /// but absent in SM/WV and GRD, so `Option` + `default` for safe fallback.
+    #[serde(rename = "dopplerCentroid", default)]
+    pub doppler_centroid: Option<DopplerCentroidXml>,
 
     #[serde(rename = "swathTiming")]
     pub swath_timing: SwathTimingXml,
@@ -93,6 +112,11 @@ pub(crate) struct GeneralAnnotationXml {
 
     #[serde(rename = "orbitList")]
     pub orbit_list: OrbitListXml,
+
+    /// Azimuth FM rate polynomial list, nested inside `<generalAnnotation>`.
+    /// Absent in some product types, so `Option` + `default`.
+    #[serde(rename = "azimuthFmRateList", default)]
+    pub azimuth_fm_rate_list: Option<AzimuthFmRateListXml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,4 +292,62 @@ pub(crate) struct GeoGridPointXml {
     pub incidence_angle: f64,
     #[serde(rename = "elevationAngle", deserialize_with = "de_f64")]
     pub elevation_angle: f64,
+}
+
+// ── Doppler Centroid ─────────────────────────────────────────────────
+
+/// Top-level `<dopplerCentroid>` block (direct child of `<product>`).
+#[derive(Debug, Deserialize)]
+pub(crate) struct DopplerCentroidXml {
+    #[serde(rename = "dcEstimateList")]
+    pub dc_estimate_list: DcEstimateListXml,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DcEstimateListXml {
+    #[serde(rename = "dcEstimate", default)]
+    pub estimates: Vec<DcEstimateXml>,
+}
+
+/// A single `<dcEstimate>` entry.
+///
+/// The `<dataDcPolynomial count="3">` element contains three space-separated
+/// f64 coefficients [a0, a1, a2].  The `count` attribute is ignored by the
+/// deserializer; `de_space_f64` reads only the text content.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DcEstimateXml {
+    #[serde(rename = "azimuthTime")]
+    pub azimuth_time: String,
+
+    /// Reference slant-range time (seconds) — polynomial zero-point in range.
+    #[serde(deserialize_with = "de_f64")]
+    pub t0: f64,
+
+    /// Data-derived Doppler centroid polynomial coefficients [a0, a1, a2].
+    #[serde(rename = "dataDcPolynomial", deserialize_with = "de_space_f64")]
+    pub data_dc_polynomial: Vec<f64>,
+}
+
+// ── Azimuth FM Rate ───────────────────────────────────────────────────
+
+/// The `<azimuthFmRateList>` block nested inside `<generalAnnotation>`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct AzimuthFmRateListXml {
+    #[serde(rename = "azimuthFmRate", default)]
+    pub rates: Vec<AzimuthFmRateXml>,
+}
+
+/// A single `<azimuthFmRate>` entry.
+#[derive(Debug, Deserialize)]
+pub(crate) struct AzimuthFmRateXml {
+    #[serde(rename = "azimuthTime")]
+    pub azimuth_time: String,
+
+    /// Reference slant-range time (seconds).
+    #[serde(deserialize_with = "de_f64")]
+    pub t0: f64,
+
+    /// FM rate polynomial coefficients [a0, a1, a2].
+    #[serde(rename = "azimuthFmRatePolynomial", deserialize_with = "de_space_f64")]
+    pub polynomial: Vec<f64>,
 }

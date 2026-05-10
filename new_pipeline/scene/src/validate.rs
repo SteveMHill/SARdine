@@ -422,6 +422,8 @@ mod tests {
             azimuth_time_interval_s: 0.002063,
             prf_hz: 1717.0,
             burst_cycle_time_s: 2.7578,
+            dc_estimates: Vec::new(),
+            fm_rates: Vec::new(),
         }]
     }
 

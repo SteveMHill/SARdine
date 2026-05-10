@@ -189,6 +189,67 @@ pub struct GeolocationGridPoint {
     pub elevation_angle_deg: f64,
 }
 
+// ─── Doppler Centroid and Azimuth FM Rate ────────────────────────────
+
+/// A single Doppler centroid polynomial estimate from the annotation XML.
+///
+/// The polynomial gives Doppler centroid frequency (Hz) as a function of
+/// two-way slant-range time:
+///
+/// ```text
+/// f_dc(τ) = a0 + a1·(τ − t0) + a2·(τ − t0)²
+/// ```
+///
+/// where `τ` is in seconds and `t0` is the per-estimate reference slant-range time.
+/// Units: a0 in Hz, a1 in Hz/s, a2 in Hz/s².
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DcEstimate {
+    /// UTC time this estimate is representative of.
+    pub azimuth_time: DateTime<Utc>,
+    /// Reference slant-range time in seconds (polynomial zero-point in range).
+    pub t0_s: f64,
+    /// Quadratic coefficients [a0, a1, a2] in Hz, Hz/s, Hz/s².
+    pub data_dc_poly: [f64; 3],
+}
+
+impl DcEstimate {
+    /// Evaluate the Doppler centroid (Hz) at slant-range time `tau_s` (seconds).
+    #[inline]
+    pub fn evaluate(&self, tau_s: f64) -> f64 {
+        let dt = tau_s - self.t0_s;
+        self.data_dc_poly[0] + self.data_dc_poly[1] * dt + self.data_dc_poly[2] * dt * dt
+    }
+}
+
+/// A single azimuth FM rate polynomial estimate from the annotation XML.
+///
+/// The polynomial gives the azimuth FM rate (Hz/s) as a function of
+/// two-way slant-range time:
+///
+/// ```text
+/// Ka(τ) = a0 + a1·(τ − t0) + a2·(τ − t0)²
+/// ```
+///
+/// Units: a0 in Hz/s, a1 in Hz/s², a2 in Hz/s³.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AzimuthFmRate {
+    /// UTC time this estimate is representative of.
+    pub azimuth_time: DateTime<Utc>,
+    /// Reference slant-range time in seconds.
+    pub t0_s: f64,
+    /// Quadratic coefficients [a0, a1, a2] in Hz/s, Hz/s², Hz/s³.
+    pub poly: [f64; 3],
+}
+
+impl AzimuthFmRate {
+    /// Evaluate the azimuth FM rate (Hz/s) at slant-range time `tau_s` (seconds).
+    #[inline]
+    pub fn evaluate(&self, tau_s: f64) -> f64 {
+        let dt = tau_s - self.t0_s;
+        self.poly[0] + self.poly[1] * dt + self.poly[2] * dt * dt
+    }
+}
+
 // ─── Bounding Box ────────────────────────────────────────────────────
 
 /// Geographic bounding box in WGS84 degrees.
@@ -252,6 +313,20 @@ pub struct SubSwathMetadata {
     /// This is NOT the burst illumination duration (which is shorter due to
     /// the inter-burst beam-steering gap).
     pub burst_cycle_time_s: f64,
+
+    /// Doppler centroid polynomial estimates from the annotation XML.
+    ///
+    /// For IW/EW SLC products: typically 10 estimates covering the full acquisition.
+    /// Empty when the `<dopplerCentroid>` block was absent (e.g. GRD, SM products).
+    /// Required (non-empty) for InSAR processing; the `sardine insar` entry point
+    /// returns an explicit error if this is empty.
+    pub dc_estimates: Vec<DcEstimate>,
+
+    /// Azimuth FM rate polynomial estimates from the annotation XML.
+    ///
+    /// For IW/EW SLC products: typically 10 estimates co-located in time with
+    /// `dc_estimates`.  Empty when the `<azimuthFmRateList>` block was absent.
+    pub fm_rates: Vec<AzimuthFmRate>,
 }
 
 impl SubSwathMetadata {

@@ -545,27 +545,29 @@ impl SlcReader {
         let _ = end_line; // SAFETY-OK: explicit suppression of unused variable; not an error swallow
 
         let seek_to = self.base_offset + first_line as u64 * self.row_bytes;
-        let total_bytes = line_count as u64 * self.row_bytes;
         let n_pixels = self.width as usize * line_count;
+        let total_bytes = n_pixels * 4; // 2 × i16 per pixel
 
-        let mut buf = vec![0u8; total_bytes as usize];
+        // Allocate the output buffer and read raw bytes directly into it,
+        // avoiding an intermediate Vec<u8> of the same size.
+        let mut pixels = vec![[0i16; 2]; n_pixels];
+        // SAFETY-OK: [i16; 2] is a tightly-packed 4-byte type with no padding;
+        // byte_buf aliases the same allocation as `pixels` with exact byte
+        // length total_bytes = n_pixels * 4.  read_exact fills every byte
+        // before `pixels` is used again.
+        let byte_buf = unsafe {
+            std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, total_bytes)
+        };
         self.file.seek(SeekFrom::Start(seek_to))?;
-        self.file.read_exact(&mut buf)?;
+        self.file.read_exact(byte_buf)?;
 
-        let le = self.little_endian;
-        let mut pixels = Vec::with_capacity(n_pixels);
-        for chunk in buf.chunks_exact(4) {
-            let i_ch = if le {
-                i16::from_le_bytes([chunk[0], chunk[1]])
-            } else {
-                i16::from_be_bytes([chunk[0], chunk[1]])
-            };
-            let q_ch = if le {
-                i16::from_le_bytes([chunk[2], chunk[3]])
-            } else {
-                i16::from_be_bytes([chunk[2], chunk[3]])
-            };
-            pixels.push([i_ch, q_ch]);
+        // S-1 products are always little-endian; byte-swap only for the
+        // (practically impossible) big-endian TIFF case.
+        if !self.little_endian {
+            for px in pixels.iter_mut() {
+                px[0] = px[0].swap_bytes();
+                px[1] = px[1].swap_bytes();
+            }
         }
 
         Ok(pixels)

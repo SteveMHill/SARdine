@@ -575,6 +575,10 @@ fn merge_subswaths_meta(scenes: &[SceneMetadata]) -> Vec<SubSwathMetadata> {
                 azimuth_time_interval_s: sw0.azimuth_time_interval_s,
                 prf_hz: sw0.prf_hz,
                 burst_cycle_time_s: sw0.burst_cycle_time_s,
+                // DC/FM rate estimates are taken from the first slice; they are
+                // geometry-based and do not change across assembled slices.
+                dc_estimates: sw0.dc_estimates.clone(),
+                fm_rates: sw0.fm_rates.clone(),
             }
         })
         .collect()
@@ -748,6 +752,8 @@ mod tests {
                 azimuth_time_interval_s: 2.055_556e-3,
                 prf_hz: 1717.0,
                 burst_cycle_time_s: burst_cycle_ms as f64 * 1e-3,
+                dc_estimates: Vec::new(),
+                fm_rates: Vec::new(),
             }],
             bursts,
             orbit: make_orbit(orbit_epoch),

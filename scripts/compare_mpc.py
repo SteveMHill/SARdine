@@ -2,7 +2,7 @@
 Compare sardine VV dB output against the Microsoft Planetary Computer (MPC)
 Sentinel-1 RTC product for the same S1B 2019-01-23 scene.
 
-MPC product: S1B_IW_GRDH_1SDV_20190123T053414_20190123T053439_014617_01B3D4_rtc
+MPC product: S1B_IW_GRDH_1SDV_20190123T053349_20190123T053414_014617_01B3D4_rtc
   - Processor:   Catalyst Earth
   - DEM:         PlanetDEM
   - Input:       GRD-H (5 range × 1 az looks, ~20 × 22 m resolution)
@@ -85,12 +85,14 @@ SARDINE = os.environ.get(
 )
 
 # The MPC COG for this exact acquisition (orbit 14617, datatake 01B3D4).
+# Product: S1B_IW_GRDH_1SDV_20190123T053349_20190123T053414 — this matches
+# the SLC scene (053348-053415) with ~25 s / ~185 km of spatial overlap.
 # Signing this URL at runtime adds a short-lived SAS token — no token is
 # stored in this file.
 _MPC_VV_UNSIGNED = (
     "https://sentinel1euwestrtc.blob.core.windows.net/sentinel1-grd-rtc/"
     "GRD/2019/1/23/IW/DV/"
-    "S1B_IW_GRDH_1SDV_20190123T053414_20190123T053439_014617_01B3D4_F1E1/"
+    "S1B_IW_GRDH_1SDV_20190123T053349_20190123T053414_014617_01B3D4_39E0/"
     "measurement/iw-vv.rtc.tiff"
 )
 
@@ -99,7 +101,7 @@ MPC_NODATA = -32768.0
 
 # Default local cache path for the downloaded COG.
 _DEFAULT_CACHE = (
-    "/home/datacube/dev/SARdine/data/MPC/S1B_IW_20190123_VV_rtc.tiff"
+    "/home/datacube/dev/SARdine/data/MPC/S1B_IW_20190123T053349_VV_rtc.tiff"
 )
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

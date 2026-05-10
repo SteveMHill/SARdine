@@ -3,6 +3,15 @@
 //! Combines the calibrated σ⁰ arrays from the three IW subswaths (IW1, IW2, IW3)
 //! into a single contiguous slant-range image.
 //!
+//! # Performance
+//!
+//! The merge allocates two output buffers totalling several GB.  To avoid
+//! serialising millions of OS page faults on a single thread, both buffers are
+//! left uninitialised after allocation and the fill+copy is done in parallel
+//! with Rayon.  Every element of every output line is written by the parallel
+//! loop before the buffers are returned, so the `unsafe { set_len }` calls are
+//! sound.
+//!
 //! # Range geometry
 //!
 //! All three IW subswaths share **identical range pixel spacing** (confirmed on
@@ -39,6 +48,7 @@
 use crate::apply_calibration::Sigma0Array;
 use crate::types::SubSwathMetadata;
 use chrono::{DateTime, Utc};
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ─── constants ────────────────────────────────────────────────────────────────
@@ -304,53 +314,113 @@ pub fn merge_subswaths(inputs: &[SwathInput<'_>]) -> Result<MergedSigma0, MergeE
 
     let out_lines = inputs.iter().map(|inp| inp.sigma0.lines).min().unwrap();
 
-    // ── Fill output buffer ─────────────────────────────────────────────────────
-
-    let mut data = vec![f32::NAN; out_lines * out_cols];
-    let mut nesz = vec![f32::NAN; out_lines * out_cols];
-
-    // Determine which swath index "owns" each output column, based on seams.
-    //   col in [0,        seams[0]):   swath 0
-    //   col in [seams[0], seams[1]):   swath 1
-    //   ...
-    //   col in [seams[N-2], out_cols): swath N-1
+    // ── Per-swath column fill ranges (precomputed once, used by every line) ───
     //
-    // We precompute a column→swath index mapping as a compact list of
-    // (start_col, swath_idx) pairs, then iterate once.
+    // For swath `sw_idx`:
+    //   owned output columns: [col_start, col_end)
+    //   corresponding input columns: [in_start, in_start + n_copy)
     //
-    // Rather than building a per-column lookup vector (expensive for large outputs),
-    // we iterate over swaths and fill each swath's column range in one pass.
-
-    for (sw_idx, inp) in inputs.iter().enumerate() {
-        // Output column range owned by this swath.
-        let col_start: usize = if sw_idx == 0 { 0 } else { seams[sw_idx - 1] };
-        let col_end: usize = if sw_idx == inputs.len() - 1 {
-            out_cols
-        } else {
-            seams[sw_idx]
-        };
-
-        // Output col → input (sigma0) col mapping:
-        //   in_col = out_col - sw_out_offsets[sw_idx]
-        let off = sw_out_offsets[sw_idx];
-
-        let sigma0 = inp.sigma0;
-
-        for out_line in 0..out_lines {
-            let in_row = &sigma0.data[out_line * sigma0.samples..(out_line + 1) * sigma0.samples];
-            let in_nesz_row = &sigma0.nesz[out_line * sigma0.samples..(out_line + 1) * sigma0.samples];
-            let out_row = &mut data[out_line * out_cols..(out_line + 1) * out_cols];
-
-            for out_col in col_start..col_end {
-                let in_col = out_col as i64 - off;
-                if in_col >= 0 && (in_col as usize) < sigma0.samples {
-                    out_row[out_col] = in_row[in_col as usize];
-                    nesz[out_line * out_cols + out_col] = in_nesz_row[in_col as usize];
-                }
-                // else: NAN already (gap at swath edge)
-            }
-        }
+    // `valid_out_start/end` clips the owned range to where the swath actually
+    // provides data (handles edge cases where a seam falls outside the swath's
+    // valid sample window; in normal IW processing this never happens but we
+    // check for correctness).
+    struct SwathFillRange {
+        /// First owned output column (fill NaN from previous fill_end up to here).
+        col_start: usize,
+        /// One-past-last owned output column (fill NaN from fill_end to next col_start).
+        col_end: usize,
+        /// First output column that has valid input data from this swath (≥ col_start).
+        valid_out_start: usize,
+        /// One-past-last output column with valid input data (≤ col_end).
+        valid_out_end: usize,
+        /// Input sigma0 column corresponding to `valid_out_start`.
+        in_start: usize,
     }
+
+    let fill_ranges: Vec<SwathFillRange> = inputs
+        .iter()
+        .enumerate()
+        .map(|(sw_idx, inp)| {
+            let col_start: usize = if sw_idx == 0 { 0 } else { seams[sw_idx - 1] };
+            let col_end: usize = if sw_idx == inputs.len() - 1 {
+                out_cols
+            } else {
+                seams[sw_idx]
+            };
+            let off = sw_out_offsets[sw_idx] as usize; // all offsets are ≥ 0 (IW1 anchors t_out_start)
+            let valid_out_start = col_start.max(off);
+            let valid_out_end = col_end.min(off.saturating_add(inp.sigma0.samples));
+            let in_start = valid_out_start.saturating_sub(off);
+            SwathFillRange { col_start, col_end, valid_out_start, valid_out_end, in_start }
+        })
+        .collect();
+
+    // ── Allocate output buffers ────────────────────────────────────────────────
+    //
+    // Use uninitialised memory: the parallel fill loop below writes every
+    // element before the buffers are returned.  This avoids the serialised
+    // OS page-fault cost of `vec![f32::NAN; N]` for several-GB allocations.
+
+    let n = out_lines * out_cols;
+    let mut data: Vec<f32> = Vec::with_capacity(n);
+    let mut nesz: Vec<f32> = Vec::with_capacity(n);
+    // SAFETY-OK: every element of `data` and `nesz` is written by the
+    // `par_chunks_mut` loop below (each line is either copy_from_slice'd from
+    // a swath or fill'd with NaN for gap regions) before either Vec is read
+    // outside this function.  No element is read before it is written.
+    unsafe {
+        data.set_len(n);
+        nesz.set_len(n);
+    }
+
+    // ── Fill output lines in parallel ──────────────────────────────────────────
+    //
+    // Each line is independent: it reads from fixed sigma0 slices and writes to
+    // a disjoint output chunk.  `par_chunks_mut` gives each Rayon worker a
+    // disjoint slice; workers only read from `inputs` (shared immutable refs).
+
+    data.par_chunks_mut(out_cols)
+        .zip(nesz.par_chunks_mut(out_cols))
+        .enumerate()
+        .for_each(|(out_line, (out_row, nesz_row))| {
+            let mut fill_end = 0usize; // tracks how far we have initialised
+
+            for (sw_idx, inp) in inputs.iter().enumerate() {
+                let fr = &fill_ranges[sw_idx];
+
+                // Fill any gap before this swath's valid data with NaN.
+                // In standard IW processing fr.valid_out_start == fr.col_start,
+                // so this range is empty and no NaN fill is emitted.
+                if fill_end < fr.valid_out_start {
+                    out_row[fill_end..fr.valid_out_start].fill(f32::NAN);
+                    nesz_row[fill_end..fr.valid_out_start].fill(f32::NAN);
+                }
+
+                if fr.valid_out_start < fr.valid_out_end {
+                    let n_copy = fr.valid_out_end - fr.valid_out_start;
+                    let base = out_line * inp.sigma0.samples + fr.in_start;
+                    out_row[fr.valid_out_start..fr.valid_out_end]
+                        .copy_from_slice(&inp.sigma0.data[base..base + n_copy]);
+                    nesz_row[fr.valid_out_start..fr.valid_out_end]
+                        .copy_from_slice(&inp.sigma0.nesz[base..base + n_copy]);
+                }
+
+                // Advance past the owned range (NaN in gap after valid data).
+                let after_valid = fr.valid_out_end;
+                if after_valid < fr.col_end {
+                    out_row[after_valid..fr.col_end].fill(f32::NAN);
+                    nesz_row[after_valid..fr.col_end].fill(f32::NAN);
+                }
+
+                fill_end = fr.col_end;
+            }
+
+            // Fill any trailing gap (e.g. non-contiguous swaths, final swath short).
+            if fill_end < out_cols {
+                out_row[fill_end..out_cols].fill(f32::NAN);
+                nesz_row[fill_end..out_cols].fill(f32::NAN);
+            }
+        });
 
     Ok(MergedSigma0 {
         data,
@@ -405,6 +475,8 @@ mod tests {
             azimuth_time_interval_s: 2e-3,
             prf_hz: 1717.13,
             burst_cycle_time_s: 2.758_091,
+            dc_estimates: Vec::new(),
+            fm_rates: Vec::new(),
         }
     }
 

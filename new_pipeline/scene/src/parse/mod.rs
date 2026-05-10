@@ -36,6 +36,12 @@ pub enum ParseError {
     #[error("no annotation XMLs found in {0}")]
     NoAnnotations(String),
 
+    #[error("polynomial has {found} coefficients, expected 3 for {context}")]
+    IncompatiblePolynomial {
+        context: &'static str,
+        found: usize,
+    },
+
     #[error("validation failed: {0}")]
     Validation(#[from] ValidationErrors),
 }
@@ -218,6 +224,57 @@ fn extract_scene_metadata(
             lines_per_burst as f64 * img.azimuth_time_interval
         };
 
+        // Parse Doppler centroid estimates (top-level `<dopplerCentroid>` block).
+        // Empty Vec when absent — not an error here; the InSAR entry point checks.
+        let dc_estimates: Vec<DcEstimate> = match &ann.doppler_centroid {
+            Some(dc_block) => {
+                let mut out = Vec::with_capacity(dc_block.dc_estimate_list.estimates.len());
+                for e in &dc_block.dc_estimate_list.estimates {
+                    let t = parse_s1_timestamp(&e.azimuth_time, "dcEstimate azimuthTime")?;
+                    let poly = &e.data_dc_polynomial;
+                    if poly.len() != 3 {
+                        return Err(ParseError::IncompatiblePolynomial {
+                            context: "dataDcPolynomial",
+                            found: poly.len(),
+                        });
+                    }
+                    out.push(DcEstimate {
+                        azimuth_time: t,
+                        t0_s: e.t0,
+                        data_dc_poly: [poly[0], poly[1], poly[2]],
+                    });
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+
+        // Parse azimuth FM rate estimates (inside `<generalAnnotation>`).
+        let fm_rates: Vec<AzimuthFmRate> =
+            match &ann.general_annotation.azimuth_fm_rate_list {
+                Some(fm_list) => {
+                    let mut out = Vec::with_capacity(fm_list.rates.len());
+                    for r in &fm_list.rates {
+                        let t =
+                            parse_s1_timestamp(&r.azimuth_time, "azimuthFmRate azimuthTime")?;
+                        let poly = &r.polynomial;
+                        if poly.len() != 3 {
+                            return Err(ParseError::IncompatiblePolynomial {
+                                context: "azimuthFmRatePolynomial",
+                                found: poly.len(),
+                            });
+                        }
+                        out.push(AzimuthFmRate {
+                            azimuth_time: t,
+                            t0_s: r.t0,
+                            poly: [poly[0], poly[1], poly[2]],
+                        });
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
+
         sub_swaths.push(SubSwathMetadata {
             id: swath_id,
             burst_count: num_bursts,
@@ -234,6 +291,8 @@ fn extract_scene_metadata(
             azimuth_time_interval_s: img.azimuth_time_interval,
             prf_hz,
             burst_cycle_time_s,
+            dc_estimates,
+            fm_rates,
         });
 
         // Build burst entries
@@ -906,5 +965,113 @@ mod tests {
         // Approximate expected ranges
         assert!(angles[0].1 > 29.0 && angles[0].1 < 32.0, "IW1 min inc: {:.2}", angles[0].1);
         assert!(angles[2].2 > 44.0 && angles[2].2 < 47.0, "IW3 max inc: {:.2}", angles[2].2);
+    }
+
+    /// Verify that the Doppler centroid and azimuth FM rate blocks are parsed
+    /// correctly from a real S1B IW1 VV annotation XML.
+    ///
+    /// Checks:
+    /// - Exactly 10 estimates are parsed (matches `count="10"` in XML).
+    /// - Reference time `t0` is within the expected near-range slant-range window
+    ///   (~5.35 ms for S1B IW1).
+    /// - First estimate polynomial a0 ≈ −18.7 Hz (data DC centroid at near range).
+    /// - FM rate polynomial a0 ≈ −2318 Hz/s.
+    /// - `evaluate()` produces physically plausible values (|f_dc| < 3000 Hz).
+    #[test]
+    fn test_parse_dc_and_fm_rate_s1b_iw1() {
+        let path = s1b_safe();
+        if !path.join("annotation").is_dir() {
+            eprintln!("Skipping: S1B test data not available");
+            return;
+        }
+
+        let meta = parse_safe_directory(&path).expect("S1B parse failed");
+
+        let iw1 = meta
+            .sub_swaths
+            .iter()
+            .find(|s| s.id == SubSwathId::IW1)
+            .expect("IW1 not found");
+
+        // DC estimates: should have 10 entries for IW1 SLC
+        assert_eq!(
+            iw1.dc_estimates.len(),
+            10,
+            "IW1 dc_estimates count: expected 10, got {}",
+            iw1.dc_estimates.len()
+        );
+
+        // FM rate estimates: should also have 10 entries
+        assert_eq!(
+            iw1.fm_rates.len(),
+            10,
+            "IW1 fm_rates count: expected 10, got {}",
+            iw1.fm_rates.len()
+        );
+
+        // First DC estimate: t0 should be near-range slant-range time (≈5.35 ms for S1B IW1)
+        let dc0 = &iw1.dc_estimates[0];
+        assert!(
+            dc0.t0_s > 5.0e-3 && dc0.t0_s < 6.0e-3,
+            "dc0.t0_s = {:.6e} — expected in [5ms, 6ms]",
+            dc0.t0_s
+        );
+
+        // First DC estimate polynomial a0 ≈ −18.7 Hz (data Doppler centroid at t0)
+        assert!(
+            (dc0.data_dc_poly[0] + 18.7).abs() < 5.0,
+            "dc0 a0 = {:.3} Hz — expected ≈ −18.7 Hz",
+            dc0.data_dc_poly[0]
+        );
+
+        // evaluate() at t0 should equal a0 (polynomial zero-offset)
+        let f_at_t0 = dc0.evaluate(dc0.t0_s);
+        assert!(
+            (f_at_t0 - dc0.data_dc_poly[0]).abs() < 1e-6,
+            "evaluate(t0) = {f_at_t0:.6} ≠ a0 = {:.6}",
+            dc0.data_dc_poly[0]
+        );
+
+        // Doppler centroid at any pixel should be physically plausible (|f_dc| < 3000 Hz)
+        // Check near-range and far-range of IW1
+        let near_tau = iw1.slant_range_time_s;
+        let far_tau = iw1.slant_range_time_s
+            + (iw1.range_samples as f64) * iw1.range_pixel_spacing_m
+                / crate::types::SPEED_OF_LIGHT_M_S
+                * 2.0;
+        let f_near = dc0.evaluate(near_tau);
+        let f_far = dc0.evaluate(far_tau);
+        assert!(
+            f_near.abs() < 3000.0,
+            "f_dc at near range = {f_near:.1} Hz — exceeds 3000 Hz"
+        );
+        assert!(
+            f_far.abs() < 3000.0,
+            "f_dc at far range = {f_far:.1} Hz — exceeds 3000 Hz"
+        );
+
+        // First FM rate estimate: a0 ≈ −2318 Hz/s
+        let fm0 = &iw1.fm_rates[0];
+        assert!(
+            (fm0.poly[0] + 2318.0).abs() < 50.0,
+            "fm0 a0 = {:.1} Hz/s — expected ≈ −2318 Hz/s",
+            fm0.poly[0]
+        );
+
+        // FM rate evaluate() at t0 should equal a0
+        let ka_at_t0 = fm0.evaluate(fm0.t0_s);
+        assert!(
+            (ka_at_t0 - fm0.poly[0]).abs() < 1e-6,
+            "fm rate evaluate(t0) = {ka_at_t0:.6} ≠ a0 = {:.6}",
+            fm0.poly[0]
+        );
+
+        // DC estimate azimuth times should be strictly increasing
+        for w in iw1.dc_estimates.windows(2) {
+            assert!(
+                w[1].azimuth_time > w[0].azimuth_time,
+                "dc_estimates not monotonically increasing in time"
+            );
+        }
     }
 }
