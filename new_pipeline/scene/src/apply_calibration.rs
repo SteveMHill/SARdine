@@ -54,6 +54,7 @@
 
 use crate::calibration::{SwathCalibration, SwathNoise};
 use crate::deburst::DeburstArray;
+use rayon::prelude::*;
 use thiserror::Error;
 
 // ─── Error type ───────────────────────────────────────────────────────────────
@@ -487,57 +488,77 @@ pub fn apply_calibration(
         az_values = &[];
     }
 
-    // ── Output buffer + reusable row scratch buffers ───────────────────────────
-    let mut out = vec![0.0f32; out_lines * out_cols];
+    // ── Output buffer ──────────────────────────────────────────────────────────
+    //
+    // Use uninitialised memory: the parallel loop below writes every element
+    // before the buffers are returned, avoiding the serialised OS page-fault
+    // cost of `vec![0.0f32; N]` for large (multi-GB) subswaths.
+    let n = out_lines * out_cols;
+    let mut out: Vec<f32> = Vec::with_capacity(n);
     // NESZ in linear σ⁰ units: N[l,c] / K²[l,c], same shape as `out`.
-    let mut nesz_out = vec![0.0f32; out_lines * out_cols];
-    // Reuse these across lines to avoid per-line heap allocations.
-    let mut k_row = vec![0.0f32; out_cols];
-    let mut nr_row = vec![0.0f32; out_cols];
-    // Scratch buffer for i16 DN → f32 power conversion (reused per line).
-    let mut power_row = vec![0.0f32; out_cols];
-
-    // ── Main loop ──────────────────────────────────────────────────────────────
-    for out_line in 0..out_lines {
-        let tiff_line = (tiff_line_origin + out_line) as i64;
-
-        // Interpolated calibration K values for this line (in-place).
-        bilinear_row_into(
-            &cal_lines, &cal_pixels, &cal_values,
-            tiff_line, col_offset, &mut k_row,
-        );
-
-        // Interpolated range noise for this line (in-place).
-        bilinear_row_into(
-            &nr_lines, &nr_pixels, &nr_values,
-            tiff_line, col_offset, &mut nr_row,
-        );
-
-        // Azimuth noise factor for this line (scalar; defaults to 1.0).
-        let az_factor = if az_noise_available && !az_lines.is_empty() {
-            let (lo, hi) = bracket_azimuth(&az_lines, tiff_line);
-            interp_azimuth(
-                az_lines[lo],
-                az_lines[hi],
-                az_values[lo],
-                az_values[hi],
-                tiff_line,
-            )
-        } else {
-            1.0
-        };
-
-        // Apply formula per pixel (two vectorizable passes).
-        let in_row = &deburst.data[out_line * out_cols..(out_line + 1) * out_cols];
-        let out_row = &mut out[out_line * out_cols..(out_line + 1) * out_cols];
-        let nesz_row = &mut nesz_out[out_line * out_cols..(out_line + 1) * out_cols];
-
-        // Pass 1: i16 DN → f32 power  (enables i16→i32 widening SIMD).
-        dn_to_power_row(in_row, &mut power_row);
-
-        // Pass 2: branchless σ⁰ and NESZ  (pure f32, no data-dependent branches).
-        apply_cal_row(&power_row, &nr_row, &k_row, az_factor, out_row, nesz_row);
+    let mut nesz_out: Vec<f32> = Vec::with_capacity(n);
+    // SAFETY-OK: every element of `out` and `nesz_out` is written by the
+    // `par_chunks_mut` loop below (via `apply_cal_row`) before either Vec is
+    // read outside this function.  `apply_cal_row` writes every `out_row` and
+    // `nesz_row` slot unconditionally (branchless arithmetic over the full
+    // column range).  No element is read before it is written.
+    unsafe {
+        out.set_len(n);
+        nesz_out.set_len(n);
     }
+
+    // ── Main loop (parallel across lines) ─────────────────────────────────────
+    //
+    // Each Rayon task owns one output line.  Read-only inputs (`deburst.data`,
+    // LUT refs) are shared across threads; each task allocates its own scratch
+    // buffers (k_row, nr_row, power_row) so there is no contention.
+    // The closure is `Send` because all captured refs point to `Sync` data
+    // and the mutable output chunks are disjoint.
+    out.par_chunks_mut(out_cols)
+        .zip(nesz_out.par_chunks_mut(out_cols))
+        .enumerate()
+        .for_each(|(out_line, (out_row, nesz_row))| {
+            let tiff_line = (tiff_line_origin + out_line) as i64;
+
+            // Per-task scratch (heap-allocated once per Rayon task; the
+            // allocator reuses freed blocks across tasks on the same thread).
+            let mut k_row = vec![0.0f32; out_cols];
+            let mut nr_row = vec![0.0f32; out_cols];
+            let mut power_row = vec![0.0f32; out_cols];
+
+            // Interpolated calibration K values for this line.
+            bilinear_row_into(
+                &cal_lines, &cal_pixels, &cal_values,
+                tiff_line, col_offset, &mut k_row,
+            );
+
+            // Interpolated range noise for this line.
+            bilinear_row_into(
+                &nr_lines, &nr_pixels, &nr_values,
+                tiff_line, col_offset, &mut nr_row,
+            );
+
+            // Azimuth noise factor for this line (scalar; defaults to 1.0).
+            let az_factor = if az_noise_available && !az_lines.is_empty() {
+                let (lo, hi) = bracket_azimuth(&az_lines, tiff_line);
+                interp_azimuth(
+                    az_lines[lo],
+                    az_lines[hi],
+                    az_values[lo],
+                    az_values[hi],
+                    tiff_line,
+                )
+            } else {
+                1.0
+            };
+
+            // Pass 1: i16 DN → f32 power  (enables i16→i32 widening SIMD).
+            let in_row = &deburst.data[out_line * out_cols..(out_line + 1) * out_cols];
+            dn_to_power_row(in_row, &mut power_row);
+
+            // Pass 2: branchless σ⁰ and NESZ  (pure f32, no data-dependent branches).
+            apply_cal_row(&power_row, &nr_row, &k_row, az_factor, out_row, nesz_row);
+        });
 
     Ok(Sigma0Array {
         data: out,
