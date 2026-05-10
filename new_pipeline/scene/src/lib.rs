@@ -22,6 +22,7 @@ pub mod geodesy;
 pub mod geoid;
 pub mod geoid_fetch;
 pub mod ground_range;
+pub mod insar;
 pub mod merge_subswaths;
 pub mod multi_slc_reader;
 pub mod orbit;
