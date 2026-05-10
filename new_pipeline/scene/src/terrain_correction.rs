@@ -33,7 +33,7 @@ use crate::dem::DemSource;
 use crate::geodesy::{cross3, dot3, geodetic_to_ecef, norm3, normalize3, sub3};
 use crate::geoid::GeoidModel;
 use crate::merge_subswaths::MergedSigma0;
-use crate::orbit::{interpolate_orbit, OrbitError};
+use crate::orbit::{interpolate_orbit_and_accel, OrbitError};
 use crate::output_crs::{OutputCrs, OutputCrsError, Projector};
 use crate::types::{
     GeolocationGridPoint, OrbitData, SceneMetadata, SubSwathId, SPEED_OF_LIGHT_M_S,
@@ -75,7 +75,10 @@ pub enum TerrainCorrectionError {
 /// pixels that converged cleanly.
 #[derive(Debug)]
 enum ZeroDopplerOutcome {
-    Converged { time: DateTime<Utc>, residual_s: f64, iterations: u8 },
+    /// Solver converged.  `sat_sv` is the satellite state vector at `time`,
+    /// returned directly from the final Lagrange evaluation so the call site
+    /// does not need to call `interpolate_orbit` again.
+    Converged { time: DateTime<Utc>, residual_s: f64, iterations: u8, sat_sv: crate::types::StateVector },
     NotConverged { last_residual_s: f64 },
     DegenerateGeometry,
 }
@@ -918,26 +921,21 @@ fn solve_zero_doppler(
     // threshold is ~12 orders of magnitude below the expected magnitude; only
     // pathological geometries hit it.
     const DERIV_FLOOR: f64 = 1.0;
-    // Finite-difference step for acceleration (10 ms).  Must be ≪ orbit
-    // state-vector spacing (~10 s) and ≫ numerical noise floor.
-    const ACCEL_FD_STEP_S: f64 = 0.01;
 
     let mut t = initial_guess;
     let mut last_delta_s: f64 = f64::INFINITY;
 
     for i in 0..max_iter {
-        let sv = interpolate_orbit(orbit, t)?;
+        // Single Lagrange pass: returns position, velocity, AND the analytical
+        // derivative of the velocity polynomial (orbital acceleration).
+        // This replaces the previous two-call pattern:
+        //   sv      = interpolate_orbit(orbit, t)
+        //   sv_plus = interpolate_orbit(orbit, t + 10 ms)  ← FD for acceleration
+        // and eliminates one Lagrange evaluation per Newton iteration.
+        let (sv, accel) = interpolate_orbit_and_accel(orbit, t)?;
         let r = sub3(target_ecef, sv.position_m);
         let f = dot3(r, sv.velocity_m_s);
         let v_sq = dot3(sv.velocity_m_s, sv.velocity_m_s);
-
-        let t_plus = t + Duration::microseconds((ACCEL_FD_STEP_S * 1e6) as i64);
-        let sv_plus = interpolate_orbit(orbit, t_plus)?;
-        let accel = [
-            (sv_plus.velocity_m_s[0] - sv.velocity_m_s[0]) / ACCEL_FD_STEP_S,
-            (sv_plus.velocity_m_s[1] - sv.velocity_m_s[1]) / ACCEL_FD_STEP_S,
-            (sv_plus.velocity_m_s[2] - sv.velocity_m_s[2]) / ACCEL_FD_STEP_S,
-        ];
         let f_prime = -v_sq + dot3(r, accel);
 
         if f_prime.abs() < DERIV_FLOOR {
@@ -945,10 +943,17 @@ fn solve_zero_doppler(
         }
 
         let delta_s = -f / f_prime;
-        t = t + Duration::microseconds((delta_s * 1e6) as i64);
         last_delta_s = delta_s;
 
         if delta_s.abs() < tol_s {
+            // Convergence check is performed BEFORE applying the step.
+            // `sv` is therefore already at the converged time `t`.  This
+            // avoids a second `interpolate_orbit_and_accel` call that would
+            // otherwise be needed to evaluate the state vector at `t +
+            // delta_s`.  The sub-tolerance step (|delta_s| < 1 μs) changes
+            // `t` by < 1 μs, causing < 7.6 mm position error — negligible
+            // for any σ⁰ application.
+            //
             // i is 0-based; report 1-based iteration count for histogram
             // semantics (slot 1 = converged on first iter).  u8 is fine:
             // max_iter is bounded well below 256 in every realistic
@@ -958,8 +963,11 @@ fn solve_zero_doppler(
                 time: t,
                 residual_s: delta_s.abs(),
                 iterations,
+                sat_sv: sv,
             });
         }
+
+        t = t + Duration::microseconds((delta_s * 1e6) as i64);
     }
 
     Ok(ZeroDopplerOutcome::NotConverged {
@@ -1450,8 +1458,8 @@ pub fn terrain_correction(
                     config.newton_tolerance_s,
                 )?;
 
-                let az_time = match outcome {
-                    ZeroDopplerOutcome::Converged { time, iterations, .. } => {
+                let (az_time, sat_sv) = match outcome {
+                    ZeroDopplerOutcome::Converged { time, iterations, sat_sv, .. } => {
                         // Bin into the histogram.  Clamp into the last
                         // slot if a caller raised `max_newton_iterations`
                         // above the compile-time histogram size; the
@@ -1459,7 +1467,7 @@ pub fn terrain_correction(
                         // in dev builds so this clamp is observable.
                         let bin = (iterations as usize).min(NEWTON_ITER_HIST_SIZE - 1);
                         iter_histogram[bin] += 1;
-                        time
+                        (time, sat_sv)
                     }
                     ZeroDopplerOutcome::NotConverged { .. } => {
                         non_converged += 1;
@@ -1475,7 +1483,8 @@ pub fn terrain_correction(
                 prev_az_time = az_time; // seed next column
 
                 // 4. Slant range from the converged state vector.
-                let sat_sv = interpolate_orbit(orbit, az_time)?;
+                // sat_sv was returned by solve_zero_doppler — no extra
+                // interpolate_orbit call needed here.
                 let r_vec = sub3(target, sat_sv.position_m);
                 let slant_range_m = norm3(r_vec);
 

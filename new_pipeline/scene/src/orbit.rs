@@ -469,6 +469,132 @@ pub fn interpolate_orbit(
     })
 }
 
+/// Interpolate satellite position, velocity **and orbital acceleration** in a
+/// single Lagrange pass.
+///
+/// Used by the Newton zero-Doppler solver to eliminate the finite-difference
+/// second orbit evaluation (`interpolate_orbit(orbit, t + Δt)`) per iteration.
+///
+/// # Acceleration computation
+///
+/// The acceleration is the exact analytical derivative of the velocity Lagrange
+/// polynomial:
+///
+/// ```text
+/// A(t) = Σ_k  v_k · L'_k(t)
+///
+/// where  L'_k(t) = L_k(t) · Σ_{j≠k}  1 / (t − t_j)
+/// ```
+///
+/// This is more accurate than finite differencing (O(Δt²) truncation error)
+/// and eliminates one `interpolate_orbit` call per Newton iteration.
+///
+/// # Numerical note
+///
+/// The reciprocal `1 / (t − t_j)` is skipped when `|t − t_j| < 1 ns`
+/// (guarded below).  S-1 orbit nodes are 10 s apart; the Newton step is
+/// microseconds — this guard is never triggered in practice and only exists
+/// to prevent NaN propagation in degenerate test inputs.
+pub(crate) fn interpolate_orbit_and_accel(
+    orbit: &OrbitData,
+    time: DateTime<Utc>,
+) -> Result<(StateVector, [f64; 3]), OrbitError> {
+    let svs = &orbit.state_vectors;
+    if svs.len() < LAGRANGE_DEGREE {
+        return Err(OrbitError::InsufficientCoverage {
+            detail: format!(
+                "need at least {} vectors for interpolation, have {}",
+                LAGRANGE_DEGREE,
+                svs.len()
+            ),
+        });
+    }
+
+    let first = svs[0].time;
+    let last  = svs[svs.len() - 1].time;
+    if time < first || time > last {
+        return Err(OrbitError::OutsideOrbitWindow { requested: time, first, last });
+    }
+
+    let t_ref = svs[0].time;
+    let t_sec = (time - t_ref).num_microseconds().unwrap_or(0) as f64 / 1e6; // SAFETY-OK: chrono microseconds cannot overflow for orbit-window durations
+
+    let centre = {
+        let mut i = LAST_CENTRE.with(|c| c.get()).min(svs.len() - 1);
+        while i + 1 < svs.len() && svs[i + 1].time <= time { i += 1; }
+        while i > 0 && svs[i].time > time { i -= 1; }
+        LAST_CENTRE.with(|c| c.set(i));
+        i
+    };
+
+    let half  = LAGRANGE_DEGREE / 2;
+    let start = if centre < half { 0 }
+                else if centre + half >= svs.len() { svs.len().saturating_sub(LAGRANGE_DEGREE) }
+                else { centre - half + 1 };
+    let end   = (start + LAGRANGE_DEGREE).min(svs.len());
+    let window = &svs[start..end];
+
+    if window.len() != LAGRANGE_DEGREE {
+        return Err(OrbitError::InterpolationWindowTooSmall {
+            got: window.len(),
+            expected: LAGRANGE_DEGREE,
+        });
+    }
+
+    let mut times = [0.0_f64; LAGRANGE_DEGREE];
+    for (i, sv) in window.iter().enumerate() {
+        times[i] = (sv.time - t_ref).num_microseconds().unwrap_or(0) as f64 / 1e6; // SAFETY-OK: chrono microseconds cannot overflow for orbit-window durations
+    }
+
+    let mut pos   = [0.0_f64; 3];
+    let mut vel   = [0.0_f64; 3];
+    let mut accel = [0.0_f64; 3];
+
+    // Precompute reciprocals  rdiff[j] = 1 / (t − t_j)  for all j.
+    // This reduces the total division count from  LAGRANGE_DEGREE² = 64
+    // (one per (k, j≠k) pair in the inner loop) to  LAGRANGE_DEGREE = 8.
+    // For each k, the derivative sum  Σ_{j≠k} 1/(t−t_j)  is then
+    //   total_rdiff − rdiff[k]
+    // using O(1) subtraction instead of O(LAGRANGE_DEGREE) divisions.
+    //
+    // Guard: if  |t − t_j| < 1 ns  the reciprocal is skipped (rdiff stays 0
+    // and total_rdiff is not incremented).  Orbit nodes are 10 s apart;
+    // Newton steps are microseconds — this branch is never taken in
+    // production.  It prevents NaN if a caller supplies t exactly at a node. // SAFETY-OK: t at a node means basis[k']=0 for all k'≠k; the contribution from k' to accel is 0·(total_rdiff-rdiff[k'])=0 regardless of the guarded term
+    let mut rdiff       = [0.0_f64; LAGRANGE_DEGREE];
+    let mut total_rdiff = 0.0_f64;
+    for j in 0..LAGRANGE_DEGREE {
+        let diff = t_sec - times[j];
+        if diff.abs() > 1e-9 { // SAFETY-OK: orbit nodes are 10 s apart; Newton steps are ≪ 1 s; this guard is never triggered in production and only prevents NaN on degenerate inputs
+            rdiff[j] = 1.0 / diff;
+            total_rdiff += rdiff[j];
+        }
+    }
+
+    for k in 0..LAGRANGE_DEGREE {
+        // Standard Lagrange basis weight L_k(t).
+        let mut basis = 1.0_f64;
+        for j in 0..LAGRANGE_DEGREE {
+            if j != k {
+                basis *= (t_sec - times[j]) / (times[k] - times[j]);
+            }
+        }
+
+        // L'_k(t) = L_k(t) · Σ_{j≠k} 1/(t−t_j) = basis · (total_rdiff − rdiff[k]).
+        // When basis ≈ 0 (t near another node), the product is 0 regardless
+        // of the sum — no short-circuit needed; the result is exact. // SAFETY-OK: IEEE 754 guarantees 0.0 * finite = 0.0 and 0.0 * ±Inf = NaN; the rdiff guard above ensures rdiff[k] is always finite, so the product is always finite when basis is 0.0
+        let d_basis = basis * (total_rdiff - rdiff[k]);
+
+        for c in 0..3 {
+            pos[c]   += basis   * window[k].position_m[c];
+            vel[c]   += basis   * window[k].velocity_m_s[c];
+            accel[c] += d_basis * window[k].velocity_m_s[c];
+        }
+    }
+
+    Ok((StateVector { time, position_m: pos, velocity_m_s: vel }, accel))
+}
+
 /// Interpolate satellite position at a given time (convenience wrapper).
 pub fn interpolate_position(
     orbit: &OrbitData,
@@ -1026,5 +1152,125 @@ mod tests {
             centre_changes <= 12,
             "warm-walk took {centre_changes} centre changes over 10 000 monotonic samples; expected <= 12",
         );
+    }
+
+    // ── Analytical acceleration correctness ───────────────────────────────────
+
+    /// `interpolate_orbit_and_accel` returns the same position/velocity as
+    /// `interpolate_orbit` and an acceleration within 0.01 m/s² of the
+    /// 10 ms finite-difference estimate on real S-1B orbit data.
+    ///
+    /// 0.01 m/s² tolerance: the FD estimate has O(Δt²) truncation error
+    /// (Δt = 10 ms, fourth derivative of a Lagrange-8 polynomial over a
+    /// 70 s window is negligible), while the analytical form is exact.
+    /// Differences > 1e-4 m/s² would indicate a coding error.
+    #[test]
+    fn interpolate_orbit_and_accel_matches_fd_on_real_orbit() {
+        if !have_eof_data() {
+            eprintln!("skipping: orbit cache not present");
+            return;
+        }
+        let orbit = parse_eof_file(&s1b_eof()).unwrap();
+        let svs = &orbit.state_vectors;
+        let t_ref = svs[0].time;
+
+        // Test at 10 equally-spaced times within the scene window
+        // (avoid the very first/last 40 s where the 8-point window clips).
+        let t_first = svs[4].time + Duration::seconds(5);
+        let t_last  = svs[svs.len() - 5].time - Duration::seconds(5);
+        let span_us = (t_last - t_first).num_microseconds().unwrap_or(1); // SAFETY-OK: test window is always > 0 µs
+
+        const ACCEL_FD_STEP_S: f64 = 0.01;
+
+        for i in 0..10usize {
+            let frac = i as f64 / 9.0;
+            let t = t_first + Duration::microseconds((frac * span_us as f64) as i64);
+            let t_plus = t + Duration::milliseconds((ACCEL_FD_STEP_S * 1000.0) as i64);
+
+            // Analytical result.
+            let (sv_a, accel_a) = interpolate_orbit_and_accel(&orbit, t)
+                .expect("analytical call must not fail within orbit window");
+
+            // FD baseline.
+            let sv0 = interpolate_orbit(&orbit, t)
+                .expect("baseline call at t must not fail");
+            let sv1 = interpolate_orbit(&orbit, t_plus)
+                .expect("baseline call at t+dt must not fail");
+            let accel_fd = [
+                (sv1.velocity_m_s[0] - sv0.velocity_m_s[0]) / ACCEL_FD_STEP_S,
+                (sv1.velocity_m_s[1] - sv0.velocity_m_s[1]) / ACCEL_FD_STEP_S,
+                (sv1.velocity_m_s[2] - sv0.velocity_m_s[2]) / ACCEL_FD_STEP_S,
+            ];
+
+            // Position and velocity must be bit-identical to interpolate_orbit.
+            for c in 0..3 {
+                assert_eq!(
+                    sv_a.position_m[c].to_bits(), sv0.position_m[c].to_bits(),
+                    "position[{c}] differs at i={i}: analytical={} vs interpolate_orbit={}",
+                    sv_a.position_m[c], sv0.position_m[c],
+                );
+                assert_eq!(
+                    sv_a.velocity_m_s[c].to_bits(), sv0.velocity_m_s[c].to_bits(),
+                    "velocity[{c}] differs at i={i}: analytical={} vs interpolate_orbit={}",
+                    sv_a.velocity_m_s[c], sv0.velocity_m_s[c],
+                );
+            }
+
+            // Acceleration: analytical vs FD must agree to < 0.01 m/s².
+            // S-1 orbital acceleration magnitude is ~8 m/s²; 0.01 m/s²
+            // is 0.1% relative error — tighter than any downstream need.
+            let t_sec = (t - t_ref).num_microseconds().unwrap_or(0) as f64 / 1e6; // SAFETY-OK: chrono microseconds cannot overflow for orbit-window durations
+            for c in 0..3 {
+                let diff = (accel_a[c] - accel_fd[c]).abs();
+                assert!(
+                    diff < 0.01,
+                    "accel[{c}] mismatch at t={t_sec:.3} s: analytical={:.6} FD={:.6} diff={diff:.2e} m/s²",
+                    accel_a[c], accel_fd[c],
+                );
+            }
+        }
+    }
+
+    /// On a constant-velocity (linear) orbit the Lagrange polynomial for
+    /// velocity is exactly constant, so its analytical derivative (acceleration)
+    /// is exactly zero.  Verify this to machine precision.
+    #[test]
+    fn interpolate_orbit_and_accel_zero_accel_on_linear_orbit() {
+        use chrono::TimeZone;
+
+        let t0 = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let p0 = [0.0_f64, 0.0, 7_078_137.0];
+        let v  = [7_600.0_f64, 10.0, -5.0];
+
+        let svs: Vec<StateVector> = (0..10)
+            .map(|i| {
+                let dt = i as f64 * 10.0;
+                StateVector {
+                    time: t0 + Duration::milliseconds((dt * 1000.0) as i64),
+                    position_m: [p0[0] + v[0] * dt, p0[1] + v[1] * dt, p0[2] + v[2] * dt],
+                    velocity_m_s: v,
+                }
+            })
+            .collect();
+        let orbit = OrbitData { reference_epoch: t0, state_vectors: svs };
+
+        let t_query = t0 + Duration::milliseconds(45_000);
+        let (sv, accel) = interpolate_orbit_and_accel(&orbit, t_query)
+            .expect("must succeed for mid-window query");
+
+        // Velocity must equal the constant v exactly.
+        for c in 0..3 {
+            assert!(
+                (sv.velocity_m_s[c] - v[c]).abs() < 1e-9,
+                "velocity[{c}]: got {} expected {}", sv.velocity_m_s[c], v[c],
+            );
+        }
+        // Acceleration of a constant-velocity orbit is exactly zero.
+        for c in 0..3 {
+            assert!(
+                accel[c].abs() < 1e-9,
+                "accel[{c}] on linear orbit = {} (expected ≈ 0)", accel[c],
+            );
+        }
     }
 }
