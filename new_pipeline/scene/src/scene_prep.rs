@@ -243,6 +243,13 @@ pub(crate) fn resolve_orbit(
     // ── Path 2: auto-download (orbit-fetch feature) ───────────────────────
     #[cfg(feature = "orbit-fetch")]
     {
+        // Opt-out: if SARDINE_ALLOW_ANNOTATION_ORBIT=1 is set, skip the
+        // download and fall through to Path 3 (annotation orbit).
+        let skip_fetch = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
+            .map(|v| v == "1")
+            .unwrap_or(false); // SAFETY-OK: missing/non-"1" → do not skip (safe direction)
+
+        if !skip_fetch {
         let cache_dir = orbit_cache_dir()
             .with_context(|| format!("resolving {label} orbit cache directory"))?;
 
@@ -279,6 +286,14 @@ pub(crate) fn resolve_orbit(
         let scene = apply_precise_orbit(scene, &orbit)
             .with_context(|| format!("applying {label} precise orbit"))?;
         return Ok((scene, crate::provenance::OrbitSource::Poeorb));
+        } // if !skip_fetch
+
+        // skip_fetch=true: fall through to annotation orbit.
+        tracing::warn!(
+            "{label}: SARDINE_ALLOW_ANNOTATION_ORBIT=1 — skipping POEORB download, \
+             using annotation orbit (metre-level accuracy)."
+        );
+        return Ok((scene, crate::provenance::OrbitSource::Annotation));
     }
 
     // ── Path 3: annotation orbit (opt-in via env var, no orbit-fetch) ─────

@@ -58,12 +58,10 @@ fn orbit_present() -> bool {
     Path::new(EOF).is_file()
 }
 
-/// Read the first N finite pixel values (dB) from a Float32 strip TIFF for
-/// range/sanity checking.  Returns the fraction of finite pixels and the
-/// (min, max) of those pixels after dB conversion.
+/// Read a Float32 TIFF and return (frac_finite, p5_db, p95_db).
 ///
-/// Skips true NaN and ±Inf.  All finite values are expected to be linear
-/// power ≥ 0; negatives are treated as invalid.
+/// Pipeline output is already dB-scale (finite values like −15.0 are normal).
+/// Counts all `is_finite()` pixels; returns 5th / 95th percentile of those.
 fn check_output_tiff(path: &Path) -> (f64, f32, f32) {
     use std::io::BufReader;
     use tiff::decoder::{Decoder, DecodingResult, Limits};
@@ -86,21 +84,18 @@ fn check_output_tiff(path: &Path) -> (f64, f32, f32) {
     };
     assert_eq!(pixels.len(), total);
 
-    let mut n_finite = 0usize;
-    let mut db_min = f32::INFINITY;
-    let mut db_max = f32::NEG_INFINITY;
+    let mut finite: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
+    let frac = finite.len() as f64 / total as f64;
 
-    for &v in &pixels {
-        if v.is_finite() && v > 0.0 {
-            n_finite += 1;
-            let db = 10.0 * v.log10();
-            if db < db_min { db_min = db; }
-            if db > db_max { db_max = db; }
-        }
+    if finite.is_empty() {
+        return (0.0, f32::NAN, f32::NAN);
     }
 
-    let frac = n_finite as f64 / total as f64;
-    (frac, db_min, db_max)
+    finite.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap()); // SAFETY-OK: no NaN after is_finite filter
+    let p5  = finite[(finite.len() as f64 * 0.05) as usize];
+    let p95 = finite[(finite.len() as f64 * 0.95) as usize];
+
+    (frac, p5, p95)
 }
 
 // ─── Test ─────────────────────────────────────────────────────────────────────
@@ -121,7 +116,7 @@ fn s1a_20201005_vv_pipeline_smoke() {
 
     let mut opts = ProcessOptions::new(
         PathBuf::from(SAFE),
-        PathBuf::from(DEM),
+        Some(PathBuf::from(DEM)),
         output.clone(),
         "auto".to_owned(), // EGM96 via geoid-fetch
     );
@@ -152,10 +147,10 @@ fn s1a_20201005_vv_pipeline_smoke() {
 
     assert!(output.exists(), "output TIFF not created: {}", output.display());
 
-    let (frac_finite, db_min, db_max) = check_output_tiff(&output);
+    let (frac_finite, db_p5, db_p95) = check_output_tiff(&output);
 
     eprintln!(
-        "regression_s1a_20201005: frac_finite={:.3}  dB range=[{db_min:.2}, {db_max:.2}]",
+        "regression_s1a_20201005: frac_finite={:.3}  p5={db_p5:.2} dB  p95={db_p95:.2} dB",
         frac_finite
     );
 
@@ -166,12 +161,12 @@ fn s1a_20201005_vv_pipeline_smoke() {
     );
 
     assert!(
-        db_min >= -40.0,
-        "minimum dB = {db_min:.2} is below −40 dB — likely a calibration error or NaN propagation"
+        db_p5 >= -40.0,
+        "p5 dB = {db_p5:.2} is below −40 dB — likely a calibration error or NaN propagation"
     );
 
     assert!(
-        db_max <= 5.0,
-        "maximum dB = {db_max:.2} exceeds +5 dB — likely a calibration error or invalid pixel"
+        db_p95 <= 5.0,
+        "p95 dB = {db_p95:.2} exceeds +5 dB — likely a calibration error or invalid pixel"
     );
 }

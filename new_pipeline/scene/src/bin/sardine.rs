@@ -683,6 +683,7 @@ fn cmd_search_slc(args: SearchSlcArgs) -> Result<()> {
 }
 
 /// Parse a `min_lon,min_lat,max_lon,max_lat` bbox string.
+#[allow(dead_code)]
 fn parse_bbox(s: &str) -> Result<[f64; 4]> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 4 {
