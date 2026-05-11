@@ -323,8 +323,8 @@ fn orbit_cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".sardine").join("orbits"))
 }
 
-/// Resolve the DEM for a scene bounding box, ensuring all required SRTM-1
-/// tiles are present and returning the directory to pass to
+/// Resolve the DEM for a scene bounding box, ensuring all required tiles are
+/// present and returning the directory to pass to
 /// [`crate::dem::DemMosaic::load_directory`].
 ///
 /// Resolution order:
@@ -333,15 +333,19 @@ fn orbit_cache_dir() -> Result<PathBuf> {
 ///    No network access; the caller is responsible for tile coverage.
 ///
 /// 2. **`dem-fetch` feature is enabled (the default)** — locate the DEM
-///    cache directory (`$SARDINE_DEM_DIR` or `$HOME/.sardine/dem/`),
-///    then call [`crate::dem_fetch::fetch_dem_tiles`] to download any
-///    missing tiles.  Already-cached tiles are reused without re-downloading.
+///    cache directory, then call the appropriate fetcher based on `dem_source`:
+///    - `"srtm1"` (default): [`crate::dem_fetch::fetch_srtm1_tiles`], caches
+///      into `$SARDINE_DEM_DIR/` (or `$HOME/.sardine/dem/`).
+///    - `"glo30"`: [`crate::dem_fetch::fetch_glo30_tiles`], caches into
+///      `$SARDINE_DEM_DIR/glo30/` (or `$HOME/.sardine/dem/glo30/`).
+///    Already-cached tiles are reused without re-downloading.
 ///
 /// Any other combination returns an explicit error.
 ///
 /// `bb` is the scene bounding box used to compute which tiles are required.
 pub(crate) fn resolve_dem(
     dem_override: Option<&Path>,
+    dem_source: &str,
     bb: &crate::types::BoundingBox,
 ) -> Result<PathBuf> {
     // ── Path 1: explicit directory ────────────────────────────────────────
@@ -356,13 +360,15 @@ pub(crate) fn resolve_dem(
             .with_context(|| "resolving DEM cache directory")?;
 
         tracing::info!(
-            "auto-downloading SRTM-1 tiles for bbox \
+            "auto-downloading {} DEM tiles for bbox \
              [{:.3}°N, {:.3}°N] × [{:.3}°E, {:.3}°E] …",
+            dem_source,
             bb.min_lat_deg, bb.max_lat_deg,
             bb.min_lon_deg, bb.max_lon_deg,
         );
 
-        let dir = crate::dem_fetch::fetch_dem_tiles(
+        let dir = crate::dem_fetch::fetch_dem_tiles_for_source(
+            dem_source,
             bb.min_lat_deg,
             bb.max_lat_deg,
             bb.min_lon_deg,
@@ -371,9 +377,10 @@ pub(crate) fn resolve_dem(
         )
         .with_context(|| {
             format!(
-                "auto-downloading SRTM-1 DEM tiles for bbox \
+                "auto-downloading {} DEM tiles for bbox \
                  [{:.3}°N, {:.3}°N] × [{:.3}°E, {:.3}°E]. \
                  Supply --dem <dir> to use a local tile directory.",
+                dem_source,
                 bb.min_lat_deg, bb.max_lat_deg,
                 bb.min_lon_deg, bb.max_lon_deg,
             )
@@ -386,7 +393,7 @@ pub(crate) fn resolve_dem(
     #[cfg(not(feature = "dem-fetch"))]
     bail!(
         "No --dem directory provided and the `dem-fetch` feature is disabled.\n\
-         Supply a directory of SRTM-1 `.hgt` tiles with --dem <dir>, or \
+         Supply a directory of DEM tiles with --dem <dir>, or \
          rebuild with `--features dem-fetch` to enable automatic tile download."
     );
 }

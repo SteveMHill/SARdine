@@ -254,7 +254,7 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
 
     tracing::info!("resolving DEM …");
     let t_dem = Instant::now();
-    let dem_dir = crate::scene_prep::resolve_dem(opts.dem.as_deref(), &scene.bounding_box)
+    let dem_dir = crate::scene_prep::resolve_dem(opts.dem.as_deref(), &opts.dem_source, &scene.bounding_box)
         .with_context(|| "resolving DEM")?;
     let dem = DemMosaic::load_directory(&dem_dir)
         .with_context(|| format!("loading DEM from: {}", dem_dir.display()))?;
@@ -762,7 +762,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     // ── Load DEM ─────────────────────────────────────────────────────────────
     tracing::info!("resolving DEM …");
     let t_dem = Instant::now();
-    let dem_dir = crate::scene_prep::resolve_dem(opts.dem.as_deref(), &ref_scene.bounding_box)
+    let dem_dir = crate::scene_prep::resolve_dem(opts.dem.as_deref(), &opts.dem_source, &ref_scene.bounding_box)
         .with_context(|| "resolving DEM")?;
     let dem = DemMosaic::load_directory(&dem_dir)
         .with_context(|| format!("loading DEM from: {}", dem_dir.display()))?;
@@ -1385,6 +1385,7 @@ mod multipol_tests {
         let opts = ProcessOptions {
             safe: PathBuf::from("/no/such/safe.SAFE"),
             dem: Some(PathBuf::from("/no/such/dem")),
+            dem_source: "srtm1".to_owned(),
             output: PathBuf::from("/tmp/no_such_out.tif"),
             orbit: None,
             polarization: "HH".to_owned(),

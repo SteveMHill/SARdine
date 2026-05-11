@@ -89,9 +89,11 @@ pub enum ResamplingKernel {
 #[derive(Debug, Clone)]
 pub struct ProcessOptions {
     pub safe: PathBuf,
-    /// Directory containing DEM tiles.  `None` → auto-download SRTM-1 tiles
-    /// into `$SARDINE_DEM_DIR` / `$HOME/.sardine/dem/`.
+    /// Directory containing DEM tiles.  `None` → auto-download using `dem_source`.
     pub dem: Option<PathBuf>,
+    /// DEM source for auto-download: `"srtm1"` (default) or `"glo30"`.
+    /// Ignored when `dem` is `Some`.
+    pub dem_source: String,
     pub output: PathBuf,
     pub orbit: Option<PathBuf>,
     pub polarization: String,
@@ -142,11 +144,12 @@ pub struct ProcessOptions {
 impl ProcessOptions {
     /// Construct with the same defaults the CLI uses.  `safe`,
     /// `output`, and `geoid` have no CLI default and must be supplied.
-    /// `dem` defaults to `None` (auto-download).
+    /// `dem` defaults to `None` (auto-download SRTM-1).
     pub fn new(safe: PathBuf, dem: Option<PathBuf>, output: PathBuf, geoid: String) -> Self {
         Self {
             safe,
             dem,
+            dem_source: "srtm1".to_owned(),
             output,
             orbit: None,
             polarization: "VV".to_owned(),
@@ -240,9 +243,11 @@ pub struct InsarOptions {
     /// If `output_phase = true`, `<output>_iw1_phase.tif` is also written.
     pub output: PathBuf,
     /// Directory containing DEM tiles for terrain correction and geocoding.
-    /// `None` → auto-download SRTM-1 tiles into `$SARDINE_DEM_DIR` /
-    /// `$HOME/.sardine/dem/`.
+    /// `None` → auto-download using `dem_source`.
     pub dem: Option<PathBuf>,
+    /// DEM source for auto-download: `"srtm1"` (default) or `"glo30"`.
+    /// Ignored when `dem` is `Some`.
+    pub dem_source: String,
     /// Path to a POEORB `.EOF` file for the reference scene.
     pub reference_orbit: Option<PathBuf>,
     /// Path to a POEORB `.EOF` file for the secondary scene.
@@ -265,13 +270,14 @@ pub struct InsarOptions {
 
 impl InsarOptions {
     /// Construct with CLI defaults.  `reference`, `secondary`, and `output` are required.
-    /// `dem` defaults to `None` (auto-download).
+    /// `dem` defaults to `None` (auto-download SRTM-1).
     pub fn new(reference: PathBuf, secondary: PathBuf, output: PathBuf, dem: Option<PathBuf>) -> Self {
         Self {
             reference,
             secondary,
             output,
             dem,
+            dem_source: "srtm1".to_owned(),
             reference_orbit: None,
             secondary_orbit: None,
             polarization: "VV".to_owned(),

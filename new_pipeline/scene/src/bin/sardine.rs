@@ -119,12 +119,23 @@ struct ProcessArgs {
     /// Directory containing SRTM-1 DEM tiles.
     ///
     /// **Omit for automatic download (default behaviour).**  When not
-    /// supplied, the pipeline downloads the required SRTM-1 `.hgt` tiles
-    /// from the AWS Open Data bucket and caches them under `$SARDINE_DEM_DIR`
+    /// supplied, the pipeline downloads tiles from the source selected by
+    /// `--dem-source` and caches them under `$SARDINE_DEM_DIR`
     /// (or `$HOME/.sardine/dem/`) for future runs.  An explicit path always
     /// takes precedence over the download cache.
     #[arg(long, value_name = "DIR")]
     dem: Option<PathBuf>,
+
+    /// DEM source for automatic tile download.  Ignored when `--dem` is set.
+    ///
+    /// Accepted values:
+    ///   - `srtm1` (default): SRTM 1-arc-second from AWS elevation-tiles-prod.
+    ///     EGM96 height reference.  `.hgt` tiles, 3601 × 3601.
+    ///   - `glo30`: Copernicus GLO-30 from AWS Open Data.
+    ///     EGM2008 height reference.  Cloud-Optimised GeoTIFF, 3600 × 3600.
+    ///     Better quality at high latitudes and in mountainous areas.
+    #[arg(long, value_name = "SOURCE", default_value = "srtm1")]
+    dem_source: String,
 
     /// Output path for the dB GeoTIFF (written as Float32 GeoTIFF).
     #[arg(long, value_name = "PATH")]
@@ -326,6 +337,7 @@ impl ProcessArgs {
             safe: primary_safe,
             extra_safe_paths,
             dem: self.dem,
+            dem_source: self.dem_source.clone(),
             output: self.output,
             orbit: self.orbit,
             polarization: self.polarization,
@@ -639,11 +651,18 @@ struct InsarArgs {
     /// Directory containing DEM tiles for geocoding (SRTM-1 or compatible).
     ///
     /// **Omit for automatic download (default behaviour).**  When not
-    /// supplied, the pipeline downloads the required SRTM-1 `.hgt` tiles
-    /// from the AWS Open Data bucket and caches them under `$SARDINE_DEM_DIR`
+    /// supplied, the pipeline downloads tiles from the source selected by
+    /// `--dem-source` and caches them under `$SARDINE_DEM_DIR`
     /// (or `$HOME/.sardine/dem/`).
     #[arg(long, value_name = "DIR")]
     dem: Option<PathBuf>,
+
+    /// DEM source for automatic tile download.  Ignored when `--dem` is set.
+    ///
+    /// Accepted values: `srtm1` (default), `glo30`.  See `sardine process
+    /// --help` for full descriptions.
+    #[arg(long, value_name = "SOURCE", default_value = "srtm1")]
+    dem_source: String,
 
     /// Path to a POEORB `.EOF` orbit file for the reference scene.
     ///
@@ -706,6 +725,7 @@ fn cmd_insar(args: InsarArgs) -> Result<()> {
         secondary: args.secondary,
         output: args.output,
         dem: args.dem,
+        dem_source: args.dem_source,
         reference_orbit: args.reference_orbit,
         secondary_orbit: args.secondary_orbit,
         polarization: args.polarization,
@@ -745,6 +765,9 @@ struct BatchEntry {
     /// Directory containing SRTM-1 DEM tiles.  Omit for automatic download.
     #[serde(default)]
     dem: Option<PathBuf>,
+    /// DEM source for automatic download: `"srtm1"` (default) or `"glo30"`.
+    #[serde(default = "default_dem_source")]
+    dem_source: String,
     /// Output path for the dB GeoTIFF.
     output: PathBuf,
     /// Geoid: `"auto"`, `"zero"`, or path to EGM96 `.bin`/`.gtx`/`.GRD` file.
@@ -829,6 +852,7 @@ fn default_polarization() -> String { "VV".to_owned() }
 fn default_pixel_spacing_deg() -> f64 { 0.0001 }
 fn default_pixel_spacing_m() -> f64 { 10.0 }
 fn default_crs() -> String { "wgs84".to_owned() }
+fn default_dem_source() -> String { "srtm1".to_owned() }
 fn default_speckle() -> String { "none".to_owned() }
 fn default_speckle_window() -> usize { 7 }
 fn default_enl() -> f32 { 1.0 }
@@ -858,6 +882,7 @@ impl BatchEntry {
             safe: primary_safe,
             extra_safe_paths,
             dem: self.dem,
+            dem_source: self.dem_source,
             output: self.output,
             orbit: self.orbit,
             polarization: self.polarization,
