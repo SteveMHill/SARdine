@@ -87,6 +87,16 @@ impl CoregPoly {
     }
 }
 
+/// The output of the full co-registration stage: reference and co-registered secondary,
+/// both in the reference scene's slant-range geometry.
+#[derive(Debug)]
+pub struct Coregistered {
+    /// Reference deramped SLC (unchanged from input).
+    pub ref_data: Deramped,
+    /// Secondary deramped SLC resampled into reference geometry.
+    pub secondary_resampled: Deramped,
+}
+
 /// Output of the sparse co-registration step.
 #[derive(Debug, Clone)]
 pub struct CoregResult {
@@ -267,7 +277,7 @@ pub fn resample_secondary(
 /// * `range_m`  — One-way slant range (m).
 /// * `max_iter` — Maximum Newton iterations (20 is sufficient for < 1 mm).
 /// * `tol_m`    — Convergence tolerance on position update norm (m).
-fn ecef_from_slant_range_doppler(
+pub(crate) fn ecef_from_slant_range_doppler(
     sat_pos: [f64; 3],
     sat_vel: [f64; 3],
     range_m: f64,

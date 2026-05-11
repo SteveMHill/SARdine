@@ -30,5 +30,7 @@
 //! - Coherence is the amplitude of the normalised complex coherence `γ`; it is
 //!   in [0, 1] and is phase-invariant.
 
+pub mod coreg;
 pub mod deramp;
 pub mod error;
+pub mod interferogram;

@@ -43,4 +43,38 @@ pub enum InsarError {
         output_len: usize,
         expected: usize,
     },
+
+    /// Forward geocoding (slant-range + zero-Doppler → ECEF on ellipsoid)
+    /// failed to converge for a sparse grid point.
+    #[error(
+        "forward geocoding failed to converge at grid point \
+         (line {line}, sample {sample})"
+    )]
+    ForwardGeocodingFailed { line: usize, sample: usize },
+
+    /// Too few valid sparse grid points to fit the co-registration polynomial.
+    /// Need at least 6 for degree-2 2D fit; got `n_valid`.
+    #[error(
+        "co-registration: need at least 6 valid grid points for polynomial fit, \
+         got {n_valid}"
+    )]
+    CoregGridTooSmall { n_valid: usize },
+
+    /// Zero-Doppler solver failed to converge on the secondary orbit for a
+    /// sparse grid point.
+    #[error(
+        "secondary zero-Doppler solver did not converge at grid point \
+         (line {line}, sample {sample})"
+    )]
+    SecondaryZeroDopplerFailed { line: usize, sample: usize },
+
+    /// Orbit interpolation error propagated from the orbit module.
+    #[error("orbit interpolation error: {0}")]
+    Orbit(#[from] crate::orbit::OrbitError),
+
+    /// Coherence estimation window size is zero.
+    #[error(
+        "coherence estimation window size must be > 0, got az={az} rg={rg}"
+    )]
+    InvalidWindowSize { az: usize, rg: usize },
 }
