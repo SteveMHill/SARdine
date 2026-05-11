@@ -489,6 +489,152 @@ fn pipeline_s1b_missing_dem_tile_errors_explicitly() {
     );
 }
 
+/// Exercises the **auto-download code path** for DEM resolution using a
+/// **cache-hit** (no network access):
+///
+/// - `dem = None` — so `resolve_dem` takes the auto-download branch.
+/// - `SARDINE_DEM_DIR` is pointed at the local fixture tiles so every
+///   `dest.exists()` check in `fetch_srtm1_tiles` returns `true` immediately.
+/// - Orbit is supplied explicitly so orbit-fetch is not exercised here.
+///
+/// The test verifies that:
+/// - The pipeline completes without error.
+/// - The post-condition `check_srtm1_tiles_present` in `resolve_dem` passes.
+/// - Output statistics match the same thresholds as the explicit-dem test.
+///
+/// This is the canonical "auto-dem cache-hit" path test — it runs the full
+/// `resolve_dem → fetch_srtm1_tiles → check_srtm1_tiles_present` chain
+/// without any network dependency.
+#[test]
+#[ignore]
+fn pipeline_s1b_auto_dem_cache_hit() {
+    if !s1b_safe_present() || !s1b_eof_present() || !srtm1_dem_present() {
+        eprintln!(
+            "orbit_dem_fit::pipeline_s1b_auto_dem_cache_hit: \
+             skipping — one or more fixtures absent.\n\
+             Required:\n  {SAFE_S1B}\n  {EOF_S1B}\n  {DEM_SRTM1}"
+        );
+        return;
+    }
+
+    // Point the DEM cache at the fixture tiles so fetch_srtm1_tiles skips all
+    // downloads (every dest.exists() → true).  This exercises the full
+    // resolve_dem auto-download branch + post-condition check without network.
+    std::env::set_var("SARDINE_DEM_DIR", DEM_SRTM1);
+
+    let output = std::env::temp_dir().join("sardine_orbit_dem_fit_s1b_auto_dem.tiff");
+
+    // dem = None → resolve_dem takes the auto-download branch.
+    let mut opts = sardine_scene::run::ProcessOptions::new(
+        PathBuf::from(SAFE_S1B),
+        None,
+        output.clone(),
+        "zero".to_owned(),
+    );
+    opts.orbit = Some(PathBuf::from(EOF_S1B));
+    opts.polarization = "VV".to_owned();
+    opts.no_provenance = true;
+
+    eprintln!("orbit_dem_fit::pipeline_s1b_auto_dem_cache_hit: running pipeline (dem=None, cache-hit) …");
+    sardine_scene::run::run_process(&opts)
+        .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
+
+    assert!(output.exists(), "output TIFF not created: {}", output.display());
+
+    let (frac_finite, db_p5, db_p95) = check_output_tiff(&output);
+    eprintln!(
+        "orbit_dem_fit::pipeline_s1b_auto_dem_cache_hit: \
+         frac_finite={:.3}  dB p5={db_p5:.2}  dB p95={db_p95:.2}",
+        frac_finite
+    );
+
+    assert!(frac_finite >= 0.50, "only {:.1}% finite pixels", 100.0 * frac_finite);
+    assert!(db_p5 >= -35.0, "p5 dB = {db_p5:.2} below −35");
+    assert!(db_p95 <= 5.0, "p95 dB = {db_p95:.2} above +5");
+}
+
+/// Exercises the **full auto-download path** for both DEM and orbit — no
+/// fixtures, no cache seed, a real network connection is required.
+///
+/// Gated on `SARDINE_NETWORK_TESTS=1` (env var, not `#[ignore]`) so it
+/// never runs in normal CI but can be triggered explicitly:
+///
+/// ```sh
+/// SARDINE_NETWORK_TESTS=1 cargo test --test orbit_dem_fit -- \
+///     --ignored --nocapture pipeline_s1b_full_auto_download
+/// ```
+///
+/// Uses a fresh `tempdir` for both orbit and DEM caches so the download
+/// machinery is exercised end-to-end.  The test will pull:
+/// - ~1 MB POEORB .EOF from s3://s1-orbits (AWS, public, no auth)
+/// - ~700 MB SRTM-1 tiles from USGS (26 × ~28 MB)
+///
+/// Internet access must be available.  The test is skipped with a clear
+/// message when `SARDINE_NETWORK_TESTS` is not set.
+#[test]
+#[ignore]
+fn pipeline_s1b_full_auto_download() {
+    if std::env::var("SARDINE_NETWORK_TESTS").as_deref() != Ok("1") {
+        eprintln!(
+            "orbit_dem_fit::pipeline_s1b_full_auto_download: \
+             skipped — set SARDINE_NETWORK_TESTS=1 to enable.\n\
+             WARNING: downloads ~700 MB DEM + orbit from the internet."
+        );
+        return;
+    }
+    if !s1b_safe_present() {
+        eprintln!(
+            "orbit_dem_fit::pipeline_s1b_full_auto_download: \
+             skipping — SAFE fixture absent: {SAFE_S1B}"
+        );
+        return;
+    }
+
+    // Fresh temp dirs so every tile and the orbit file are actually downloaded.
+    let dem_dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir for DEM: {e}"));
+    let orbit_dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir for orbit: {e}"));
+    let output = std::env::temp_dir().join("sardine_orbit_dem_fit_s1b_full_auto.tiff");
+
+    // Route both auto-download caches into the temp dirs.
+    std::env::set_var("SARDINE_DEM_DIR", dem_dir.path());
+    std::env::set_var("SARDINE_ORBIT_DIR", orbit_dir.path());
+
+    // dem = None, orbit = None → both resolve_dem and resolve_orbit take the
+    // auto-download branch.
+    let mut opts = sardine_scene::run::ProcessOptions::new(
+        PathBuf::from(SAFE_S1B),
+        None,
+        output.clone(),
+        "zero".to_owned(),
+    );
+    opts.polarization = "VV".to_owned();
+    opts.no_provenance = true;
+    // opts.orbit intentionally left as None
+
+    eprintln!(
+        "orbit_dem_fit::pipeline_s1b_full_auto_download: \
+         downloading orbit → {}  DEM → {} …",
+        orbit_dir.path().display(),
+        dem_dir.path().display(),
+    );
+
+    sardine_scene::run::run_process(&opts)
+        .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
+
+    assert!(output.exists(), "output TIFF not created: {}", output.display());
+
+    let (frac_finite, db_p5, db_p95) = check_output_tiff(&output);
+    eprintln!(
+        "orbit_dem_fit::pipeline_s1b_full_auto_download: \
+         frac_finite={:.3}  dB p5={db_p5:.2}  dB p95={db_p95:.2}",
+        frac_finite
+    );
+
+    assert!(frac_finite >= 0.50, "only {:.1}% finite pixels", 100.0 * frac_finite);
+    assert!(db_p5 >= -35.0, "p5 dB = {db_p5:.2} below −35");
+    assert!(db_p95 <= 5.0, "p95 dB = {db_p95:.2} above +5");
+}
+
 // ─── Output inspection helper ─────────────────────────────────────────────────
 
 /// Read a single-band Float32 TIFF containing **dB-scale** backscatter.
