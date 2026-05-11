@@ -109,7 +109,7 @@ mod inner {
     /// Format a tile name from integer south-west lat/lon (SRTM/flat convention).
     ///
     /// `{N|S}{lat:02}{E|W}{lon:03}` — e.g. `N47E007`, `S01W071`.
-    pub(super) fn tile_name(lat: i32, lon: i32) -> String {
+    pub(crate) fn tile_name(lat: i32, lon: i32) -> String {
         let ns = if lat >= 0 { 'N' } else { 'S' };
         let ew = if lon >= 0 { 'E' } else { 'W' };
         format!("{}{:02}{}{:03}", ns, lat.unsigned_abs(), ew, lon.unsigned_abs())
@@ -132,7 +132,7 @@ mod inner {
     ///
     /// Tile SW corners at integer degrees are chosen so every point inside
     /// the bbox falls inside at least one tile.
-    pub(super) fn tiles_for_bbox(
+    pub(crate) fn tiles_for_bbox(
         min_lat: f64,
         max_lat: f64,
         min_lon: f64,
@@ -404,6 +404,7 @@ mod inner {
 
 #[cfg(feature = "dem-fetch")]
 pub use inner::{fetch_dem_tiles_for_source, fetch_glo30_tiles, fetch_srtm1_tiles, DemFetchError};
+pub(crate) use inner::{tile_name, tiles_for_bbox};
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

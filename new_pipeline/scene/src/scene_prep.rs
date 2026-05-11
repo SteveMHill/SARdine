@@ -350,6 +350,23 @@ pub(crate) fn resolve_dem(
 ) -> Result<PathBuf> {
     // ── Path 1: explicit directory ────────────────────────────────────────
     if let Some(dir) = dem_override {
+        // For SRTM-1, verify that all required tiles are actually present
+        // in the supplied directory.  This catches the common mistake of
+        // pointing --dem at a directory that was prepared for a different
+        // scene area (the tiles would be present but for the wrong bbox,
+        // and terrain-correction would silently produce all-nodata output).
+        #[cfg(feature = "dem-fetch")]
+        if dem_source == "srtm1" {
+            check_srtm1_tiles_present(dir, bb)
+                .with_context(|| {
+                    format!(
+                        "DEM directory '{}' does not fully cover this scene (--dem-source srtm1). \
+                         Pass --dem pointing to a directory with the correct tiles, or \
+                         omit --dem to auto-download.",
+                        dir.display()
+                    )
+                })?;
+        }
         return Ok(dir.to_path_buf());
     }
 
@@ -386,6 +403,14 @@ pub(crate) fn resolve_dem(
             )
         })?;
 
+        // Post-condition: for SRTM-1, every required tile must have been
+        // downloaded (or was already cached).  This fires if the download
+        // loop silently skipped a tile due to an unexpected server state.
+        if dem_source == "srtm1" {
+            check_srtm1_tiles_present(&dir, bb)
+                .with_context(|| "SRTM-1 tile completeness check failed after auto-download")?;
+        }
+
         return Ok(dir);
     }
 
@@ -410,6 +435,56 @@ fn dem_cache_dir() -> Result<PathBuf> {
          cannot locate DEM cache directory"
     })?;
     Ok(PathBuf::from(home).join(".sardine").join("dem"))
+}
+
+/// Verify that every SRTM-1 tile required to cover `bb` is present in `dir`.
+///
+/// SRTM-1 tiles are 1°×1° HGT files named `N{lat}E{lon}.hgt` /
+/// `S{lat}W{lon}.hgt`.  Because SRTM-1 provides sea-level tiles for ocean
+/// areas, a missing tile is never legitimate — it means either the DEM
+/// directory is incomplete or points at the wrong scene area.
+///
+/// Call this after [`resolve_dem`] returns a directory for `"srtm1"` source.
+/// For `"glo30"` do not call this: ocean tiles are legitimately absent (HTTP
+/// 404 from the server).
+///
+/// # Errors
+///
+/// Returns a human-readable error listing every missing tile filename.
+#[cfg(feature = "dem-fetch")]
+pub fn check_srtm1_tiles_present(
+    dir: &Path,
+    bb: &crate::types::BoundingBox,
+) -> Result<()> {
+    use crate::dem_fetch::{tile_name, tiles_for_bbox};
+
+    let required = tiles_for_bbox(bb.min_lat_deg, bb.max_lat_deg, bb.min_lon_deg, bb.max_lon_deg);
+    let missing: Vec<String> = required
+        .iter()
+        .filter_map(|(lat, lon)| {
+            let name = tile_name(*lat, *lon);
+            if dir.join(format!("{}.hgt", name)).exists() {
+                None
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+
+    if !missing.is_empty() {
+        bail!(
+            "DEM directory '{}' is missing {} SRTM-1 tile(s) required for this scene's \
+             bounding box [{:.3}°–{:.3}°N, {:.3}°–{:.3}°E]: {}.\n\
+             Either download the missing tiles or point --dem at a directory with \
+             complete coverage for this scene.",
+            dir.display(),
+            missing.len(),
+            bb.min_lat_deg, bb.max_lat_deg,
+            bb.min_lon_deg, bb.max_lon_deg,
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

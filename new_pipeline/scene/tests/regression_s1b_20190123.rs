@@ -177,7 +177,7 @@ fn s1b_20190123_vv_refined_lee_bias_vs_asf() {
     eprintln!("regression: running sardine pipeline …");
     let mut opts = ProcessOptions::new(
         PathBuf::from(SAFE),
-        PathBuf::from(DEM),
+        Some(PathBuf::from(DEM)),
         output.clone(),
         "auto".to_owned(), // EGM96 geoid via geoid-fetch
     );
