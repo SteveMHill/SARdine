@@ -89,7 +89,9 @@ pub enum ResamplingKernel {
 #[derive(Debug, Clone)]
 pub struct ProcessOptions {
     pub safe: PathBuf,
-    pub dem: PathBuf,
+    /// Directory containing DEM tiles.  `None` → auto-download SRTM-1 tiles
+    /// into `$SARDINE_DEM_DIR` / `$HOME/.sardine/dem/`.
+    pub dem: Option<PathBuf>,
     pub output: PathBuf,
     pub orbit: Option<PathBuf>,
     pub polarization: String,
@@ -138,9 +140,10 @@ pub struct ProcessOptions {
 }
 
 impl ProcessOptions {
-    /// Construct with the same defaults the CLI uses.  `safe`, `dem`,
+    /// Construct with the same defaults the CLI uses.  `safe`,
     /// `output`, and `geoid` have no CLI default and must be supplied.
-    pub fn new(safe: PathBuf, dem: PathBuf, output: PathBuf, geoid: String) -> Self {
+    /// `dem` defaults to `None` (auto-download).
+    pub fn new(safe: PathBuf, dem: Option<PathBuf>, output: PathBuf, geoid: String) -> Self {
         Self {
             safe,
             dem,
@@ -237,7 +240,9 @@ pub struct InsarOptions {
     /// If `output_phase = true`, `<output>_iw1_phase.tif` is also written.
     pub output: PathBuf,
     /// Directory containing DEM tiles for terrain correction and geocoding.
-    pub dem: PathBuf,
+    /// `None` → auto-download SRTM-1 tiles into `$SARDINE_DEM_DIR` /
+    /// `$HOME/.sardine/dem/`.
+    pub dem: Option<PathBuf>,
     /// Path to a POEORB `.EOF` file for the reference scene.
     pub reference_orbit: Option<PathBuf>,
     /// Path to a POEORB `.EOF` file for the secondary scene.
@@ -259,8 +264,9 @@ pub struct InsarOptions {
 }
 
 impl InsarOptions {
-    /// Construct with CLI defaults.  `reference`, `secondary`, `output`, and `dem` are required.
-    pub fn new(reference: PathBuf, secondary: PathBuf, output: PathBuf, dem: PathBuf) -> Self {
+    /// Construct with CLI defaults.  `reference`, `secondary`, and `output` are required.
+    /// `dem` defaults to `None` (auto-download).
+    pub fn new(reference: PathBuf, secondary: PathBuf, output: PathBuf, dem: Option<PathBuf>) -> Self {
         Self {
             reference,
             secondary,

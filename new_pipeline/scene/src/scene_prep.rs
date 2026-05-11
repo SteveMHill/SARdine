@@ -323,6 +323,88 @@ fn orbit_cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".sardine").join("orbits"))
 }
 
+/// Resolve the DEM for a scene bounding box, ensuring all required SRTM-1
+/// tiles are present and returning the directory to pass to
+/// [`crate::dem::DemMosaic::load_directory`].
+///
+/// Resolution order:
+///
+/// 1. **`dem_override` is `Some(dir)`** — use that directory directly.
+///    No network access; the caller is responsible for tile coverage.
+///
+/// 2. **`dem-fetch` feature is enabled (the default)** — locate the DEM
+///    cache directory (`$SARDINE_DEM_DIR` or `$HOME/.sardine/dem/`),
+///    then call [`crate::dem_fetch::fetch_dem_tiles`] to download any
+///    missing tiles.  Already-cached tiles are reused without re-downloading.
+///
+/// Any other combination returns an explicit error.
+///
+/// `bb` is the scene bounding box used to compute which tiles are required.
+pub(crate) fn resolve_dem(
+    dem_override: Option<&Path>,
+    bb: &crate::types::BoundingBox,
+) -> Result<PathBuf> {
+    // ── Path 1: explicit directory ────────────────────────────────────────
+    if let Some(dir) = dem_override {
+        return Ok(dir.to_path_buf());
+    }
+
+    // ── Path 2: auto-download (dem-fetch feature) ─────────────────────────
+    #[cfg(feature = "dem-fetch")]
+    {
+        let cache_dir = dem_cache_dir()
+            .with_context(|| "resolving DEM cache directory")?;
+
+        tracing::info!(
+            "auto-downloading SRTM-1 tiles for bbox \
+             [{:.3}°N, {:.3}°N] × [{:.3}°E, {:.3}°E] …",
+            bb.min_lat_deg, bb.max_lat_deg,
+            bb.min_lon_deg, bb.max_lon_deg,
+        );
+
+        let dir = crate::dem_fetch::fetch_dem_tiles(
+            bb.min_lat_deg,
+            bb.max_lat_deg,
+            bb.min_lon_deg,
+            bb.max_lon_deg,
+            &cache_dir,
+        )
+        .with_context(|| {
+            format!(
+                "auto-downloading SRTM-1 DEM tiles for bbox \
+                 [{:.3}°N, {:.3}°N] × [{:.3}°E, {:.3}°E]. \
+                 Supply --dem <dir> to use a local tile directory.",
+                bb.min_lat_deg, bb.max_lat_deg,
+                bb.min_lon_deg, bb.max_lon_deg,
+            )
+        })?;
+
+        return Ok(dir);
+    }
+
+    // ── Path 3: no dem-fetch feature, no override — explicit error ────────
+    #[cfg(not(feature = "dem-fetch"))]
+    bail!(
+        "No --dem directory provided and the `dem-fetch` feature is disabled.\n\
+         Supply a directory of SRTM-1 `.hgt` tiles with --dem <dir>, or \
+         rebuild with `--features dem-fetch` to enable automatic tile download."
+    );
+}
+
+/// Resolve the DEM cache directory.
+///
+/// Checks `$SARDINE_DEM_DIR` first; falls back to `$HOME/.sardine/dem/`.
+fn dem_cache_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("SARDINE_DEM_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var("HOME").with_context(|| {
+        "HOME environment variable not set and SARDINE_DEM_DIR not set; \
+         cannot locate DEM cache directory"
+    })?;
+    Ok(PathBuf::from(home).join(".sardine").join("dem"))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry points
 // ─────────────────────────────────────────────────────────────────────────────

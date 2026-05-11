@@ -116,9 +116,15 @@ struct ProcessArgs {
     #[arg(long, value_name = "PATH", num_args = 1..)]
     safe: Vec<PathBuf>,
 
-    /// Directory containing SRTM1 DEM GeoTIFF tiles.
+    /// Directory containing SRTM-1 DEM tiles.
+    ///
+    /// **Omit for automatic download (default behaviour).**  When not
+    /// supplied, the pipeline downloads the required SRTM-1 `.hgt` tiles
+    /// from the AWS Open Data bucket and caches them under `$SARDINE_DEM_DIR`
+    /// (or `$HOME/.sardine/dem/`) for future runs.  An explicit path always
+    /// takes precedence over the download cache.
     #[arg(long, value_name = "DIR")]
-    dem: PathBuf,
+    dem: Option<PathBuf>,
 
     /// Output path for the dB GeoTIFF (written as Float32 GeoTIFF).
     #[arg(long, value_name = "PATH")]
@@ -631,8 +637,13 @@ struct InsarArgs {
     output: PathBuf,
 
     /// Directory containing DEM tiles for geocoding (SRTM-1 or compatible).
+    ///
+    /// **Omit for automatic download (default behaviour).**  When not
+    /// supplied, the pipeline downloads the required SRTM-1 `.hgt` tiles
+    /// from the AWS Open Data bucket and caches them under `$SARDINE_DEM_DIR`
+    /// (or `$HOME/.sardine/dem/`).
     #[arg(long, value_name = "DIR")]
-    dem: PathBuf,
+    dem: Option<PathBuf>,
 
     /// Path to a POEORB `.EOF` orbit file for the reference scene.
     ///
@@ -731,8 +742,9 @@ struct BatchEntry {
     /// Primary (or only) SAFE path.  May be a string or array of strings
     /// (first element = primary, remainder = extra slices, ascending time order).
     safe: OneOrMany,
-    /// Directory containing SRTM1 DEM tiles.
-    dem: PathBuf,
+    /// Directory containing SRTM-1 DEM tiles.  Omit for automatic download.
+    #[serde(default)]
+    dem: Option<PathBuf>,
     /// Output path for the dB GeoTIFF.
     output: PathBuf,
     /// Geoid: `"auto"`, `"zero"`, or path to EGM96 `.bin`/`.gtx`/`.GRD` file.

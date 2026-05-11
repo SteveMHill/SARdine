@@ -13,10 +13,11 @@ keywords = ["sentinel-1", "sar", "remote-sensing", "geospatial", "radar"]
 categories = ["science::geo"]
 
 [features]
-default      = ["orbit-fetch"]
+default      = ["orbit-fetch", "dem-fetch"]
 orbit-fetch  = ["dep:ureq"]
 slc-fetch    = ["dep:ureq"]
 geoid-fetch  = ["dep:ureq"]
+dem-fetch    = ["dep:ureq", "dep:flate2"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -28,6 +29,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "2", optional = true }
+flate2 = { version = "1", optional = true }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tiff = "0.11.3"

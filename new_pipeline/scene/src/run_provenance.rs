@@ -162,8 +162,10 @@ pub(crate) fn build_provenance(
         .to_owned();
     let dem_dir_str = opts
         .dem
-        .to_str()
-        .ok_or_else(|| anyhow!("--dem path contains non-UTF-8 characters"))?
+        .as_deref()
+        .map(|p| p.to_str().ok_or_else(|| anyhow!("--dem path contains non-UTF-8 characters")))
+        .transpose()?
+        .unwrap_or("auto") // SAFETY-OK: provenance display only — None means auto-downloaded
         .to_owned();
     let orbit_file_path = match orbit_source {
         crate::provenance::OrbitSource::Poeorb => Some(

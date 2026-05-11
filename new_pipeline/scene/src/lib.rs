@@ -17,6 +17,7 @@ pub mod calibration;
 pub mod cog;
 pub mod deburst;
 pub mod dem;
+pub mod dem_fetch;
 pub mod export;
 pub mod geodesy;
 pub mod geoid;

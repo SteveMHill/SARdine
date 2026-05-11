@@ -252,10 +252,12 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
         report_timing("speckle_before_tc", t_speckle);
     }
 
-    tracing::info!("loading DEM mosaic from {} …", opts.dem.display());
+    tracing::info!("resolving DEM …");
     let t_dem = Instant::now();
-    let dem = DemMosaic::load_directory(&opts.dem)
-        .with_context(|| format!("loading DEM from: {}", opts.dem.display()))?;
+    let dem_dir = crate::scene_prep::resolve_dem(opts.dem.as_deref(), &scene.bounding_box)
+        .with_context(|| "resolving DEM")?;
+    let dem = DemMosaic::load_directory(&dem_dir)
+        .with_context(|| format!("loading DEM from: {}", dem_dir.display()))?;
     report_timing("dem_load", t_dem);
 
     let bb = scene.bounding_box;
@@ -274,8 +276,8 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     )
     .with_context(|| {
         format!(
-            "DEM mosaic at {} does not cover the scene footprint",
-            opts.dem.display()
+            "DEM tiles in {} do not cover the scene footprint",
+            dem_dir.display()
         )
     })?;
 
@@ -758,17 +760,19 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     );
 
     // ── Load DEM ─────────────────────────────────────────────────────────────
-    tracing::info!("loading DEM from {} …", opts.dem.display());
+    tracing::info!("resolving DEM …");
     let t_dem = Instant::now();
-    let dem = DemMosaic::load_directory(&opts.dem)
-        .with_context(|| format!("loading DEM: {}", opts.dem.display()))?;
+    let dem_dir = crate::scene_prep::resolve_dem(opts.dem.as_deref(), &ref_scene.bounding_box)
+        .with_context(|| "resolving DEM")?;
+    let dem = DemMosaic::load_directory(&dem_dir)
+        .with_context(|| format!("loading DEM from: {}", dem_dir.display()))?;
     report_timing("dem_load", t_dem);
 
     let bb = ref_scene.bounding_box;
     dem.covers_bbox(bb.min_lat_deg, bb.max_lat_deg, bb.min_lon_deg, bb.max_lon_deg, 0.05)
         .with_context(|| format!(
-            "DEM at {} does not cover reference scene footprint",
-            opts.dem.display()
+            "DEM tiles in {} do not cover reference scene footprint",
+            dem_dir.display()
         ))?;
 
     // ── Parse reference geolocation grids (TC initial-guess LUT) ─────────────
@@ -1380,7 +1384,7 @@ mod multipol_tests {
         // fails up-front.  Paths can be bogus.
         let opts = ProcessOptions {
             safe: PathBuf::from("/no/such/safe.SAFE"),
-            dem: PathBuf::from("/no/such/dem"),
+            dem: Some(PathBuf::from("/no/such/dem")),
             output: PathBuf::from("/tmp/no_such_out.tif"),
             orbit: None,
             polarization: "HH".to_owned(),
