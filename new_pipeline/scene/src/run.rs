@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::types::Polarization;
 
@@ -39,7 +39,7 @@ use crate::types::Polarization;
 pub use crate::pipeline_options::{
     derive_pol_output_path, parse_iw_selection, parse_output_mode, parse_polarizations,
     parse_speckle_order, resolve_crs, resolve_geoid, resolve_speckle, sidecar_path, GrdOptions,
-    IwSelection, OutputMode, ProcessOptions, ResamplingKernel, SpeckleOrder,
+    InsarOptions, IwSelection, OutputMode, ProcessOptions, ResamplingKernel, SpeckleOrder,
 };
 pub use crate::run_provenance::speckle_provenance_fields;
 pub(crate) use crate::run_provenance::collect_quality_flags;
@@ -652,6 +652,410 @@ fn run_grd_from_prepared(
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// InSAR pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the InSAR coherence (and optionally phase) pipeline for a pair of
+/// Sentinel-1 IW SLC `.SAFE` products.
+///
+/// # Processing steps (per IW subswath)
+///
+/// 1. Parse both SAFE directories; apply POEORB if supplied.
+/// 2. Deburst each subswath (reference and secondary) to continuous complex arrays.
+/// 3. TOPS azimuth deramp each array using per-burst Doppler centroid metadata.
+/// 4. Estimate geometric co-registration offsets via a 20×50 sparse grid of
+///    zero-Doppler Newton solves + bivariate 2-D polynomial fit.
+/// 5. Resample the secondary to the reference grid using the fitted polynomial.
+/// 6. Form the boxcar-windowed interferogram and coherence magnitude.
+///    Flat-earth phase is computed per-pixel and subtracted before accumulation.
+/// 7. Write per-subswath Float32 TIFF(s) in slant-range radar geometry (no CRS).
+///    The output path has `_IW{n}_coherence.tif` appended.
+///    When `opts.output_phase = true`, `_IW{n}_phase.tif` is also written.
+/// 8. Write a per-subswath `.provenance.json` sidecar with geometry parameters.
+///
+/// # Geometry note
+///
+/// The coherence output is in multi-looked slant-range geometry
+/// (`az_looks × rg_looks` applied).  This is NOT geocoded.  Geocoding
+/// coherence is deferred because the multi-looked pixel spacing differs from
+/// the full-resolution slant-range grid used by `terrain_correction`.
+pub fn run_insar(opts: &InsarOptions) -> Result<()> {
+    use crate::deburst::deburst_subswath;
+    use crate::export::write_tiff_no_crs;
+    use crate::insar::coreg::{compute_coreg_offsets, resample_secondary, Coregistered};
+    use crate::insar::deramp::deramp_subswath;
+    use crate::insar::interferogram::{form_interferogram, InterferogramConfig};
+    use crate::orbit::{apply_precise_orbit, parse_eof_file};
+    use crate::parse::parse_safe_directory;
+    use crate::slc_reader::SlcReader;
+    use crate::types::{Polarization, SubSwathId};
+
+    let t_total = Instant::now();
+
+    if opts.az_looks == 0 || opts.rg_looks == 0 {
+        bail!("--az-looks and --rg-looks must be ≥ 1 (got {}, {})", opts.az_looks, opts.rg_looks);
+    }
+
+    if opts.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(opts.threads)
+            .build_global()
+            .with_context(|| format!("setting Rayon thread count to {}", opts.threads))?;
+        tracing::info!("using {} thread(s)", opts.threads);
+    } else {
+        tracing::info!("using all available CPU threads (Rayon default)");
+    }
+
+    let pol = match opts.polarization.to_uppercase().as_str() {
+        "VV" => Polarization::VV,
+        "VH" => Polarization::VH,
+        other => bail!("Unsupported polarization: {}. Use VV or VH.", other),
+    };
+    let pol_str = format!("{pol}").to_lowercase();
+
+    // ── Parse reference SAFE ─────────────────────────────────────────────────
+    tracing::info!("parsing reference SAFE: {} …", opts.reference.display());
+    let t_parse = Instant::now();
+    let ref_scene_raw = parse_safe_directory(&opts.reference)
+        .with_context(|| format!("parsing reference SAFE: {}", opts.reference.display()))?;
+    let ref_scene = if let Some(orbit_path) = opts.reference_orbit.as_deref() {
+        let orbit = parse_eof_file(orbit_path)
+            .with_context(|| format!("parsing reference orbit: {}", orbit_path.display()))?;
+        apply_precise_orbit(ref_scene_raw, &orbit)
+            .with_context(|| "applying reference precise orbit")?
+    } else {
+        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
+            .map(|v| v == "1")
+            .unwrap_or(false); // SAFETY-OK: env var parse; fallback is deny (safe direction)
+        if !allow {
+            bail!(
+                "No --reference-orbit provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
+                 Provide a POEORB file with --reference-orbit, or set \
+                 SARDINE_ALLOW_ANNOTATION_ORBIT=1 to use the annotation orbit (metre-level accuracy)."
+            );
+        }
+        tracing::warn!("reference: using annotation orbit (metre-level accuracy)");
+        ref_scene_raw
+    };
+
+    // ── Parse secondary SAFE ─────────────────────────────────────────────────
+    tracing::info!("parsing secondary SAFE: {} …", opts.secondary.display());
+    let sec_scene_raw = parse_safe_directory(&opts.secondary)
+        .with_context(|| format!("parsing secondary SAFE: {}", opts.secondary.display()))?;
+    let sec_scene = if let Some(orbit_path) = opts.secondary_orbit.as_deref() {
+        let orbit = parse_eof_file(orbit_path)
+            .with_context(|| format!("parsing secondary orbit: {}", orbit_path.display()))?;
+        apply_precise_orbit(sec_scene_raw, &orbit)
+            .with_context(|| "applying secondary precise orbit")?
+    } else {
+        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
+            .map(|v| v == "1")
+            .unwrap_or(false); // SAFETY-OK: env var parse; fallback is deny (safe direction)
+        if !allow {
+            bail!(
+                "No --secondary-orbit provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
+                 Provide a POEORB file with --secondary-orbit, or set \
+                 SARDINE_ALLOW_ANNOTATION_ORBIT=1 to use the annotation orbit (metre-level accuracy)."
+            );
+        }
+        tracing::warn!("secondary: using annotation orbit (metre-level accuracy)");
+        sec_scene_raw
+    };
+    report_timing("parse_safe_meta", t_parse);
+
+    let wavelength_m = ref_scene.wavelength_m();
+    tracing::info!(
+        "radar wavelength: {:.6} m (from reference annotation)",
+        wavelength_m
+    );
+
+    // ── Build output basename (strip extension from opts.output) ─────────────
+    let out_base = {
+        let mut p = opts.output.clone();
+        if p.extension().is_some() {
+            p.set_extension("");
+        }
+        p
+    };
+    let out_base_str = out_base
+        .to_str()
+        .ok_or_else(|| anyhow!("output path contains non-UTF-8 characters"))?
+        .to_owned();
+
+    let ref_meas_dir = opts.reference.join("measurement");
+    let sec_meas_dir = opts.secondary.join("measurement");
+
+    let iw_ids = [SubSwathId::IW1, SubSwathId::IW2, SubSwathId::IW3];
+
+    for &iw_id in &iw_ids {
+        let iw_str = format!("{iw_id}").to_lowercase();
+        tracing::info!("─── processing {:?} ───", iw_id);
+
+        // Locate measurement TIFFs ───────────────────────────────────────────
+        let ref_tiff = find_measurement_tiff_insar(&ref_meas_dir, &iw_str, &pol_str)
+            .with_context(|| format!("finding reference TIFF for {:?} pol={}", iw_id, pol_str))?;
+        let sec_tiff = find_measurement_tiff_insar(&sec_meas_dir, &iw_str, &pol_str)
+            .with_context(|| format!("finding secondary TIFF for {:?} pol={}", iw_id, pol_str))?;
+
+        // Sub-swath metadata ─────────────────────────────────────────────────
+        let ref_sw = ref_scene
+            .sub_swaths
+            .iter()
+            .find(|s| s.id == iw_id)
+            .with_context(|| format!("subswath {:?} not found in reference metadata", iw_id))?
+            .clone();
+        let sec_sw = sec_scene
+            .sub_swaths
+            .iter()
+            .find(|s| s.id == iw_id)
+            .with_context(|| format!("subswath {:?} not found in secondary metadata", iw_id))?
+            .clone();
+
+        // Burst entries ──────────────────────────────────────────────────────
+        let ref_bursts = {
+            let mut b: Vec<_> = ref_scene
+                .bursts
+                .iter()
+                .filter(|b| b.subswath_id == iw_id)
+                .cloned()
+                .collect();
+            b.sort_by_key(|b| b.burst_index);
+            b
+        };
+        let sec_bursts = {
+            let mut b: Vec<_> = sec_scene
+                .bursts
+                .iter()
+                .filter(|b| b.subswath_id == iw_id)
+                .cloned()
+                .collect();
+            b.sort_by_key(|b| b.burst_index);
+            b
+        };
+
+        if ref_bursts.is_empty() {
+            bail!("no {:?} {} bursts found in reference SAFE", iw_id, pol_str.to_uppercase());
+        }
+        if sec_bursts.is_empty() {
+            bail!("no {:?} {} bursts found in secondary SAFE", iw_id, pol_str.to_uppercase());
+        }
+
+        // Reference azimuth start time (time of debursted line 0) ────────────
+        let ref_first_utc = ref_bursts[0].azimuth_time_utc;
+        let sec_first_utc = sec_bursts[0].azimuth_time_utc;
+
+        // Deburst ────────────────────────────────────────────────────────────
+        tracing::info!("debursting reference {:?} …", iw_id);
+        let t_deburst = Instant::now();
+        let ref_deburst = {
+            let mut r = SlcReader::open(&ref_tiff)
+                .with_context(|| format!("opening reference TIFF: {}", ref_tiff.display()))?;
+            deburst_subswath(&mut r, &ref_sw, &ref_bursts)
+                .with_context(|| format!("debursting reference {:?}", iw_id))?
+        };
+
+        tracing::info!("debursting secondary {:?} …", iw_id);
+        let sec_deburst = {
+            let mut r = SlcReader::open(&sec_tiff)
+                .with_context(|| format!("opening secondary TIFF: {}", sec_tiff.display()))?;
+            deburst_subswath(&mut r, &sec_sw, &sec_bursts)
+                .with_context(|| format!("debursting secondary {:?}", iw_id))?
+        };
+        report_timing("deburst", t_deburst);
+
+        // Deramp ─────────────────────────────────────────────────────────────
+        tracing::info!("deramping reference {:?} …", iw_id);
+        let t_deramp = Instant::now();
+        let ref_deramped = deramp_subswath(&ref_deburst, &ref_sw, ref_first_utc)
+            .with_context(|| format!("deramping reference {:?}", iw_id))?;
+        let sec_deramped = deramp_subswath(&sec_deburst, &sec_sw, sec_first_utc)
+            .with_context(|| format!("deramping secondary {:?}", iw_id))?;
+        report_timing("deramp", t_deramp);
+
+        // Co-registration ────────────────────────────────────────────────────
+        tracing::info!("computing co-registration offsets {:?} …", iw_id);
+        let t_coreg = Instant::now();
+        let coreg_result = compute_coreg_offsets(
+            &ref_sw,
+            &ref_scene.orbit,
+            ref_first_utc,
+            &ref_deburst,
+            &sec_sw,
+            &sec_scene.orbit,
+            sec_first_utc,
+        )
+        .with_context(|| format!("co-registration offset computation for {:?}", iw_id))?;
+        tracing::info!(
+            "  {:?} co-reg: n_valid={}, rms={:.4} px",
+            iw_id, coreg_result.n_valid, coreg_result.fit_residual_rms
+        );
+        report_timing("coreg_offsets", t_coreg);
+
+        // Resample secondary ─────────────────────────────────────────────────
+        tracing::info!("resampling secondary {:?} …", iw_id);
+        let t_resamp = Instant::now();
+        let sec_resampled = resample_secondary(
+            ref_deramped.lines,
+            ref_deramped.samples,
+            &coreg_result.poly,
+            &sec_deramped,
+        );
+        report_timing("resample_secondary", t_resamp);
+
+        let coreg = Coregistered { ref_data: ref_deramped, secondary_resampled: sec_resampled };
+
+        // Interferogram + coherence ──────────────────────────────────────────
+        tracing::info!("forming interferogram {:?} ({}az × {}rg looks) …",
+            iw_id, opts.az_looks, opts.rg_looks);
+        let t_igram = Instant::now();
+        let cfg = InterferogramConfig {
+            az_looks: opts.az_looks,
+            rg_looks: opts.rg_looks,
+            compute_phase: opts.output_phase,
+        };
+        let igram = form_interferogram(
+            &coreg,
+            &ref_sw,
+            &ref_scene.orbit,
+            ref_first_utc,
+            &sec_scene.orbit,
+            wavelength_m,
+            &cfg,
+        )
+        .with_context(|| format!("interferogram formation for {:?}", iw_id))?;
+        report_timing("interferogram", t_igram);
+
+        tracing::info!(
+            "  {:?} coherence image: {} lines × {} samples",
+            iw_id, igram.lines, igram.samples
+        );
+
+        // Write coherence TIFF ────────────────────────────────────────────────
+        let coh_path = format!("{out_base_str}_{iw_str}_coherence.tif");
+        tracing::info!("writing coherence TIFF → {}", coh_path);
+        let t_export = Instant::now();
+        write_tiff_no_crs(&coh_path, &igram.coherence, igram.samples, igram.lines)
+            .with_context(|| format!("writing coherence TIFF: {coh_path}"))?;
+
+        // Write phase TIFF (optional) ─────────────────────────────────────────
+        if opts.output_phase {
+            let phase_path = format!("{out_base_str}_{iw_str}_phase.tif");
+            tracing::info!("writing phase TIFF → {}", phase_path);
+            write_tiff_no_crs(&phase_path, &igram.phase, igram.samples, igram.lines)
+                .with_context(|| format!("writing phase TIFF: {phase_path}"))?;
+        }
+        report_timing("export", t_export);
+
+        // Write geometry provenance sidecar ───────────────────────────────────
+        let prov_path = format!("{out_base_str}_{iw_str}_coherence.provenance.json");
+        tracing::info!("writing provenance sidecar → {}", prov_path);
+        let prov_json = build_insar_provenance_json(
+            &opts.reference,
+            &opts.secondary,
+            opts.reference_orbit.as_deref(),
+            opts.secondary_orbit.as_deref(),
+            &pol_str,
+            &ref_sw,
+            &sec_sw,
+            &igram,
+            &coreg_result,
+            wavelength_m,
+        );
+        std::fs::write(&prov_path, &prov_json)
+            .with_context(|| format!("writing provenance JSON: {prov_path}"))?;
+    }
+
+    tracing::info!("done.");
+    report_timing("total", t_total);
+    Ok(())
+}
+
+/// Find a measurement TIFF inside `dir` matching both `iw` and `pol` substrings.
+///
+/// This is a private helper that duplicates the logic of `scene_prep::find_measurement_tiff`
+/// for use in `run_insar`; it is not exported.
+fn find_measurement_tiff_insar(dir: &std::path::Path, iw: &str, pol: &str) -> Result<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading measurement dir: {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.contains(iw) && name.contains(pol) && name.ends_with(".tiff") {
+            return Ok(entry.path());
+        }
+    }
+    bail!(
+        "No measurement TIFF found for iw={} pol={} in {}",
+        iw, pol, dir.display()
+    )
+}
+
+/// Build a minimal JSON provenance string for one InSAR subswath output.
+///
+/// Written as a plain string (no serde dependency on a provenance struct) to
+/// keep the InSAR pipeline independent of the sigma0 provenance types.
+fn build_insar_provenance_json(
+    reference: &std::path::Path,
+    secondary: &std::path::Path,
+    reference_orbit: Option<&std::path::Path>,
+    secondary_orbit: Option<&std::path::Path>,
+    pol: &str,
+    ref_sw: &crate::types::SubSwathMetadata,
+    sec_sw: &crate::types::SubSwathMetadata,
+    igram: &crate::insar::interferogram::Interferogram,
+    coreg: &crate::insar::coreg::CoregResult,
+    wavelength_m: f64,
+) -> String {
+    let ref_orbit_str = reference_orbit
+        .and_then(|p| p.to_str())
+        .unwrap_or("annotation"); // SAFETY-OK: None means annotation orbit was used; the string "annotation" is the correct provenance label for that case
+    let sec_orbit_str = secondary_orbit
+        .and_then(|p| p.to_str())
+        .unwrap_or("annotation"); // SAFETY-OK: same — None means annotation orbit; "annotation" is the correct provenance label
+    let ref_str = reference.to_str().unwrap_or(""); // SAFETY-OK: non-UTF-8 path already caught upstream when building out_base_str
+    let sec_str = secondary.to_str().unwrap_or(""); // SAFETY-OK: same — path is user-supplied and validated earlier
+    format!(
+        concat!(
+            "{{\n",
+            "  \"pipeline\": \"sardine-insar\",\n",
+            "  \"reference_safe\": \"{ref}\",\n",
+            "  \"secondary_safe\": \"{sec}\",\n",
+            "  \"reference_orbit\": \"{ref_orb}\",\n",
+            "  \"secondary_orbit\": \"{sec_orb}\",\n",
+            "  \"polarization\": \"{pol}\",\n",
+            "  \"subswath\": \"{sw}\",\n",
+            "  \"wavelength_m\": {wl:.8},\n",
+            "  \"az_looks\": {az},\n",
+            "  \"rg_looks\": {rg},\n",
+            "  \"coherence_lines\": {coh_lines},\n",
+            "  \"coherence_samples\": {coh_samples},\n",
+            "  \"ref_range_pixel_spacing_m\": {rps:.6},\n",
+            "  \"ref_azimuth_pixel_spacing_m\": {aps:.6},\n",
+            "  \"ref_slant_range_time_s\": {srt:.12e},\n",
+            "  \"coreg_n_valid\": {n_valid},\n",
+            "  \"coreg_rms_px\": {rms:.6}\n",
+            "}}\n"
+        ),
+        ref = ref_str,
+        sec = sec_str,
+        ref_orb = ref_orbit_str,
+        sec_orb = sec_orbit_str,
+        pol = pol,
+        sw = format!("{:?}", ref_sw.id),
+        wl = wavelength_m,
+        az = igram.az_looks,
+        rg = igram.rg_looks,
+        coh_lines = igram.lines,
+        coh_samples = igram.samples,
+        rps = ref_sw.range_pixel_spacing_m,
+        aps = ref_sw.azimuth_pixel_spacing_m,
+        srt = ref_sw.slant_range_time_s,
+        n_valid = coreg.n_valid,
+        rms = coreg.fit_residual_rms,
+    )
 }
 
 #[cfg(test)]

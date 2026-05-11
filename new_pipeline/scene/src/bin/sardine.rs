@@ -2,6 +2,7 @@
 //!
 //! # Subcommands
 //! - `process`       — Full pipeline: deburst → calibration → merge → terrain-correction → dB → GeoTIFF
+//! - `insar`         — InSAR coherence (and optionally phase) for an SLC pair (no geocoding)
 //! - `fetch-orbit`   — Download POEORB for a SAFE product (requires `--features orbit-fetch`)
 //! - `download-slc`  — Download a Sentinel-1 IW SLC SAFE from ASF datapool (requires `--features slc-fetch`)
 //! - `inspect`       — Print scene metadata (bounding box, polarizations, burst count, timing)
@@ -18,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 
 use sardine_scene::parse::parse_safe_directory;
 use sardine_scene::run::{
-    GrdOptions, IwSelection, ProcessOptions,
+    GrdOptions, InsarOptions, IwSelection, ProcessOptions,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,6 +62,14 @@ enum Commands {
     /// non-georeferenced TIFF — radar geometry cannot be honestly
     /// expressed in EPSG:4326.
     Grd(GrdArgs),
+
+    /// Produce coherence (and optionally wrapped phase) for an InSAR pair.
+    ///
+    /// Processes all three IW sub-swaths.  Output files are written with
+    /// per-subswath suffixes (`_IW1_coherence.tif`, etc.) appended to the
+    /// `--output` basename.  No geocoding is performed; output is in
+    /// slant-range radar geometry (non-georeferenced TIFF).
+    Insar(InsarArgs),
 
     /// Process multiple scenes from a JSON batch file.
     ///
@@ -597,6 +606,81 @@ fn cmd_grd(args: GrdArgs) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// insar subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct InsarArgs {
+    /// Path to the reference (master) Sentinel-1 IW SLC `.SAFE` directory.
+    #[arg(long, value_name = "PATH")]
+    reference: PathBuf,
+
+    /// Path to the secondary (slave) Sentinel-1 IW SLC `.SAFE` directory.
+    #[arg(long, value_name = "PATH")]
+    secondary: PathBuf,
+
+    /// Output basename.  Per-subswath suffixes are appended automatically:
+    ///   `<output>_iw1_coherence.tif`, `<output>_iw2_coherence.tif`, etc.
+    ///
+    /// If `--output-phase` is set, `<output>_iw1_phase.tif` etc. are also written.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Path to a POEORB `.EOF` file for the reference scene.
+    ///
+    /// If omitted, the annotation orbit is used only when
+    /// `SARDINE_ALLOW_ANNOTATION_ORBIT=1` is set.
+    #[arg(long, value_name = "FILE")]
+    reference_orbit: Option<PathBuf>,
+
+    /// Path to a POEORB `.EOF` file for the secondary scene.
+    ///
+    /// If omitted, the annotation orbit is used only when
+    /// `SARDINE_ALLOW_ANNOTATION_ORBIT=1` is set.
+    #[arg(long, value_name = "FILE")]
+    secondary_orbit: Option<PathBuf>,
+
+    /// Polarization channel: `VV` (default) or `VH`.
+    #[arg(long, value_name = "POL", default_value = "VV")]
+    polarization: String,
+
+    /// Azimuth window size (lines) for coherence estimation.
+    #[arg(long, value_name = "N", default_value_t = sardine_scene::insar::interferogram::DEFAULT_COH_AZ_LOOKS)]
+    az_looks: usize,
+
+    /// Range window size (samples) for coherence estimation.
+    #[arg(long, value_name = "N", default_value_t = sardine_scene::insar::interferogram::DEFAULT_COH_RG_LOOKS)]
+    rg_looks: usize,
+
+    /// Also write the wrapped interferometric phase as `<output>_iw{n}_phase.tif`.
+    ///
+    /// **Note**: Phase correctness requires validated flat-earth deramping.
+    /// For coherence-only products, omit this flag.
+    #[arg(long)]
+    output_phase: bool,
+
+    /// Number of processing threads.  0 = use all available CPU cores (default).
+    #[arg(long, value_name = "N", default_value_t = 0usize)]
+    threads: usize,
+}
+
+fn cmd_insar(args: InsarArgs) -> Result<()> {
+    let opts = InsarOptions {
+        reference: args.reference,
+        secondary: args.secondary,
+        output: args.output,
+        reference_orbit: args.reference_orbit,
+        secondary_orbit: args.secondary_orbit,
+        polarization: args.polarization,
+        az_looks: args.az_looks,
+        rg_looks: args.rg_looks,
+        output_phase: args.output_phase,
+        threads: args.threads,
+    };
+    sardine_scene::run::run_insar(&opts)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // batch subcommand
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -825,6 +909,7 @@ fn main() -> ExitCode {
         Commands::DownloadSlc(args) => cmd_download_slc(args),
         Commands::Inspect(args) => cmd_inspect(args),
         Commands::Grd(args) => cmd_grd(args),
+        Commands::Insar(args) => cmd_insar(args),
         Commands::Batch(args) => cmd_batch(args),
     };
     match result {

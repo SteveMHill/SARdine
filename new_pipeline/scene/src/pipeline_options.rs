@@ -223,6 +223,53 @@ impl GrdOptions {
     }
 }
 
+/// Plain (non-clap) input set for [`crate::run::run_insar`].
+///
+/// Mirrors the `sardine insar` CLI flags one-to-one.
+#[derive(Debug, Clone)]
+pub struct InsarOptions {
+    /// Path to the reference (master) Sentinel-1 IW SLC `.SAFE` directory.
+    pub reference: PathBuf,
+    /// Path to the secondary (slave) Sentinel-1 IW SLC `.SAFE` directory.
+    pub secondary: PathBuf,
+    /// Output basename.  Per-subswath suffixes are appended:
+    /// `<output>_IW1_coherence.tif`, `<output>_IW2_coherence.tif`, etc.
+    /// If `output_phase = true`, `<output>_IW1_phase.tif` is also written.
+    pub output: PathBuf,
+    /// Path to a POEORB `.EOF` file for the reference scene.
+    pub reference_orbit: Option<PathBuf>,
+    /// Path to a POEORB `.EOF` file for the secondary scene.
+    pub secondary_orbit: Option<PathBuf>,
+    /// Polarization channel: `"VV"` or `"VH"`.
+    pub polarization: String,
+    /// Azimuth multi-look factor (coherence window height in SLC lines).
+    pub az_looks: usize,
+    /// Range multi-look factor (coherence window width in SLC samples).
+    pub rg_looks: usize,
+    /// When true, also write the wrapped interferometric phase.
+    pub output_phase: bool,
+    /// Number of Rayon threads.  0 = use all available cores.
+    pub threads: usize,
+}
+
+impl InsarOptions {
+    /// Construct with CLI defaults.  `reference`, `secondary`, and `output` are required.
+    pub fn new(reference: PathBuf, secondary: PathBuf, output: PathBuf) -> Self {
+        Self {
+            reference,
+            secondary,
+            output,
+            reference_orbit: None,
+            secondary_orbit: None,
+            polarization: "VV".to_owned(),
+            az_looks: crate::insar::interferogram::DEFAULT_COH_AZ_LOOKS,
+            rg_looks: crate::insar::interferogram::DEFAULT_COH_RG_LOOKS,
+            output_phase: false,
+            threads: 0,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Resolver helpers
 // ─────────────────────────────────────────────────────────────────────────────
