@@ -474,7 +474,7 @@ fn cmd_download_slc(args: DownloadSlcArgs) -> Result<()> {
     {
         use chrono::Duration;
         use sardine_scene::slc_fetch::{
-            credentials_from_env, fetch_slc_result, search_slc, SlcCredentials,
+            credentials_from_env, fetch_slc_result, search_slc, ProgressFn, SlcCredentials,
             SlcFetchError, SlcSearchParams,
         };
 
@@ -531,19 +531,19 @@ fn cmd_download_slc(args: DownloadSlcArgs) -> Result<()> {
             })?;
 
         // Progress callback: emit to stderr via tracing.
-        let progress_fn = |done: u64, total: Option<u64>| {
+        let progress_fn: ProgressFn = std::sync::Arc::new(|done: u64, total: Option<u64>| {
             if let Some(t) = total {
                 tracing::info!("  {:.1} / {:.1} MB", done as f64 / 1e6, t as f64 / 1e6);
             } else {
                 tracing::info!("  {:.1} MB downloaded", done as f64 / 1e6);
             }
-        };
+        });
 
         let safe_path = fetch_slc_result(
             result,
             &args.output_dir,
             &creds,
-            Some(&progress_fn),
+            Some(progress_fn),
             !args.no_verify,
         )
         .map_err(|e: SlcFetchError| anyhow::anyhow!("{}", e))?;

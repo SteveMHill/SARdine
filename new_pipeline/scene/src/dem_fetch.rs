@@ -99,6 +99,14 @@ mod inner {
         /// Unknown DEM source string.
         #[error("Unknown DEM source '{0}': expected 'srtm1' or 'glo30'")]
         UnknownSource(String),
+
+        /// One or more parallel tile downloads failed.
+        ///
+        /// The inner string is the first error message collected from the
+        /// worker threads.  Full details are logged at `tracing::error!` level
+        /// by each failing worker before propagating.
+        #[error("parallel DEM tile download failed: {0}")]
+        Parallel(String),
     }
 
     // SRTM-1 raw tile size: 3601 × 3601 big-endian i16 values.
@@ -302,10 +310,30 @@ mod inner {
         }
     }
 
+    // ── Concurrency helper ────────────────────────────────────────────────
+
+    /// Number of parallel tile download threads.
+    ///
+    /// Reads `SARDINE_DEM_CONCURRENCY` from the environment; falls back to 4.
+    /// Values ≤ 0 or non-numeric are treated as 1 (sequential).
+    fn dem_concurrency() -> usize {
+        std::env::var("SARDINE_DEM_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(4) // SAFETY-OK: env var parse fallback; 4 is a safe default concurrency, not a physical constant
+    }
+
     // ── Public API ─────────────────────────────────────────────────────────
 
     /// Ensure all SRTM-1 tiles covering the given bounding box are present
     /// in `cache_dir`, downloading any that are missing.
+    ///
+    /// Missing tiles are downloaded in parallel using up to
+    /// `SARDINE_DEM_CONCURRENCY` threads (default 4).  Already-cached tiles
+    /// are skipped without any I/O.  The first download failure is returned
+    /// as [`DemFetchError::Parallel`]; partial `.tmp` files from failed
+    /// workers are cleaned up before returning.
     ///
     /// Returns `cache_dir` as a [`PathBuf`] ready for
     /// [`crate::dem::DemMosaic::load_directory`].
@@ -316,29 +344,68 @@ mod inner {
         max_lon: f64,
         cache_dir: &Path,
     ) -> Result<PathBuf, DemFetchError> {
+        use rayon::prelude::*;
+
         std::fs::create_dir_all(cache_dir)?;
 
         let corners = tiles_for_bbox(min_lat, max_lat, min_lon, max_lon);
 
-        for (lat, lon) in &corners {
-            let name = tile_name(*lat, *lon);
-            let dest = cache_dir.join(format!("{}.hgt", name));
-            if dest.exists() {
-                tracing::debug!("SRTM-1 tile {} already cached, skipping", name);
-                continue;
-            }
-            tracing::info!("downloading SRTM-1 tile {} …", name);
-            download_srtm1_tile(&name, &dest).map_err(|e| {
-                let tmp = dest.with_extension("hgt.tmp");
-                if tmp.exists() {
-                    let _ = std::fs::remove_file(&tmp); // SAFETY-OK: cleanup of failed download; removal failure leaves only a harmless .tmp file
+        // Partition: already-cached tiles are logged and skipped; only missing
+        // tiles enter the parallel download phase.
+        let missing: Vec<(String, PathBuf)> = corners
+            .into_iter()
+            .filter_map(|(lat, lon)| {
+                let name = tile_name(lat, lon);
+                let dest = cache_dir.join(format!("{}.hgt", name));
+                if dest.exists() {
+                    tracing::debug!("SRTM-1 tile {} already cached, skipping", name);
+                    None
+                } else {
+                    Some((name, dest))
                 }
-                e
-            })?;
-            tracing::info!("  → cached {}", dest.display());
+            })
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(cache_dir.to_path_buf());
         }
 
-        Ok(cache_dir.to_path_buf())
+        let n_threads = dem_concurrency();
+        tracing::info!(
+            "downloading {} SRTM-1 tile(s) with {} thread(s) …",
+            missing.len(),
+            n_threads,
+        );
+
+        // Build a scoped thread pool so DEM downloads never steal threads
+        // from the global rayon pool used by processing.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_threads)
+            .build()
+            .map_err(|e| DemFetchError::Parallel(format!("rayon pool build failed: {e}")))?;
+
+        let results: Vec<Result<(), DemFetchError>> = pool.install(|| {
+            missing.par_iter().map(|(name, dest)| {
+                tracing::info!("downloading SRTM-1 tile {} …", name);
+                download_srtm1_tile(name, dest).map_err(|e| {
+                    let tmp = dest.with_extension("hgt.tmp");
+                    if tmp.exists() {
+                        let _ = std::fs::remove_file(&tmp); // SAFETY-OK: cleanup of failed parallel download; removal failure leaves only a harmless .tmp file
+                    }
+                    tracing::error!("SRTM-1 tile {} failed: {}", name, e);
+                    e
+                })?;
+                tracing::info!("  → cached {}", dest.display());
+                Ok(())
+            }).collect()
+        });
+
+        // Collect errors: return the first failure, if any.
+        results
+            .into_iter()
+            .find(|r| r.is_err())
+            .map(|r| r.map(|_| cache_dir.to_path_buf()))
+            .unwrap_or(Ok(cache_dir.to_path_buf())) // SAFETY-OK: unwrap_or on the Ok branch of a find-none result; value is the success path
     }
 
     /// Ensure all Copernicus GLO-30 tiles covering the given bounding box are
@@ -346,6 +413,9 @@ mod inner {
     ///
     /// Tiles that do not exist on the server (open-ocean, HTTP 404) are
     /// silently skipped — the DEM mosaic marks those pixels as nodata.
+    ///
+    /// Missing tiles are downloaded in parallel using up to
+    /// `SARDINE_DEM_CONCURRENCY` threads (default 4).
     ///
     /// Returns the GLO-30 subdirectory as a [`PathBuf`] ready for
     /// [`crate::dem::DemMosaic::load_directory`].
@@ -356,32 +426,66 @@ mod inner {
         max_lon: f64,
         cache_dir: &Path,
     ) -> Result<PathBuf, DemFetchError> {
+        use rayon::prelude::*;
+
         let glo30_dir = cache_dir.join("glo30");
         std::fs::create_dir_all(&glo30_dir)?;
 
         let corners = tiles_for_bbox(min_lat, max_lat, min_lon, max_lon);
 
-        for (lat, lon) in &corners {
-            let stem = glo30_tile_name(*lat, *lon);
-            let dest = glo30_dir.join(format!("{}.tif", stem));
-            if dest.exists() {
-                tracing::debug!("GLO-30 tile {} already cached, skipping", stem);
-                continue;
-            }
-            tracing::info!("downloading GLO-30 tile {} …", stem);
-            let downloaded = download_glo30_tile(&stem, &dest).map_err(|e| {
-                let tmp = dest.with_extension("tif.tmp");
-                if tmp.exists() {
-                    let _ = std::fs::remove_file(&tmp); // SAFETY-OK: cleanup of failed download; removal failure leaves only a harmless .tmp file
+        let missing: Vec<(String, PathBuf)> = corners
+            .into_iter()
+            .filter_map(|(lat, lon)| {
+                let stem = glo30_tile_name(lat, lon);
+                let dest = glo30_dir.join(format!("{}.tif", stem));
+                if dest.exists() {
+                    tracing::debug!("GLO-30 tile {} already cached, skipping", stem);
+                    None
+                } else {
+                    Some((stem, dest))
                 }
-                e
-            })?;
-            if downloaded {
-                tracing::info!("  → cached {}", dest.display());
-            }
+            })
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(glo30_dir);
         }
 
-        Ok(glo30_dir)
+        let n_threads = dem_concurrency();
+        tracing::info!(
+            "downloading {} GLO-30 tile(s) with {} thread(s) …",
+            missing.len(),
+            n_threads,
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_threads)
+            .build()
+            .map_err(|e| DemFetchError::Parallel(format!("rayon pool build failed: {e}")))?;
+
+        let results: Vec<Result<(), DemFetchError>> = pool.install(|| {
+            missing.par_iter().map(|(stem, dest)| {
+                tracing::info!("downloading GLO-30 tile {} …", stem);
+                let downloaded = download_glo30_tile(stem, dest).map_err(|e| {
+                    let tmp = dest.with_extension("tif.tmp");
+                    if tmp.exists() {
+                        let _ = std::fs::remove_file(&tmp); // SAFETY-OK: cleanup of failed parallel download; removal failure leaves only a harmless .tmp file
+                    }
+                    tracing::error!("GLO-30 tile {} failed: {}", stem, e);
+                    e
+                })?;
+                if downloaded {
+                    tracing::info!("  → cached {}", dest.display());
+                }
+                Ok(())
+            }).collect()
+        });
+
+        results
+            .into_iter()
+            .find(|r| r.is_err())
+            .map(|r| r.map(|_| glo30_dir.clone()))
+            .unwrap_or(Ok(glo30_dir)) // SAFETY-OK: unwrap_or on the Ok branch of a find-none result; value is the success path
     }
 
     /// Dispatch to [`fetch_srtm1_tiles`] or [`fetch_glo30_tiles`] based on

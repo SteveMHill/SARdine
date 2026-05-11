@@ -34,8 +34,13 @@
 #[cfg(feature = "slc-fetch")]
 mod inner {
     use std::io::{self, Read, Write};
+    use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
 
     use thiserror::Error;
     const ASF_DATAPOOL: &str = "https://datapool.asf.alaska.edu";
@@ -228,11 +233,14 @@ mod inner {
         pub frame_number: Option<u32>,
     }
 
-    /// Progress callback type for [`fetch_slc_result`].
+    /// Progress callback type for [`fetch_slc_result`] and [`download_to_file_parallel`].
     ///
     /// Arguments: `(bytes_downloaded, total_bytes_or_none)`.
-    /// Called after every 512 KB chunk.
-    pub type ProgressFn<'a> = &'a dyn Fn(u64, Option<u64>);
+    /// Called after every 512 KB chunk from any worker thread.
+    ///
+    /// The callback must be `Send + Sync` because parallel downloads invoke it
+    /// from multiple threads concurrently.  Wrap a closure in [`Arc::new`].
+    pub type ProgressFn = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Auth helpers
@@ -634,7 +642,7 @@ mod inner {
         token: &str,
         product_id: &str,
         range_start: Option<u64>,
-    ) -> Result<ureq::Response, SlcFetchError> {
+    ) -> Result<(String, ureq::Response), SlcFetchError> {
         let auth = format!("Bearer {}", token);
         let range_header = range_start.map(|o| format!("bytes={}-", o));
         let mut url = start_url.to_string();
@@ -679,7 +687,7 @@ mod inner {
                         })?;
                     url = resolve_redirect_url(&url, location);
                 }
-                _ => return Ok(resp),
+                _ => return Ok((url, resp)),
             }
         }
         Err(SlcFetchError::Http {
@@ -737,7 +745,7 @@ mod inner {
         dest: &Path,
         product_id: &str,
         token: &str,
-        progress: Option<ProgressFn<'_>>,
+        progress: Option<&ProgressFn>,
     ) -> Result<(), SlcFetchError> {
         let part = {
             let mut p = dest.as_os_str().to_owned();
@@ -758,7 +766,7 @@ mod inner {
             .build();
 
         let (response, actual_offset) = if offset > 0 {
-            let resp = get_with_auth(&agent, url, token, product_id, Some(offset))?;
+            let (_, resp) = get_with_auth(&agent, url, token, product_id, Some(offset))?;
             match resp.status() {
                 206 => (resp, offset),
                 200 => {
@@ -769,7 +777,7 @@ mod inner {
                         url
                     );
                     std::fs::remove_file(&part)?;
-                    let resp2 = get_with_auth(&agent, url, token, product_id, None)?;
+                    let (_, resp2) = get_with_auth(&agent, url, token, product_id, None)?;
                     (resp2, 0)
                 }
                 s => {
@@ -780,7 +788,8 @@ mod inner {
                 }
             }
         } else {
-            (get_with_auth(&agent, url, token, product_id, None)?, 0)
+            let (_, resp) = get_with_auth(&agent, url, token, product_id, None)?;
+            (resp, 0)
         };
 
         // Parse Content-Length to compute total size if available.
@@ -817,6 +826,216 @@ mod inner {
         drop(out);
 
         std::fs::rename(&part, dest)?;
+        Ok(())
+    }
+
+    /// Number of parallel range-download threads for SLC ZIP files.
+    ///
+    /// Reads `SARDINE_SLC_CONCURRENCY` from the environment; falls back to 8.
+    /// Values below 1 are treated as 1 (sequential delegation to single-stream).
+    fn slc_concurrency() -> usize {
+        std::env::var("SARDINE_SLC_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8) // SAFETY-OK: env var parse fallback; 8 is a safe default concurrency, not a physical constant
+    }
+
+    /// Download a URL to a file using N parallel byte-range threads.
+    ///
+    /// # Protocol
+    ///
+    /// 1. Resolves the final S3 pre-signed URL and `Content-Length` by following
+    ///    the ASF 3-hop redirect chain via [`get_with_auth`] (probe request).
+    /// 2. Falls back to single-stream [`download_to_file`] if:
+    ///    - a `.part` file exists (resume in progress), or
+    ///    - the server did not return `Content-Length`, or
+    ///    - `SARDINE_SLC_CONCURRENCY=1` or the file is tiny (< 1 MB).
+    /// 3. Pre-allocates the destination file via `set_len`, then spawns
+    ///    `N` threads with `std::thread::scope`.  Each thread fetches one byte
+    ///    range directly from the S3 URL (no `Authorization` header needed —
+    ///    S3 pre-signed URLs embed credentials in query parameters).
+    ///    Writes are issued via `write_at` (POSIX `pwrite`), which is safe for
+    ///    concurrent non-overlapping ranges on the same file descriptor.
+    /// 4. On success, atomically renames `{dest}.tmp` to `dest`.
+    ///    On failure, removes `{dest}.tmp` and returns the first error.
+    fn download_to_file_parallel(
+        url: &str,
+        dest: &Path,
+        product_id: &str,
+        token: &str,
+        progress: Option<&ProgressFn>,
+    ) -> Result<(), SlcFetchError> {
+        // If a `.part` file exists a single-stream resume is already in
+        // progress — delegate and preserve resume semantics.
+        let part = {
+            let mut p = dest.as_os_str().to_owned();
+            p.push(".part");
+            PathBuf::from(p)
+        };
+        if part.exists() {
+            tracing::info!(
+                "partial file found at {}, resuming single-stream download",
+                part.display()
+            );
+            return download_to_file(url, dest, product_id, token, progress);
+        }
+
+        let n_threads = slc_concurrency();
+
+        // Probe the redirect chain to obtain the final S3 URL + Content-Length.
+        let agent = ureq::builder()
+            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_S))
+            .redirects(0)
+            .build();
+        let (final_url, probe_resp) =
+            get_with_auth(&agent, url, token, product_id, None)?;
+
+        let total_bytes = probe_resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok()); // SAFETY-OK: None means header absent; fallback to single-stream is the explicit next branch
+        drop(probe_resp); // close probe connection before spawning threads
+
+        let total_bytes = match total_bytes {
+            Some(len) if n_threads > 1 && len >= 1024 * 1024 => len,
+            Some(_) => {
+                // Single-thread mode or file too small for parallel benefit.
+                tracing::debug!("parallel download skipped (single-thread or small file), using single-stream");
+                return download_to_file(url, dest, product_id, token, progress);
+            }
+            None => {
+                tracing::info!(
+                    "no Content-Length from server for {}, falling back to single-stream download",
+                    product_id
+                );
+                return download_to_file(url, dest, product_id, token, progress);
+            }
+        };
+
+        tracing::info!(
+            "downloading {} ({:.1} MB) with {} threads …",
+            product_id,
+            total_bytes as f64 / 1e6,
+            n_threads,
+        );
+
+        // Pre-allocate the destination in a .tmp file (not .part — we write all
+        // ranges before making the file visible, so partial state is never
+        // observed as a complete file).
+        let tmp = {
+            let mut p = dest.as_os_str().to_owned();
+            p.push(".tmp");
+            PathBuf::from(p)
+        };
+        {
+            let f = std::fs::File::create(&tmp)?;
+            f.set_len(total_bytes)?;
+        }
+
+        // Re-open in write mode and share across threads.
+        // `write_at` (POSIX pwrite) is safe for non-overlapping ranges on the
+        // same fd: it does not modify the file position cursor.
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)
+                .map_err(SlcFetchError::Io)?,
+        );
+
+        let chunk_size = (total_bytes + n_threads as u64 - 1) / n_threads as u64;
+        let ranges: Vec<(u64, u64)> = (0..n_threads as u64)
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = ((i + 1) * chunk_size - 1).min(total_bytes - 1);
+                (start, end)
+            })
+            .collect();
+
+        let bytes_done = Arc::new(AtomicU64::new(0u64));
+
+        let thread_result: Result<(), SlcFetchError> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(n_threads);
+
+            for (range_start, range_end) in &ranges {
+                let range_start = *range_start;
+                let range_end = *range_end;
+                let file = Arc::clone(&file);
+                let bytes_done = Arc::clone(&bytes_done);
+                let progress_arc = progress.cloned();
+                let final_url = final_url.clone();
+                let product_id = product_id.to_string();
+
+                handles.push(scope.spawn(move || -> Result<(), SlcFetchError> {
+                    // S3 pre-signed URLs encode credentials in query params.
+                    // Do NOT send an Authorization header — S3 returns 400 if
+                    // an Authorization header accompanies a query-param signature.
+                    let thread_agent = ureq::builder()
+                        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_S))
+                        .build();
+                    let range_header = format!("bytes={}-{}", range_start, range_end);
+                    let resp = thread_agent
+                        .get(&final_url)
+                        .set("User-Agent", "sardine-scene/0.1")
+                        .set("Range", &range_header)
+                        .call()
+                        .map_err(|e| SlcFetchError::Http {
+                            url: final_url.clone(),
+                            detail: format!("range {}-{} request failed: {}", range_start, range_end, e),
+                        })?;
+
+                    if resp.status() != 206 {
+                        return Err(SlcFetchError::Http {
+                            url: final_url,
+                            detail: format!(
+                                "expected HTTP 206 for range {}-{}, got {}",
+                                range_start, range_end, resp.status()
+                            ),
+                        });
+                    }
+
+                    let mut reader = resp.into_reader();
+                    let mut buf = vec![0u8; BUF_SIZE];
+                    let mut offset = range_start;
+                    loop {
+                        let n = reader.read(&mut buf).map_err(SlcFetchError::Io)?;
+                        if n == 0 {
+                            break;
+                        }
+                        file.write_at(&buf[..n], offset).map_err(SlcFetchError::Io)?;
+                        offset += n as u64;
+                        let done = bytes_done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                        if let Some(ref cb) = progress_arc {
+                            cb(done, Some(total_bytes));
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| {
+                        SlcFetchError::Io(io::Error::new(
+                            io::ErrorKind::Other,
+                            "SLC download worker thread panicked",
+                        ))
+                    })??;
+            }
+            Ok(())
+        });
+
+        // Drop the Arc<File> before renaming so the fd is closed.
+        drop(file);
+
+        if let Err(e) = thread_result {
+            if tmp.exists() {
+                let _ = std::fs::remove_file(&tmp); // SAFETY-OK: cleanup of failed parallel download; removal failure leaves only a harmless .tmp file
+            }
+            return Err(e);
+        }
+
+        std::fs::rename(&tmp, dest)?;
         Ok(())
     }
 
@@ -870,7 +1089,7 @@ mod inner {
         result: &SlcSearchResult,
         output_dir: &Path,
         creds: &SlcCredentials,
-        progress: Option<ProgressFn<'_>>,
+        progress: Option<ProgressFn>,
         verify_checksum: bool,
     ) -> Result<PathBuf, SlcFetchError> {
         let safe_dir = output_dir.join(format!("{}.SAFE", result.scene_name));
@@ -895,7 +1114,13 @@ mod inner {
         } else {
             let token = resolve_token(creds)?;
             tracing::info!("downloading {} …", result.url);
-            download_to_file(&result.url, &zip_path, &result.scene_name, &token, progress)?;
+            download_to_file_parallel(
+                &result.url,
+                &zip_path,
+                &result.scene_name,
+                &token,
+                progress.as_ref(),
+            )?;
             tracing::info!("download complete → {}", zip_path.display());
         }
 
