@@ -5,6 +5,7 @@
 //! - `insar`         — InSAR coherence (and optionally phase) for an SLC pair (no geocoding)
 //! - `fetch-orbit`   — Download POEORB for a SAFE product (requires `--features orbit-fetch`)
 //! - `download-slc`  — Download a Sentinel-1 IW SLC SAFE from ASF datapool (requires `--features slc-fetch`)
+//! - `search-slc`    — Search the ASF DAAC catalogue for Sentinel-1 SLC products (requires `--features slc-fetch`)
 //! - `inspect`       — Print scene metadata (bounding box, polarizations, burst count, timing)
 //!
 //! All scientific orchestration lives in [`sardine_scene::run`]; this binary
@@ -51,8 +52,17 @@ enum Commands {
     ///
     /// Requires the crate to be built with `--features slc-fetch`.
     /// Authentication: set the `EARTHDATA_TOKEN` environment variable to a
-    /// valid Earthdata Bearer token (https://urs.earthdata.nasa.gov/user_tokens).
+    /// valid Earthdata Bearer token (https://urs.earthdata.nasa.gov/user_tokens),
+    /// or provide `--token`, or provide `--username` + `--password` to
+    /// auto-acquire a token via Earthdata Login.
     DownloadSlc(DownloadSlcArgs),
+
+    /// Search the ASF DAAC catalogue for Sentinel-1 IW SLC products.
+    ///
+    /// Requires the crate to be built with `--features slc-fetch`.
+    /// The ASF search endpoint is publicly accessible — no authentication
+    /// is required for searching.
+    SearchSlc(SearchSlcArgs),
 
     /// Print scene metadata for a SAFE product.
     Inspect(InspectArgs),
@@ -439,25 +449,104 @@ struct DownloadSlcArgs {
     #[arg(long, value_name = "DIR")]
     output_dir: PathBuf,
 
-    /// Earthdata Bearer token.  Defaults to the `EARTHDATA_TOKEN` environment variable.
+    /// Earthdata Bearer token.  Defaults to the `EARTHDATA_TOKEN` environment
+    /// variable.  Alternatively, use `--username` + `--password`.
     #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
+
+    /// Earthdata username.  Used together with `--password` to auto-acquire a
+    /// bearer token.  Overrides `EARTHDATA_USERNAME` env var.
+    #[arg(long, value_name = "USERNAME")]
+    username: Option<String>,
+
+    /// Earthdata password.  Used together with `--username`.
+    /// Overrides `EARTHDATA_PASSWORD` env var.
+    #[arg(long, value_name = "PASSWORD")]
+    password: Option<String>,
+
+    /// Skip MD5 checksum verification after download.
+    #[arg(long, default_value_t = false)]
+    no_verify: bool,
 }
 
 fn cmd_download_slc(args: DownloadSlcArgs) -> Result<()> {
     #[cfg(feature = "slc-fetch")]
     {
-        use sardine_scene::slc_fetch::{fetch_slc, token_from_env};
-
-        let token = match args.token {
-            Some(t) => t,
-            None => token_from_env().with_context(|| {
-                "No --token provided and EARTHDATA_TOKEN is not set."
-            })?,
+        use chrono::Duration;
+        use sardine_scene::slc_fetch::{
+            credentials_from_env, fetch_slc_result, search_slc, SlcCredentials,
+            SlcFetchError, SlcSearchParams,
         };
 
-        let safe_path = fetch_slc(&args.product_id, &args.output_dir, &token)
-            .with_context(|| format!("downloading SLC: {}", args.product_id))?;
+        // Build credentials: explicit flags take priority over env vars.
+        let creds = if let Some(tok) = args.token {
+            SlcCredentials::BearerToken(tok)
+        } else if let (Some(u), Some(p)) = (args.username, args.password) {
+            SlcCredentials::UsernamePassword { username: u, password: p }
+        } else {
+            credentials_from_env().with_context(|| {
+                "No credentials provided.  Set EARTHDATA_TOKEN (or EARTHDATA_USERNAME \
+                 + EARTHDATA_PASSWORD), or pass --token / --username + --password."
+            })?
+        };
+
+        // Parse sensing start/stop from the product ID.
+        // Format: S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_...
+        //                         ^pos17         ^pos32^pos33      ^pos48
+        let id = &args.product_id;
+        if id.len() < 48 {
+            bail!("product ID too short to parse sensing time: {}", id);
+        }
+        let start_str = &id[17..32];
+        let stop_str = &id[33..48];
+        let start = chrono::NaiveDateTime::parse_from_str(start_str, "%Y%m%dT%H%M%S")
+            .with_context(|| format!("parsing start time from product ID: {}", start_str))?
+            .and_utc();
+        let stop = chrono::NaiveDateTime::parse_from_str(stop_str, "%Y%m%dT%H%M%S")
+            .with_context(|| format!("parsing stop time from product ID: {}", stop_str))?
+            .and_utc();
+
+        // Add a 30-second margin either side to ensure the product falls
+        // within the search window despite minor ASF metadata rounding.
+        let params = SlcSearchParams {
+            start: start - Duration::seconds(30),
+            end: stop + Duration::seconds(30),
+            max_results: 10,
+            ..Default::default()
+        };
+
+        let results = search_slc(&params).with_context(|| {
+            format!("searching ASF catalogue for {}", args.product_id)
+        })?;
+
+        let result = results
+            .iter()
+            .find(|r| r.scene_name == args.product_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "product '{}' not found in ASF catalogue (searched {} results)",
+                    args.product_id,
+                    results.len()
+                )
+            })?;
+
+        // Progress callback: emit to stderr via tracing.
+        let progress_fn = |done: u64, total: Option<u64>| {
+            if let Some(t) = total {
+                tracing::info!("  {:.1} / {:.1} MB", done as f64 / 1e6, t as f64 / 1e6);
+            } else {
+                tracing::info!("  {:.1} MB downloaded", done as f64 / 1e6);
+            }
+        };
+
+        let safe_path = fetch_slc_result(
+            result,
+            &args.output_dir,
+            &creds,
+            Some(&progress_fn),
+            !args.no_verify,
+        )
+        .map_err(|e: SlcFetchError| anyhow::anyhow!("{}", e))?;
 
         println!("{}", safe_path.display());
         Ok(())
@@ -471,6 +560,139 @@ fn cmd_download_slc(args: DownloadSlcArgs) -> Result<()> {
              Rebuild with: cargo build --features slc-fetch"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// search-slc subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct SearchSlcArgs {
+    /// Acquisition start datetime (ISO-8601, UTC), e.g. `2024-01-01T00:00:00Z`.
+    #[arg(long, value_name = "DATETIME")]
+    start: String,
+
+    /// Acquisition end datetime (ISO-8601, UTC), e.g. `2024-02-01T00:00:00Z`.
+    #[arg(long, value_name = "DATETIME")]
+    end: String,
+
+    /// Bounding box as `min_lon,min_lat,max_lon,max_lat` (WGS-84 decimal degrees).
+    #[arg(long, value_name = "BBOX")]
+    bbox: Option<String>,
+
+    /// Beam mode filter (`IW`, `EW`, `SM`).  Default: no filter.
+    #[arg(long, value_name = "MODE")]
+    beam_mode: Option<String>,
+
+    /// Polarization filter (`VV`, `VH`, `VV+VH`).  Default: no filter.
+    #[arg(long, value_name = "POL")]
+    polarization: Option<String>,
+
+    /// Flight direction filter (`ASC` or `DESC`).  Default: no filter.
+    #[arg(long, value_name = "DIR")]
+    orbit_dir: Option<String>,
+
+    /// Relative orbit (path) number filter.
+    #[arg(long, value_name = "N")]
+    relative_orbit: Option<u32>,
+
+    /// Maximum number of results (default 100; hard-capped at 250).
+    #[arg(long, value_name = "N", default_value_t = 100)]
+    max_results: usize,
+
+    /// Output full JSON records (newline-delimited) instead of one scene name per line.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+fn cmd_search_slc(args: SearchSlcArgs) -> Result<()> {
+    #[cfg(feature = "slc-fetch")]
+    {
+        use sardine_scene::slc_fetch::{search_slc, SlcSearchParams};
+
+        let start = chrono::DateTime::parse_from_rfc3339(&args.start)
+            .with_context(|| format!("parsing --start: {}", args.start))?
+            .to_utc();
+        let end = chrono::DateTime::parse_from_rfc3339(&args.end)
+            .with_context(|| format!("parsing --end: {}", args.end))?
+            .to_utc();
+
+        let bbox = args
+            .bbox
+            .as_deref()
+            .map(parse_bbox)
+            .transpose()
+            .with_context(|| "parsing --bbox")?;
+
+        let orbit_direction = args.orbit_dir.map(|d| match d.to_uppercase().as_str() {
+            "ASC" => "ASCENDING".to_string(),
+            "DESC" => "DESCENDING".to_string(),
+            other => other.to_string(),
+        });
+
+        let params = SlcSearchParams {
+            start,
+            end,
+            bbox,
+            beam_mode: args.beam_mode,
+            polarization: args.polarization,
+            orbit_direction,
+            relative_orbit: args.relative_orbit,
+            max_results: args.max_results,
+        };
+
+        let results = search_slc(&params)
+            .with_context(|| "ASF catalogue search failed")?;
+
+        if args.json {
+            for r in &results {
+                let md5_json = r.md5sum.as_deref().map(|s| format!("{:?}", s)).unwrap_or_else(|| "null".to_string()); // SAFETY-OK: display-only None→JSON-null conversion
+                let orbit_json = r.relative_orbit.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string()); // SAFETY-OK: display-only None→JSON-null conversion
+                let frame_json = r.frame_number.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string()); // SAFETY-OK: display-only None→JSON-null conversion
+                println!(
+                    "{{\"scene_name\":{:?},\"url\":{:?},\"bytes\":{},\
+                     \"md5sum\":{},\"start_time\":{:?},\"stop_time\":{:?},\
+                     \"platform\":{:?},\"beam_mode\":{:?},\"polarization\":{:?},\
+                     \"orbit_direction\":{:?},\"relative_orbit\":{},\
+                     \"frame_number\":{}}}",
+                    r.scene_name, r.url, r.bytes,
+                    md5_json,
+                    r.start_time.to_rfc3339(), r.stop_time.to_rfc3339(),
+                    r.platform, r.beam_mode, r.polarization, r.orbit_direction,
+                    orbit_json,
+                    frame_json,
+                );
+            }
+        } else {
+            for r in &results {
+                println!("{}", r.scene_name);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "slc-fetch"))]
+    {
+        let _ = args; // SAFETY-OK: args intentionally unused in non-feature build; no numeric fallback
+        bail!(
+            "The 'search-slc' subcommand requires the 'slc-fetch' feature.\n\
+             Rebuild with: cargo build --features slc-fetch"
+        );
+    }
+}
+
+/// Parse a `min_lon,min_lat,max_lon,max_lat` bbox string.
+fn parse_bbox(s: &str) -> Result<[f64; 4]> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        bail!("bbox must be 'min_lon,min_lat,max_lon,max_lat', got: {}", s);
+    }
+    let vals: Vec<f64> = parts
+        .iter()
+        .map(|p| p.trim().parse::<f64>().with_context(|| format!("not a number: {}", p)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok([vals[0], vals[1], vals[2], vals[3]])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -972,6 +1194,7 @@ fn main() -> ExitCode {
         Commands::Process(args) => cmd_process(args),
         Commands::FetchOrbit(args) => cmd_fetch_orbit(args),
         Commands::DownloadSlc(args) => cmd_download_slc(args),
+        Commands::SearchSlc(args) => cmd_search_slc(args),
         Commands::Inspect(args) => cmd_inspect(args),
         Commands::Grd(args) => cmd_grd(args),
         Commands::Insar(args) => cmd_insar(args),
