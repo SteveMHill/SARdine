@@ -402,7 +402,7 @@ fn pipeline_s1b_with_explicit_orbit_and_dem() {
         PathBuf::from(SAFE_S1B),
         Some(PathBuf::from(DEM_SRTM1)),
         output.clone(),
-        "egm96".to_owned(),
+        "zero".to_owned(), // no geoid correction — avoids geoid-fetch network dep
     );
 
     opts.orbit = Some(PathBuf::from(EOF_S1B));
@@ -415,9 +415,9 @@ fn pipeline_s1b_with_explicit_orbit_and_dem() {
 
     assert!(output.exists(), "output TIFF not created: {}", output.display());
 
-    let (frac_finite, db_min, db_max) = check_output_tiff(&output);
+    let (frac_finite, db_p5, db_p95) = check_output_tiff(&output);
     eprintln!(
-        "orbit_dem_fit: frac_finite={:.3}  dB=[{db_min:.2}, {db_max:.2}]",
+        "orbit_dem_fit: frac_finite={:.3}  dB p5={db_p5:.2}  dB p95={db_p95:.2}",
         frac_finite
     );
 
@@ -426,13 +426,18 @@ fn pipeline_s1b_with_explicit_orbit_and_dem() {
         "only {:.1}% finite pixels — pipeline likely failed silently",
         100.0 * frac_finite
     );
+    // Bulk backscatter (5th–95th percentile) must be in a physically plausible
+    // C-band VV range for mixed European land cover.
+    // p5 threshold: −35 dB allows for water/shadow pixels in the low tail.
+    // p95 threshold: +5 dB; the far tail (urban double-bounce) can exceed this
+    // but the 95th percentile of valid pixels should not.
     assert!(
-        db_min >= -40.0,
-        "min dB = {db_min:.2} below −40 — calibration error or NaN propagation"
+        db_p5 >= -35.0,
+        "p5 dB = {db_p5:.2} below −35 — likely calibration error or massive nodata"
     );
     assert!(
-        db_max <= 5.0,
-        "max dB = {db_max:.2} above +5 — likely invalid pixel or calibration error"
+        db_p95 <= 5.0,
+        "p95 dB = {db_p95:.2} above +5 — likely calibration error or wrong scene"
     );
 }
 
@@ -460,7 +465,7 @@ fn pipeline_s1b_missing_dem_tile_errors_explicitly() {
         PathBuf::from(SAFE_S1B),
         Some(tmp_dem.path().to_path_buf()),
         output.clone(),
-        "egm96".to_owned(),
+        "zero".to_owned(), // no geoid correction — avoids geoid-fetch network dep
     );
     opts.orbit = Some(PathBuf::from(EOF_S1B));
     opts.polarization = "VV".to_owned();
@@ -486,7 +491,13 @@ fn pipeline_s1b_missing_dem_tile_errors_explicitly() {
 
 // ─── Output inspection helper ─────────────────────────────────────────────────
 
-/// Read a single-band Float32 TIFF; return (fraction_finite, db_min, db_max).
+/// Read a single-band Float32 TIFF containing **dB-scale** backscatter.
+///
+/// Returns `(fraction_finite, db_p5, db_p95)` where `p5`/`p95` are the 5th
+/// and 95th percentiles of finite pixel values.
+///
+/// The pipeline writes dB values directly (via `to_db_inplace` in `run.rs`),
+/// so all finite values — including negatives like `-15 dB` — are valid.
 fn check_output_tiff(path: &Path) -> (f64, f32, f32) {
     use std::io::BufReader;
     use tiff::decoder::{Decoder, DecodingResult, Limits};
@@ -507,18 +518,18 @@ fn check_output_tiff(path: &Path) -> (f64, f32, f32) {
     };
     assert_eq!(pixels.len(), total);
 
-    let mut n_finite = 0usize;
-    let mut db_min = f32::INFINITY;
-    let mut db_max = f32::NEG_INFINITY;
+    // Collect all finite values (negative dB is expected for dark land / water).
+    let mut finite: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
+    let frac = finite.len() as f64 / total as f64;
 
-    for &v in &pixels {
-        if v.is_finite() && v > 0.0 {
-            n_finite += 1;
-            let db = 10.0 * v.log10();
-            if db < db_min { db_min = db; }
-            if db > db_max { db_max = db; }
-        }
+    if finite.is_empty() {
+        return (0.0, f32::NAN, f32::NAN);
     }
 
-    (n_finite as f64 / total as f64, db_min, db_max)
+    // Sort for percentile computation.
+    finite.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap()); // SAFETY-OK: no NaN after is_finite filter
+    let p5 = finite[(finite.len() as f64 * 0.05) as usize];
+    let p95 = finite[(finite.len() as f64 * 0.95) as usize];
+
+    (frac, p5, p95)
 }
