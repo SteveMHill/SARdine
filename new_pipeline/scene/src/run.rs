@@ -664,34 +664,42 @@ fn run_grd_from_prepared(
 /// # Processing steps (per IW subswath)
 ///
 /// 1. Parse both SAFE directories; apply POEORB if supplied.
-/// 2. Deburst each subswath (reference and secondary) to continuous complex arrays.
-/// 3. TOPS azimuth deramp each array using per-burst Doppler centroid metadata.
-/// 4. Estimate geometric co-registration offsets via a 20×50 sparse grid of
+/// 2. Load DEM and parse reference geolocation grids (for TC initial-guess LUT).
+/// 3. Deburst each subswath (reference and secondary) to continuous complex arrays.
+/// 4. TOPS azimuth deramp each array using per-burst Doppler centroid metadata.
+/// 5. Estimate geometric co-registration offsets via a 20×50 sparse grid of
 ///    zero-Doppler Newton solves + bivariate 2-D polynomial fit.
-/// 5. Resample the secondary to the reference grid using the fitted polynomial.
-/// 6. Form the boxcar-windowed interferogram and coherence magnitude.
+/// 6. Resample the secondary to the reference grid using the fitted polynomial.
+/// 7. Form the boxcar-windowed interferogram and coherence magnitude.
 ///    Flat-earth phase is computed per-pixel and subtracted before accumulation.
-/// 7. Write per-subswath Float32 TIFF(s) in slant-range radar geometry (no CRS).
-///    The output path has `_IW{n}_coherence.tif` appended.
-///    When `opts.output_phase = true`, `_IW{n}_phase.tif` is also written.
-/// 8. Write a per-subswath `.provenance.json` sidecar with geometry parameters.
+/// 8. Geocode the multi-looked coherence (and optionally phase) via terrain
+///    correction using the reference scene orbit and DEM.
+///    Output is a GeoTIFF at `opts.pixel_spacing_deg` in WGS84 lat/lon.
 ///
-/// # Geometry note
+/// # Multi-look geometry note
 ///
-/// The coherence output is in multi-looked slant-range geometry
-/// (`az_looks × rg_looks` applied).  This is NOT geocoded.  Geocoding
-/// coherence is deferred because the multi-looked pixel spacing differs from
-/// the full-resolution slant-range grid used by `terrain_correction`.
+/// The coherence estimation window (`az_looks × rg_looks`) produces a decimated
+/// output: line `l` of the coherence image corresponds to full-resolution lines
+/// `[l·az_looks, (l+1)·az_looks)` of the reference SLC.  For terrain correction,
+/// this means the effective azimuth time interval is `az_looks × ati_s` and the
+/// effective range pixel spacing is `rg_looks × rps_m`.  A synthetic
+/// [`MergedSigma0`] is constructed from these scaled parameters, and a cloned
+/// [`SceneMetadata`] has all subswath `azimuth_time_interval_s` fields scaled
+/// by `az_looks` so that `RadarGeometry::from_scene_and_merged` uses the
+/// correct multi-looked line timing.
 pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     use crate::deburst::deburst_subswath;
-    use crate::export::write_tiff_no_crs;
+    use crate::dem::DemMosaic;
+    use crate::export::write_geotiff_with_crs;
     use crate::insar::coreg::{compute_coreg_offsets, resample_secondary, Coregistered};
     use crate::insar::deramp::deramp_subswath;
     use crate::insar::interferogram::{form_interferogram, InterferogramConfig};
+    use crate::merge_subswaths::MergedSigma0;
     use crate::orbit::{apply_precise_orbit, parse_eof_file};
-    use crate::parse::parse_safe_directory;
+    use crate::parse::{parse_geolocation_grids, parse_safe_directory};
     use crate::slc_reader::SlcReader;
-    use crate::types::{Polarization, SubSwathId};
+    use crate::terrain_correction::{terrain_correction, TerrainCorrectionConfig};
+    use crate::types::{Polarization, SubSwathId, SPEED_OF_LIGHT_M_S};
 
     let t_total = Instant::now();
 
@@ -771,6 +779,34 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
         "radar wavelength: {:.6} m (from reference annotation)",
         wavelength_m
     );
+
+    // ── Load DEM ─────────────────────────────────────────────────────────────
+    tracing::info!("loading DEM from {} …", opts.dem.display());
+    let t_dem = Instant::now();
+    let dem = DemMosaic::load_directory(&opts.dem)
+        .with_context(|| format!("loading DEM: {}", opts.dem.display()))?;
+    report_timing("dem_load", t_dem);
+
+    let bb = ref_scene.bounding_box;
+    dem.covers_bbox(bb.min_lat_deg, bb.max_lat_deg, bb.min_lon_deg, bb.max_lon_deg, 0.05)
+        .with_context(|| format!(
+            "DEM at {} does not cover reference scene footprint",
+            opts.dem.display()
+        ))?;
+
+    // ── Parse reference geolocation grids (TC initial-guess LUT) ─────────────
+    tracing::info!("parsing reference geolocation grids …");
+    let ref_grids = parse_geolocation_grids(&opts.reference)
+        .with_context(|| "parsing reference geolocation grids")?;
+
+    // ── Resolve geoid ─────────────────────────────────────────────────────────
+    let geoid = resolve_geoid(&opts.geoid)?;
+
+    // ── Terrain correction config (shared across subswaths) ──────────────────
+    let tc_pixel_spacing = opts.pixel_spacing_deg;
+    if tc_pixel_spacing <= 0.0 {
+        bail!("--pixel-spacing-deg must be > 0 (got {})", tc_pixel_spacing);
+    }
 
     // ── Build output basename (strip extension from opts.output) ─────────────
     let out_base = {
@@ -933,19 +969,143 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             iw_id, igram.lines, igram.samples
         );
 
-        // Write coherence TIFF ────────────────────────────────────────────────
-        let coh_path = format!("{out_base_str}_{iw_str}_coherence.tif");
-        tracing::info!("writing coherence TIFF → {}", coh_path);
-        let t_export = Instant::now();
-        write_tiff_no_crs(&coh_path, &igram.coherence, igram.samples, igram.lines)
-            .with_context(|| format!("writing coherence TIFF: {coh_path}"))?;
+        // ── Build multi-looked MergedSigma0 for terrain correction ───────────
+        //
+        // After boxcar coherence estimation, line l of igram corresponds to
+        // SLC lines [l·az_looks, (l+1)·az_looks).  The center of window l
+        // is at SLC line l·az_looks + (az_looks−1)/2, with azimuth time:
+        //
+        //   t_az(l) = ref_first_utc + (l·az_looks + (az_looks−1)/2) · ati_s
+        //           = az_start + l · (az_looks · ati_s)
+        //
+        // where az_start = ref_first_utc + (az_looks−1)/2 · ati_s.
+        // Analogously, the two-way slant-range time for column c is:
+        //
+        //   τ(c) = near_τ + (c·rg_looks + (rg_looks−1)/2) · Δτ_r
+        //        = near_τ_ml + c · (rg_looks · Δτ_r)
+        //
+        // terrain_correction reads:
+        //   - azimuth_time_interval_s  from scene.sub_swaths[0]  (NOT merged)
+        //   - range_pixel_spacing_m    from merged
+        //   - near_slant_range_time_s  from merged
+        //   - azimuth_start_time       from merged
+        //
+        // So: build a synthetic MergedSigma0 with multi-looked spacing, and
+        // clone SceneMetadata with all subswath ati_s scaled by az_looks.
 
-        // Write phase TIFF (optional) ─────────────────────────────────────────
+        let ref_ati_s = ref_sw.azimuth_time_interval_s;
+        let rg_delta_tau = 2.0 * ref_sw.range_pixel_spacing_m / SPEED_OF_LIGHT_M_S;
+
+        // Center of the first azimuth window.
+        let az_center_offset_us = ((opts.az_looks - 1) as f64 * 0.5 * ref_ati_s * 1e6) as i64;
+        let ml_az_start = ref_first_utc
+            + chrono::Duration::microseconds(az_center_offset_us);
+
+        // Two-way slant-range time to the center of the first range window.
+        let rg_center_offset_tau = (opts.rg_looks - 1) as f64 * 0.5 * rg_delta_tau;
+        let ml_near_tau = ref_sw.slant_range_time_s
+            + coreg.ref_data.valid_sample_offset as f64 * rg_delta_tau
+            + rg_center_offset_tau;
+
+        let ml_rps_m = ref_sw.range_pixel_spacing_m * opts.rg_looks as f64;
+        let ml_rps_s = rg_delta_tau * opts.rg_looks as f64;
+
+        let n_coh = igram.lines * igram.samples;
+        let coh_merged = MergedSigma0 {
+            data: igram.coherence.clone(),
+            nesz: vec![0.0_f32; n_coh],
+            lines: igram.lines,
+            samples: igram.samples,
+            near_slant_range_time_s: ml_near_tau,
+            range_pixel_spacing_s: ml_rps_s,
+            range_pixel_spacing_m: ml_rps_m,
+            cal_lut_extrapolation_gap_px: 0,
+            noise_lut_extrapolation_gap_px: 0,
+            azimuth_start_time: ml_az_start,
+        };
+
+        // Clone scene metadata and scale every subswath's ati_s by az_looks,
+        // so that terrain_correction maps multi-looked line indices to the
+        // correct azimuth times.
+        let mut ml_scene = ref_scene.clone();
+        for sw in &mut ml_scene.sub_swaths {
+            sw.azimuth_time_interval_s *= opts.az_looks as f64;
+        }
+
+        // ── Terrain correction (coherence) ────────────────────────────────────
+        tracing::info!("geocoding {:?} coherence …", iw_id);
+        let t_tc = Instant::now();
+
+        // Filter geolocation grids to only the current subswath.
+        let iw_grids: Vec<_> = ref_grids
+            .iter()
+            .filter(|(id, _)| *id == iw_id)
+            .cloned()
+            .collect();
+
+        let mut tc_cfg = TerrainCorrectionConfig::new(geoid.clone());
+        tc_cfg.pixel_spacing_deg = tc_pixel_spacing;
+        tc_cfg.flatten = false;  // coherence has no radiometric normalisation
+
+        let coh_geocoded = terrain_correction(&coh_merged, &ml_scene, &dem, &iw_grids, &tc_cfg)
+            .with_context(|| format!("terrain correction of {:?} coherence", iw_id))?;
+        report_timing("terrain_correction_coherence", t_tc);
+
+        tracing::info!(
+            "  {:?} geocoded coherence: {} rows × {} cols — valid={}, dem_missing={}",
+            iw_id,
+            coh_geocoded.rows, coh_geocoded.cols,
+            coh_geocoded.valid_pixel_count,
+            coh_geocoded.dem_missing_count,
+        );
+
+        // ── Write coherence GeoTIFF ───────────────────────────────────────────
+        let coh_path = format!("{out_base_str}_{iw_str}_coherence.tif");
+        tracing::info!("writing coherence GeoTIFF → {}", coh_path);
+        let t_export = Instant::now();
+        write_geotiff_with_crs(
+            &coh_path,
+            &coh_geocoded.data,
+            coh_geocoded.cols,
+            coh_geocoded.rows,
+            coh_geocoded.geotransform,
+            &coh_geocoded.crs,
+        )
+        .with_context(|| format!("writing coherence GeoTIFF: {coh_path}"))?;
+
+        // ── Write phase GeoTIFF (optional) ────────────────────────────────────
         if opts.output_phase {
+            tracing::info!("geocoding {:?} phase …", iw_id);
+            let t_tc_phase = Instant::now();
+            let phase_merged = MergedSigma0 {
+                data: igram.phase.clone(),
+                nesz: vec![0.0_f32; n_coh],
+                lines: igram.lines,
+                samples: igram.samples,
+                near_slant_range_time_s: ml_near_tau,
+                range_pixel_spacing_s: ml_rps_s,
+                range_pixel_spacing_m: ml_rps_m,
+                cal_lut_extrapolation_gap_px: 0,
+                noise_lut_extrapolation_gap_px: 0,
+                azimuth_start_time: ml_az_start,
+            };
+            let phase_geocoded = terrain_correction(
+                &phase_merged, &ml_scene, &dem, &iw_grids, &tc_cfg,
+            )
+            .with_context(|| format!("terrain correction of {:?} phase", iw_id))?;
+            report_timing("terrain_correction_phase", t_tc_phase);
+
             let phase_path = format!("{out_base_str}_{iw_str}_phase.tif");
-            tracing::info!("writing phase TIFF → {}", phase_path);
-            write_tiff_no_crs(&phase_path, &igram.phase, igram.samples, igram.lines)
-                .with_context(|| format!("writing phase TIFF: {phase_path}"))?;
+            tracing::info!("writing phase GeoTIFF → {}", phase_path);
+            write_geotiff_with_crs(
+                &phase_path,
+                &phase_geocoded.data,
+                phase_geocoded.cols,
+                phase_geocoded.rows,
+                phase_geocoded.geotransform,
+                &phase_geocoded.crs,
+            )
+            .with_context(|| format!("writing phase GeoTIFF: {phase_path}"))?;
         }
         report_timing("export", t_export);
 

@@ -626,6 +626,10 @@ struct InsarArgs {
     #[arg(long, value_name = "PATH")]
     output: PathBuf,
 
+    /// Directory containing DEM tiles for geocoding (SRTM-1 or compatible).
+    #[arg(long, value_name = "DIR")]
+    dem: PathBuf,
+
     /// Path to a POEORB `.EOF` file for the reference scene.
     ///
     /// If omitted, the annotation orbit is used only when
@@ -659,6 +663,20 @@ struct InsarArgs {
     #[arg(long)]
     output_phase: bool,
 
+    /// Geoid model for converting DEM orthometric heights to WGS84 ellipsoidal
+    /// heights.  Use `auto` (download EGM96 on first run), `zero` (no
+    /// correction — ocean scenes only), or a path to an EGM96 `.bin` grid.
+    ///
+    /// Omitting the geoid correction introduces a geolocation error equal to
+    /// the local geoid undulation (typically 30–50 m at mid-latitudes).
+    #[arg(long, value_name = "SPEC", default_value = "auto")]
+    geoid: String,
+
+    /// Output pixel spacing in degrees (WGS84 lat/lon).  Approximately 10 m
+    /// ≈ 0.0001°; 20 m ≈ 0.0002°.
+    #[arg(long, value_name = "DEG", default_value_t = 0.0001_f64)]
+    pixel_spacing_deg: f64,
+
     /// Number of processing threads.  0 = use all available CPU cores (default).
     #[arg(long, value_name = "N", default_value_t = 0usize)]
     threads: usize,
@@ -669,12 +687,15 @@ fn cmd_insar(args: InsarArgs) -> Result<()> {
         reference: args.reference,
         secondary: args.secondary,
         output: args.output,
+        dem: args.dem,
         reference_orbit: args.reference_orbit,
         secondary_orbit: args.secondary_orbit,
         polarization: args.polarization,
         az_looks: args.az_looks,
         rg_looks: args.rg_looks,
         output_phase: args.output_phase,
+        geoid: args.geoid,
+        pixel_spacing_deg: args.pixel_spacing_deg,
         threads: args.threads,
     };
     sardine_scene::run::run_insar(&opts)

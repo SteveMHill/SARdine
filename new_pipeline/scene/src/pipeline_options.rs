@@ -233,9 +233,11 @@ pub struct InsarOptions {
     /// Path to the secondary (slave) Sentinel-1 IW SLC `.SAFE` directory.
     pub secondary: PathBuf,
     /// Output basename.  Per-subswath suffixes are appended:
-    /// `<output>_IW1_coherence.tif`, `<output>_IW2_coherence.tif`, etc.
-    /// If `output_phase = true`, `<output>_IW1_phase.tif` is also written.
+    /// `<output>_iw1_coherence.tif`, `<output>_iw2_coherence.tif`, etc.
+    /// If `output_phase = true`, `<output>_iw1_phase.tif` is also written.
     pub output: PathBuf,
+    /// Directory containing DEM tiles for terrain correction and geocoding.
+    pub dem: PathBuf,
     /// Path to a POEORB `.EOF` file for the reference scene.
     pub reference_orbit: Option<PathBuf>,
     /// Path to a POEORB `.EOF` file for the secondary scene.
@@ -246,25 +248,32 @@ pub struct InsarOptions {
     pub az_looks: usize,
     /// Range multi-look factor (coherence window width in SLC samples).
     pub rg_looks: usize,
-    /// When true, also write the wrapped interferometric phase.
+    /// When true, also write the wrapped interferometric phase GeoTIFF.
     pub output_phase: bool,
+    /// Geoid model spec: `"auto"`, `"zero"`, or a path to an EGM96 grid.
+    pub geoid: String,
+    /// Output pixel spacing in degrees (WGS84 lat/lon grid).
+    pub pixel_spacing_deg: f64,
     /// Number of Rayon threads.  0 = use all available cores.
     pub threads: usize,
 }
 
 impl InsarOptions {
-    /// Construct with CLI defaults.  `reference`, `secondary`, and `output` are required.
-    pub fn new(reference: PathBuf, secondary: PathBuf, output: PathBuf) -> Self {
+    /// Construct with CLI defaults.  `reference`, `secondary`, `output`, and `dem` are required.
+    pub fn new(reference: PathBuf, secondary: PathBuf, output: PathBuf, dem: PathBuf) -> Self {
         Self {
             reference,
             secondary,
             output,
+            dem,
             reference_orbit: None,
             secondary_orbit: None,
             polarization: "VV".to_owned(),
             az_looks: crate::insar::interferogram::DEFAULT_COH_AZ_LOOKS,
             rg_looks: crate::insar::interferogram::DEFAULT_COH_RG_LOOKS,
             output_phase: false,
+            geoid: "auto".to_owned(),
+            pixel_spacing_deg: 0.0001,
             threads: 0,
         }
     }
