@@ -198,6 +198,132 @@ fn merge_geolocation_grids(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Orbit resolution helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the orbit for `scene`, applying it and returning the updated
+/// `SceneMetadata` together with an [`OrbitSource`] tag for provenance.
+///
+/// Resolution order:
+///
+/// 1. **`orbit_override` is `Some(path)`** — parse and apply that file.
+///    No network access.
+///
+/// 2. **`orbit-fetch` feature is enabled (the default)** — locate the orbit
+///    cache directory (`$SARDINE_ORBIT_DIR` or `$HOME/.sardine/orbits/`),
+///    then call [`crate::orbit_fetch::fetch_poeorb`].  The first successful
+///    download is cached on disk so subsequent runs are instant.
+///
+/// 3. **`SARDINE_ALLOW_ANNOTATION_ORBIT=1` env var** — use the orbit vectors
+///    already baked into the SAFE annotation XML (metre-level accuracy).
+///    This is intentionally not the default: annotation orbits are not
+///    suitable for precision terrain correction.
+///
+/// Any other combination returns an explicit error — there is no silent
+/// fallback to annotation orbit.
+///
+/// `label` is a human-readable scene name used in error messages (e.g.
+/// `"reference"` or `"secondary"`).
+pub(crate) fn resolve_orbit(
+    scene: crate::types::SceneMetadata,
+    orbit_override: Option<&Path>,
+    label: &str,
+) -> Result<(crate::types::SceneMetadata, crate::provenance::OrbitSource)> {
+    use crate::orbit::{apply_precise_orbit, parse_eof_file};
+
+    // ── Path 1: explicit file ─────────────────────────────────────────────
+    if let Some(orbit_path) = orbit_override {
+        let orbit = parse_eof_file(orbit_path)
+            .with_context(|| format!("parsing {label} orbit: {}", orbit_path.display()))?;
+        let scene = apply_precise_orbit(scene, &orbit)
+            .with_context(|| format!("applying {label} precise orbit"))?;
+        return Ok((scene, crate::provenance::OrbitSource::Poeorb));
+    }
+
+    // ── Path 2: auto-download (orbit-fetch feature) ───────────────────────
+    #[cfg(feature = "orbit-fetch")]
+    {
+        let cache_dir = orbit_cache_dir()
+            .with_context(|| format!("resolving {label} orbit cache directory"))?;
+
+        tracing::info!(
+            "{label}: auto-downloading POEORB for {} (sensing_start={}) …",
+            scene.product_id,
+            scene.start_time.format("%Y-%m-%dT%H:%M:%SZ"),
+        );
+
+        let eof_path = crate::orbit_fetch::fetch_poeorb(
+            &scene.product_id,
+            scene.start_time,
+            &cache_dir,
+        )
+        .with_context(|| {
+            format!(
+                "auto-downloading POEORB for {label} scene '{}'. \
+                 Supply --{}orbit <path> to use a local file, or set \
+                 SARDINE_ALLOW_ANNOTATION_ORBIT=1 to accept annotation-orbit \
+                 accuracy (metre-level).",
+                scene.product_id,
+                if label == "reference" || label == "secondary" {
+                    format!("{label}-")
+                } else {
+                    String::new()
+                }
+            )
+        })?;
+
+        tracing::info!("{label}: POEORB cached at {}", eof_path.display());
+
+        let orbit = parse_eof_file(&eof_path)
+            .with_context(|| format!("parsing downloaded {label} orbit: {}", eof_path.display()))?;
+        let scene = apply_precise_orbit(scene, &orbit)
+            .with_context(|| format!("applying {label} precise orbit"))?;
+        return Ok((scene, crate::provenance::OrbitSource::Poeorb));
+    }
+
+    // ── Path 3: annotation orbit (opt-in via env var, no orbit-fetch) ─────
+    #[cfg(not(feature = "orbit-fetch"))]
+    {
+        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
+            .map(|v| v == "1")
+            .unwrap_or(false); // SAFETY-OK: env var parse; missing/invalid → deny (safe direction)
+        if !allow {
+            bail!(
+                "No --{lbl}orbit file provided and the `orbit-fetch` feature is disabled.\n\
+                 Options:\n  \
+                 1. Supply a POEORB file with --{lbl}orbit <path>\n  \
+                 2. Set SARDINE_ALLOW_ANNOTATION_ORBIT=1 to use the annotation orbit \
+                 (metre-level accuracy — not recommended for geocoded products)",
+                lbl = if label == "reference" || label == "secondary" {
+                    format!("{label}-")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        tracing::warn!(
+            "{label}: using annotation orbit (metre-level accuracy). \
+             Provide a POEORB file or enable the `orbit-fetch` feature for cm-level accuracy."
+        );
+        return Ok((scene, crate::provenance::OrbitSource::Annotation));
+    }
+}
+
+/// Resolve the orbit cache directory.
+///
+/// Checks `$SARDINE_ORBIT_DIR` first; falls back to `$HOME/.sardine/orbits/`.
+fn orbit_cache_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("SARDINE_ORBIT_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var("HOME").with_context(|| {
+        "HOME environment variable not set and SARDINE_ORBIT_DIR not set; \
+         cannot locate orbit cache directory"
+    })?;
+    Ok(PathBuf::from(home).join(".sardine").join("orbits"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -220,7 +346,6 @@ pub fn prepare_merged_scene(
     use crate::calibration::parse_calibration_noise;
     use crate::deburst::deburst_subswath;
     use crate::merge_subswaths::{merge_single_subswath_owned, merge_subswaths, SwathInput};
-    use crate::orbit::{apply_precise_orbit, parse_eof_file};
     use crate::parse::{parse_geolocation_grids, parse_safe_directory};
     use crate::slc_reader::SlcReader;
     use crate::types::SubSwathId;
@@ -246,29 +371,7 @@ pub fn prepare_merged_scene(
     let scene = parse_safe_directory(safe)
         .with_context(|| format!("parsing SAFE: {}", safe.display()))?;
 
-    let (scene, orbit_source) = if let Some(orbit_path) = orbit_path {
-        let orbit = parse_eof_file(orbit_path)
-            .with_context(|| format!("parsing orbit file: {}", orbit_path.display()))?;
-        let scene = apply_precise_orbit(scene, &orbit)
-            .with_context(|| "applying precise orbit")?;
-        (scene, crate::provenance::OrbitSource::Poeorb)
-    } else {
-        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
-            .map(|v| v == "1")
-            .unwrap_or(false); // SAFETY-OK: env var parse; fallback to deny is the safe direction
-        if !allow {
-            bail!(
-                "No --orbit file provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
-                 Provide a POEORB file with --orbit, or set SARDINE_ALLOW_ANNOTATION_ORBIT=1 \
-                 to use the annotation orbit (metre-level accuracy)."
-            );
-        }
-        tracing::warn!(
-            "using annotation orbit (metre-level accuracy). \
-             Provide a POEORB file for cm-level accuracy."
-        );
-        (scene, crate::provenance::OrbitSource::Annotation)
-    };
+    let (scene, orbit_source) = resolve_orbit(scene, orbit_path, "scene")?;
 
     tracing::info!("parsing calibration/noise LUTs …");
     let cal_noise = parse_calibration_noise(safe)
@@ -463,7 +566,6 @@ pub fn prepare_merged_scene_assembled(
     use crate::calibration::parse_calibration_noise;
     use crate::deburst::{compute_overlap_lines, deburst_subswath};
     use crate::merge_subswaths::{merge_single_subswath_owned, merge_subswaths, SwathInput};
-    use crate::orbit::{apply_precise_orbit, parse_eof_file};
     use crate::parse::parse_geolocation_grids;
     use crate::slc_reader::SlcReader;
     use crate::types::SubSwathId;
@@ -487,29 +589,7 @@ pub fn prepare_merged_scene_assembled(
     };
 
     let scene = assembled.scene.clone();
-    let (scene, orbit_source) = if let Some(orbit_path) = orbit_path {
-        let orbit = parse_eof_file(orbit_path)
-            .with_context(|| format!("parsing orbit file: {}", orbit_path.display()))?;
-        let scene = apply_precise_orbit(scene, &orbit)
-            .with_context(|| "applying precise orbit")?;
-        (scene, crate::provenance::OrbitSource::Poeorb)
-    } else {
-        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
-            .map(|v| v == "1")
-            .unwrap_or(false); // SAFETY-OK: env var parse; fallback to deny is the safe direction
-        if !allow {
-            bail!(
-                "No --orbit file provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
-                 Provide a POEORB file with --orbit, or set SARDINE_ALLOW_ANNOTATION_ORBIT=1 \
-                 to use the annotation orbit (metre-level accuracy)."
-            );
-        }
-        tracing::warn!(
-            "using annotation orbit (metre-level accuracy). \
-             Provide a POEORB file for cm-level accuracy."
-        );
-        (scene, crate::provenance::OrbitSource::Annotation)
-    };
+    let (scene, orbit_source) = resolve_orbit(scene, orbit_path, "scene")?;
 
     // Geolocation grids: parse from every slice and merge.
     tracing::info!("parsing geolocation grids from {n_slices} slices …");

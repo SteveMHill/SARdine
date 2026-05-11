@@ -222,7 +222,7 @@ mod inner {
     }
 
     /// Extract `<Key>` element values from an S3 XML listing body.
-    fn extract_s3_keys(xml: &str) -> Vec<String> {
+    pub(super) fn extract_s3_keys(xml: &str) -> Vec<String> {
         let mut keys = Vec::new();
         let mut remaining = xml;
         while let Some(start) = remaining.find("<Key>") {
@@ -320,7 +320,7 @@ mod inner {
     /// `S1{A|B}_OPER_AUX_POEORB_OPOD_{prod}T{time}_V{start}_{stop}.EOF[.zip]`
     ///
     /// We parse `{start}` and `{stop}` from the `_V` suffix.
-    fn orbit_filename_covers(filename: &str, t: DateTime<Utc>) -> bool {
+    pub(super) fn orbit_filename_covers(filename: &str, t: DateTime<Utc>) -> bool {
         // Look for the `_V` validity suffix.
         let stripped = filename.trim_end_matches(".EOF").trim_end_matches(".zip");
         if let Some(v_pos) = stripped.rfind("_V") {

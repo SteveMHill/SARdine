@@ -124,11 +124,13 @@ struct ProcessArgs {
     #[arg(long, value_name = "PATH")]
     output: PathBuf,
 
-    /// Path to a POEORB `.EOF` file.
+    /// Path to a POEORB `.EOF` orbit file.
     ///
-    /// If omitted, the annotation orbit is used only when the environment
-    /// variable `SARDINE_ALLOW_ANNOTATION_ORBIT=1` is set.  Without that
-    /// variable, the command exits with an error.
+    /// **Omit for automatic download (default behaviour).**  When not
+    /// supplied, the pipeline fetches the matching POEORB from the ASF
+    /// AWS Open Data bucket and caches it under `$SARDINE_ORBIT_DIR`
+    /// (or `$HOME/.sardine/orbits/`) for future runs.  An explicit path
+    /// always takes precedence over the download cache.
     #[arg(long, value_name = "FILE")]
     orbit: Option<PathBuf>,
 
@@ -520,8 +522,10 @@ struct GrdArgs {
     #[arg(long, value_name = "PATH")]
     output: PathBuf,
 
-    /// Path to a POEORB `.EOF` file.  Same orbit-source policy as
-    /// `process`: required unless `SARDINE_ALLOW_ANNOTATION_ORBIT=1`.
+    /// Path to a POEORB `.EOF` orbit file.
+    ///
+    /// **Omit for automatic download (default behaviour).**  Same
+    /// caching policy as `process --orbit`.
     #[arg(long, value_name = "FILE")]
     orbit: Option<PathBuf>,
 
@@ -630,17 +634,20 @@ struct InsarArgs {
     #[arg(long, value_name = "DIR")]
     dem: PathBuf,
 
-    /// Path to a POEORB `.EOF` file for the reference scene.
+    /// Path to a POEORB `.EOF` orbit file for the reference scene.
     ///
-    /// If omitted, the annotation orbit is used only when
-    /// `SARDINE_ALLOW_ANNOTATION_ORBIT=1` is set.
+    /// **Omit for automatic download (default behaviour).**  When not
+    /// supplied, the pipeline fetches the matching POEORB from the ASF
+    /// AWS Open Data bucket and caches it under `$SARDINE_ORBIT_DIR`
+    /// (or `$HOME/.sardine/orbits/`).  An explicit path always takes
+    /// precedence over the download cache.
     #[arg(long, value_name = "FILE")]
     reference_orbit: Option<PathBuf>,
 
-    /// Path to a POEORB `.EOF` file for the secondary scene.
+    /// Path to a POEORB `.EOF` orbit file for the secondary scene.
     ///
-    /// If omitted, the annotation orbit is used only when
-    /// `SARDINE_ALLOW_ANNOTATION_ORBIT=1` is set.
+    /// **Omit for automatic download (default behaviour).**  Same
+    /// caching policy as `--reference-orbit`.
     #[arg(long, value_name = "FILE")]
     secondary_orbit: Option<PathBuf>,
 

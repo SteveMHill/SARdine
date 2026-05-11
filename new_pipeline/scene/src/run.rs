@@ -695,7 +695,6 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     use crate::insar::deramp::deramp_subswath;
     use crate::insar::interferogram::{form_interferogram, InterferogramConfig};
     use crate::merge_subswaths::MergedSigma0;
-    use crate::orbit::{apply_precise_orbit, parse_eof_file};
     use crate::parse::{parse_geolocation_grids, parse_safe_directory};
     use crate::slc_reader::SlcReader;
     use crate::terrain_correction::{terrain_correction, TerrainCorrectionConfig};
@@ -729,48 +728,26 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     let t_parse = Instant::now();
     let ref_scene_raw = parse_safe_directory(&opts.reference)
         .with_context(|| format!("parsing reference SAFE: {}", opts.reference.display()))?;
-    let ref_scene = if let Some(orbit_path) = opts.reference_orbit.as_deref() {
-        let orbit = parse_eof_file(orbit_path)
-            .with_context(|| format!("parsing reference orbit: {}", orbit_path.display()))?;
-        apply_precise_orbit(ref_scene_raw, &orbit)
-            .with_context(|| "applying reference precise orbit")?
-    } else {
-        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
-            .map(|v| v == "1")
-            .unwrap_or(false); // SAFETY-OK: env var parse; fallback is deny (safe direction)
-        if !allow {
-            bail!(
-                "No --reference-orbit provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
-                 Provide a POEORB file with --reference-orbit, or set \
-                 SARDINE_ALLOW_ANNOTATION_ORBIT=1 to use the annotation orbit (metre-level accuracy)."
-            );
-        }
-        tracing::warn!("reference: using annotation orbit (metre-level accuracy)");
-        ref_scene_raw
+    let ref_scene = {
+        let (scene, _) = crate::scene_prep::resolve_orbit(
+            ref_scene_raw,
+            opts.reference_orbit.as_deref(),
+            "reference",
+        )?;
+        scene
     };
 
     // ── Parse secondary SAFE ─────────────────────────────────────────────────
     tracing::info!("parsing secondary SAFE: {} …", opts.secondary.display());
     let sec_scene_raw = parse_safe_directory(&opts.secondary)
         .with_context(|| format!("parsing secondary SAFE: {}", opts.secondary.display()))?;
-    let sec_scene = if let Some(orbit_path) = opts.secondary_orbit.as_deref() {
-        let orbit = parse_eof_file(orbit_path)
-            .with_context(|| format!("parsing secondary orbit: {}", orbit_path.display()))?;
-        apply_precise_orbit(sec_scene_raw, &orbit)
-            .with_context(|| "applying secondary precise orbit")?
-    } else {
-        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
-            .map(|v| v == "1")
-            .unwrap_or(false); // SAFETY-OK: env var parse; fallback is deny (safe direction)
-        if !allow {
-            bail!(
-                "No --secondary-orbit provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
-                 Provide a POEORB file with --secondary-orbit, or set \
-                 SARDINE_ALLOW_ANNOTATION_ORBIT=1 to use the annotation orbit (metre-level accuracy)."
-            );
-        }
-        tracing::warn!("secondary: using annotation orbit (metre-level accuracy)");
-        sec_scene_raw
+    let sec_scene = {
+        let (scene, _) = crate::scene_prep::resolve_orbit(
+            sec_scene_raw,
+            opts.secondary_orbit.as_deref(),
+            "secondary",
+        )?;
+        scene
     };
     report_timing("parse_safe_meta", t_parse);
 

@@ -13,6 +13,7 @@ keywords = ["sentinel-1", "sar", "remote-sensing", "geospatial", "radar"]
 categories = ["science::geo"]
 
 [features]
+default      = ["orbit-fetch"]
 orbit-fetch  = ["dep:ureq"]
 slc-fetch    = ["dep:ureq"]
 geoid-fetch  = ["dep:ureq"]
