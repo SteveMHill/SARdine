@@ -551,13 +551,21 @@ mod inner {
         })
     }
 
-    /// Parse an ASF datetime string (e.g. `"2019-01-23T05:33:48.000000"`) to
-    /// a UTC [`chrono::DateTime`].
+    /// Parse an ASF datetime string to a UTC [`chrono::DateTime`].
+    ///
+    /// ASF historically returned bare naive datetimes (`"2019-01-23T05:33:48.000000"`,
+    /// no timezone suffix).  As of 2025 the API now returns RFC3339 strings with a
+    /// `Z` suffix and no fractional seconds (`"2019-01-23T05:33:48Z"`).  Both
+    /// formats are accepted; all values are treated as UTC.
     fn parse_asf_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
-        // ASF returns datetimes without a timezone suffix; they are always UTC.
+        // Try RFC3339 first (handles 'Z' and '+00:00' suffixes).
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Ok(dt.with_timezone(&chrono::Utc));
+        }
+        // Fall back to the legacy bare-naive format (no timezone suffix).
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
             .map(|ndt| ndt.and_utc())
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("{e} (input: {s:?})"))
     }
 
     // Maximum number of redirects to follow manually.
