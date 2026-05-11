@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use sardine_scene::run::
+use sardine_scene::run::{
     parse_iw_selection, parse_output_mode, parse_speckle_order,
     run_grd_multi, run_process_multi, GrdOptions, ProcessOptions, ResamplingKernel,
 };
@@ -116,7 +116,8 @@ fn process(
     let speckle_order = parse_speckle_order(&speckle_order).map_err(py_err)?;
     let opts = ProcessOptions {
         safe,
-        dem,
+        dem: Some(dem),
+        dem_source: "srtm1".to_string(),
         output,
         orbit,
         polarization,
