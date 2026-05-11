@@ -1145,7 +1145,7 @@ fn build_insar_provenance_json(
     secondary_orbit: Option<&std::path::Path>,
     pol: &str,
     ref_sw: &crate::types::SubSwathMetadata,
-    sec_sw: &crate::types::SubSwathMetadata,
+    _sec_sw: &crate::types::SubSwathMetadata,
     igram: &crate::insar::interferogram::Interferogram,
     coreg: &crate::insar::coreg::CoregResult,
     wavelength_m: f64,

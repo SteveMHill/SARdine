@@ -326,6 +326,7 @@ pub fn merge_subswaths(inputs: &[SwathInput<'_>]) -> Result<MergedSigma0, MergeE
     // check for correctness).
     struct SwathFillRange {
         /// First owned output column (fill NaN from previous fill_end up to here).
+        #[allow(dead_code)]
         col_start: usize,
         /// One-past-last owned output column (fill NaN from fill_end to next col_start).
         col_end: usize,

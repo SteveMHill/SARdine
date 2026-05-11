@@ -74,7 +74,8 @@ pub enum TerrainCorrectionError {
 /// `DegenerateGeometry` to NaN output pixels and count them separately from
 /// pixels that converged cleanly.
 #[derive(Debug)]
-enum ZeroDopplerOutcome {
+#[allow(dead_code)]
+pub(crate) enum ZeroDopplerOutcome {
     /// Solver converged.  `sat_sv` is the satellite state vector at `time`,
     /// returned directly from the final Lagrange evaluation so the call site
     /// does not need to call `interpolate_orbit` again.
@@ -539,6 +540,7 @@ pub(crate) enum TerrainGeometryOutcome {
 /// See the previous docstring of `compute_flattening_weight` (now subsumed
 /// by this function) for the full derivation and the rationale for using
 /// centred differences over forward differences.
+#[allow(dead_code)]
 pub(crate) fn compute_terrain_geometry(
     lat: f64,
     lon: f64,
@@ -794,6 +796,7 @@ fn bilinear_sample_slice(data: &[f32], n_lines: usize, n_samples: usize, line: f
 }
 
 /// Bilinear interpolation of a value in the merged sigma0 image.
+#[allow(dead_code)]
 fn bilinear_sample(merged: &MergedSigma0, line: f64, sample: f64) -> f32 {
     bilinear_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
 }
@@ -910,7 +913,7 @@ fn resample_merged(
 ///   usually indicates bad orbit data or a target inside the Earth.
 ///
 /// Orbit interpolation errors (coverage gaps) propagate up as `OrbitError`.
-fn solve_zero_doppler(
+pub(crate) fn solve_zero_doppler(
     target_ecef: [f64; 3],
     orbit: &OrbitData,
     initial_guess: DateTime<Utc>,

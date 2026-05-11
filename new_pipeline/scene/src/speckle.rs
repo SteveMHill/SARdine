@@ -349,7 +349,7 @@ fn gamma_map(data: &[f32], cols: usize, rows: usize, window: usize, enl: f32) ->
     let half = (window / 2) as i32;
     // Speckle CV² = 1/L for amplitude-detected intensity, same as Lee.
     let cv_n_sq = 1.0_f32 / enl;
-    let cv_n = cv_n_sq.sqrt();
+    let _cv_n = cv_n_sq.sqrt();
     // Maximum tolerable scene CV before declaring the pixel a point
     // target (passes through unchanged).  Lopes 1990 defines this as
     // CV_max² = 2 · CV_n² / (1 − CV_n²); for L=1 this is 1.0

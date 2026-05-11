@@ -346,14 +346,6 @@ pub fn write_cog_with_crs(
 
     let geo_keys = crs.geo_key_directory();
 
-    // SAFETY-OK: little-endian host enforced by compile_error in write_cog_raw_inner;
-    // f32 backing bytes match on-disk TIFF II byte order.  data.len() * 4 is the
-    // exact byte count of the f32 slice (no padding, no alignment gap).
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
-
-    drop(bytes); // not needed; tile writer reads from the f32 slice directly
     write_cog_raw_inner(
         path, data, cols, rows, geotransform,
         tile_size, &geo_keys,

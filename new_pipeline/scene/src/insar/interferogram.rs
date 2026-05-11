@@ -78,12 +78,14 @@ use chrono::{DateTime, Duration, Utc};
 use rayon::prelude::*;
 
 use crate::insar::{coreg::{ecef_from_slant_range_doppler, Coregistered}, error::InsarError};
-use crate::orbit::{interpolate_orbit_and_accel, OrbitError};
+use crate::orbit::interpolate_orbit_and_accel;
 use crate::types::{OrbitData, SubSwathMetadata, SPEED_OF_LIGHT_M_S};
 
 // ── WGS84 ellipsoid ────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 const WGS84_A: f64 = 6_378_137.0;
+#[allow(dead_code)]
 const WGS84_B: f64 = 6_356_752.314_245;
 
 // ── Default window sizes ──────────────────────────────────────────────────
@@ -414,6 +416,7 @@ pub fn form_interferogram(
 ///
 /// Uses a Newton-type 2-iteration approach.  For the purposes of flat-earth
 /// phase estimation (accuracy requirement ~0.1 rad) this is sufficient.
+#[allow(dead_code)]
 fn ellipsoid_intercept(sat_pos: [f64; 3], sat_vel: [f64; 3], r_ref: f64) -> [f64; 3] {
     // Normalise velocity to get along-track unit vector.
     let v_norm = {

@@ -43,8 +43,6 @@ mod inner {
     };
 
     use thiserror::Error;
-    const ASF_DATAPOOL: &str = "https://datapool.asf.alaska.edu";
-
     // ASF Search API endpoint (public, no auth required).
     const ASF_SEARCH_URL: &str = "https://api.daac.asf.alaska.edu/services/search/param";
 
@@ -562,46 +560,6 @@ mod inner {
             .map_err(|e| e.to_string())
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Internal helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Map the S1A/S1B prefix to the ASF datapool two-letter satellite code.
-    fn satellite_code(product_id: &str) -> Result<&'static str, SlcFetchError> {
-        if product_id.starts_with("S1A") {
-            Ok("SA")
-        } else if product_id.starts_with("S1B") {
-            Ok("SB")
-        } else {
-            Err(SlcFetchError::UnknownSatellite(
-                product_id[..product_id.len().min(6)].to_string(),
-            ))
-        }
-    }
-
-    /// Derive the ASF product type segment from the product ID.
-    ///
-    /// Returns `"SLC"` unless the ID contains `"_GRD"`.
-    fn product_type(product_id: &str) -> &'static str {
-        if product_id.contains("_GRD") {
-            "GRD"
-        } else {
-            "SLC"
-        }
-    }
-
-    /// Build the ASF datapool download URL for a product ID.
-    ///
-    /// Format: `https://datapool.asf.alaska.edu/{TYPE}/{SAT}/{PRODUCT_ID}.zip`
-    fn build_url(product_id: &str) -> Result<String, SlcFetchError> {
-        let sat = satellite_code(product_id)?;
-        let ptype = product_type(product_id);
-        Ok(format!(
-            "{}/{}/{}/{}.zip",
-            ASF_DATAPOOL, ptype, sat, product_id
-        ))
-    }
-
     // Maximum number of redirects to follow manually.
     const MAX_REDIRECTS: usize = 10;
 
@@ -963,7 +921,6 @@ mod inner {
                 let bytes_done = Arc::clone(&bytes_done);
                 let progress_arc = progress.cloned();
                 let final_url = final_url.clone();
-                let product_id = product_id.to_string();
 
                 handles.push(scope.spawn(move || -> Result<(), SlcFetchError> {
                     // S3 pre-signed URLs encode credentials in query params.
@@ -1257,53 +1214,6 @@ mod inner {
     mod tests {
         use super::*;
         use chrono::{Datelike, Timelike};
-
-        // ── existing build_url / token tests ─────────────────────────────────
-
-        #[test]
-        fn test_build_url_s1b_slc() {
-            let url = build_url(
-                "S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833",
-            )
-            .unwrap();
-            assert_eq!(
-                url,
-                "https://datapool.asf.alaska.edu/SLC/SB/\
-                 S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833.zip"
-            );
-        }
-
-        #[test]
-        fn test_build_url_s1a_slc() {
-            let url = build_url(
-                "S1A_IW_SLC__1SDV_20201005T170824_20201005T170851_034664_04098A_1E66",
-            )
-            .unwrap();
-            assert_eq!(
-                url,
-                "https://datapool.asf.alaska.edu/SLC/SA/\
-                 S1A_IW_SLC__1SDV_20201005T170824_20201005T170851_034664_04098A_1E66.zip"
-            );
-        }
-
-        #[test]
-        fn test_build_url_unknown_satellite() {
-            let err = build_url("S2A_MSIL1C_20190123").unwrap_err();
-            assert!(
-                matches!(err, SlcFetchError::UnknownSatellite(_)),
-                "expected UnknownSatellite, got {:?}",
-                err
-            );
-        }
-
-        #[test]
-        fn test_build_url_grd() {
-            let url = build_url(
-                "S1A_IW_GRDH_1SDV_20201005T170824_20201005T170849_034664_04098A_1234",
-            )
-            .unwrap();
-            assert!(url.contains("/GRD/"), "expected GRD in URL: {}", url);
-        }
 
         #[test]
         fn test_token_from_env_absent() {
