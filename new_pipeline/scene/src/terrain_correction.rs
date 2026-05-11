@@ -796,7 +796,7 @@ fn bilinear_sample_slice(data: &[f32], n_lines: usize, n_samples: usize, line: f
 }
 
 /// Bilinear interpolation of a value in the merged sigma0 image.
-#[allow(dead_code)]
+#[cfg(test)]
 fn bilinear_sample(merged: &MergedSigma0, line: f64, sample: f64) -> f32 {
     bilinear_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
 }
