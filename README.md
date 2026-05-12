@@ -4,7 +4,7 @@ Sentinel-1 IW SLC backscatter processing pipeline in Rust.
 
 > **Status (May 2026):** pre-1.0. The end-to-end pipeline is implemented and
 > empirically validated against ASF RTC10 GAMMA at **+0.016 dB median linear
-> bias** on S1B (10×10 multilook). **358 unit tests + 1 guard integration
+> bias** on S1B (10×10 multilook). **362 unit tests + 1 guard integration
 > test** pass (`cargo test`).
 
 The active codebase is a single Rust crate at

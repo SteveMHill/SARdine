@@ -5,7 +5,7 @@
 ## Current state in one sentence
 
 End-to-end pipeline is complete and empirically validated against ASF RTC10
-GAMMA at +0.016 dB median linear bias (S1B, after 10×10 multilook). **301
+GAMMA at +0.016 dB median linear bias (S1B, after 10×10 multilook). **362
 unit tests + 1 guard integration test** pass. The pipeline reads a full
 S1A/S1B IW SLC product, applies a precise POEORB orbit, debursts,
 calibrates (σ⁰ + per-pixel NESZ), merges all three IW subswaths, geocodes
@@ -21,7 +21,7 @@ library entry points are exposed as a Python extension
 
 ```
 cd /home/datacube/dev/SARdine/new_pipeline/scene
-cargo test                                  # all 301 unit + 1 guard test must pass
+cargo test                                  # all 362 unit + 1 guard test must pass
 cargo build --release
 
 # Inspect a SAFE
@@ -58,7 +58,7 @@ See [HANDOVER.md §3](HANDOVER.md) for the full quick-start and last verified ru
 
 ## `sardine-scene` crate — `new_pipeline/scene/`
 
-Rust crate. **301 unit tests + 1 guard integration test**, no GDAL dependency.
+Rust crate. **362 unit tests + 1 guard integration test**, no GDAL dependency.
 
 **Cargo.toml deps:** `chrono 0.4`, `quick-xml 0.36`, `serde 1`, `thiserror 1`,
 `proj4rs 0.1`, `rayon 1`, `tempfile 3` (dev). Optional: `reqwest`, `zip`,
