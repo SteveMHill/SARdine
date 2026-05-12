@@ -75,10 +75,10 @@ enum Commands {
 
     /// Produce coherence (and optionally wrapped phase) for an InSAR pair.
     ///
-    /// Processes all three IW sub-swaths.  Output files are written with
-    /// per-subswath suffixes (`_IW1_coherence.tif`, etc.) appended to the
-    /// `--output` basename.  No geocoding is performed; output is in
-    /// slant-range radar geometry (non-georeferenced TIFF).
+    /// Processes all three IW sub-swaths.  Each subswath produces a geocoded
+    /// GeoTIFF with per-subswath suffixes (`<output>_iw{n}_coherence.tif`, etc.).
+    /// When `--output-phase` is set, `<output>_iw{n}_phase.tif` files are also
+    /// written.  Output CRS defaults to WGS84 (`--crs wgs84`).
     Insar(InsarArgs),
 
     /// Process multiple scenes from a JSON batch file.
@@ -906,7 +906,7 @@ struct InsarArgs {
     #[arg(long, value_name = "FILE")]
     secondary_orbit: Option<PathBuf>,
 
-    /// Polarization channel: `VV` (default) or `VH`.
+    /// Polarization channel: `VV` (default), `VH`, `HH`, or `HV`.
     #[arg(long, value_name = "POL", default_value = "VV")]
     polarization: String,
 
@@ -939,6 +939,19 @@ struct InsarArgs {
     #[arg(long, value_name = "DEG", default_value_t = 0.0001_f64)]
     pixel_spacing_deg: f64,
 
+    /// Output pixel spacing in metres (for projected CRSs such as UTM or LAEA).
+    #[arg(long, value_name = "M", default_value_t = 10.0_f64)]
+    pixel_spacing_m: f64,
+
+    /// Output CRS.  `wgs84` (default, EPSG:4326), `auto` (UTM zone chosen
+    /// from scene centre), or an explicit code such as `EPSG:32632`.
+    #[arg(long, value_name = "SPEC", default_value = "wgs84")]
+    crs: String,
+
+    /// Write Cloud-Optimised GeoTIFF (tiled, with overview pyramid).
+    #[arg(long)]
+    cog: bool,
+
     /// Number of processing threads.  0 = use all available CPU cores (default).
     #[arg(long, value_name = "N", default_value_t = 0usize)]
     threads: usize,
@@ -959,6 +972,9 @@ fn cmd_insar(args: InsarArgs) -> Result<()> {
         output_phase: args.output_phase,
         geoid: args.geoid,
         pixel_spacing_deg: args.pixel_spacing_deg,
+        pixel_spacing_m: args.pixel_spacing_m,
+        crs: args.crs,
+        cog: args.cog,
         threads: args.threads,
     };
     sardine::run::run_insar(&opts)

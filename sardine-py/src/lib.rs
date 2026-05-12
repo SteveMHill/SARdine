@@ -5,6 +5,7 @@
 //!
 //! * [`process`] — full backscatter pipeline (equivalent to `sardine process`).
 //! * [`grd`]     — ground-range pipeline (equivalent to `sardine grd`).
+//! * [`insar`]   — InSAR coherence / wrapped phase (equivalent to `sardine insar`).
 //!
 //! Both functions take only the four required arguments positionally;
 //! every other knob is a keyword argument with the same default the CLI
@@ -28,9 +29,10 @@ use std::path::PathBuf;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use sardine::run::{
+use sardine::run::
+{
     parse_iw_selection, parse_output_mode, parse_speckle_order,
-    run_grd_multi, run_process_multi, GrdOptions, ProcessOptions, ResamplingKernel,
+    run_grd_multi, run_insar, run_process_multi, GrdOptions, InsarOptions, ProcessOptions, ResamplingKernel,
 };
 
 /// Convert an `anyhow::Error` into a Python `RuntimeError` with the
@@ -210,6 +212,85 @@ fn grd(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// InSAR pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the InSAR coherence (and optionally wrapped phase) pipeline.
+///
+/// Equivalent to `sardine insar …`.  Required positional arguments:
+///
+/// * ``reference`` — path to reference Sentinel-1 IW SLC ``.SAFE``.
+/// * ``secondary`` — path to secondary Sentinel-1 IW SLC ``.SAFE``.
+/// * ``output``    — output basename (``.tif`` extension optional; suffixes added).
+/// * ``geoid``     — ``"auto"``, ``"zero"``, or path to EGM96 grid.
+///
+/// All other parameters are keyword-only.  See
+/// [`sardine::run::InsarOptions`] for field semantics.
+#[pyfunction]
+#[pyo3(signature = (
+    reference,
+    secondary,
+    output,
+    geoid,
+    *,
+    dem = None,
+    dem_source = "srtm1".to_owned(),
+    reference_orbit = None,
+    secondary_orbit = None,
+    polarization = "VV".to_owned(),
+    az_looks = sardine::insar::interferogram::DEFAULT_COH_AZ_LOOKS,
+    rg_looks = sardine::insar::interferogram::DEFAULT_COH_RG_LOOKS,
+    output_phase = false,
+    pixel_spacing_deg = 0.0001,
+    pixel_spacing_m = 10.0,
+    crs = "wgs84".to_owned(),
+    cog = false,
+    threads = 0,
+))]
+#[allow(clippy::too_many_arguments)]
+fn insar(
+    py: Python<'_>,
+    reference: PathBuf,
+    secondary: PathBuf,
+    output: PathBuf,
+    geoid: String,
+    dem: Option<PathBuf>,
+    dem_source: String,
+    reference_orbit: Option<PathBuf>,
+    secondary_orbit: Option<PathBuf>,
+    polarization: String,
+    az_looks: usize,
+    rg_looks: usize,
+    output_phase: bool,
+    pixel_spacing_deg: f64,
+    pixel_spacing_m: f64,
+    crs: String,
+    cog: bool,
+    threads: usize,
+) -> PyResult<()> {
+    let opts = InsarOptions {
+        reference,
+        secondary,
+        output,
+        dem,
+        dem_source,
+        reference_orbit,
+        secondary_orbit,
+        polarization,
+        az_looks,
+        rg_looks,
+        output_phase,
+        geoid,
+        pixel_spacing_deg,
+        pixel_spacing_m,
+        crs,
+        cog,
+        threads,
+    };
+    py.allow_threads(|| run_insar(&opts)).map_err(py_err)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Optional fetch helpers (feature-gated)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -361,6 +442,7 @@ fn features(py: Python<'_>) -> PyResult<Py<PyAny>> {
 fn _sardine(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process, m)?)?;
     m.add_function(wrap_pyfunction!(grd, m)?)?;
+    m.add_function(wrap_pyfunction!(insar, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_orbit, m)?)?;
     m.add_function(wrap_pyfunction!(download_slc, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_geoid, m)?)?;

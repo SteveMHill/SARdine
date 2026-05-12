@@ -792,10 +792,19 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     // ── Resolve geoid ─────────────────────────────────────────────────────────
     let geoid = resolve_geoid(&opts.geoid)?;
 
-    // ── Terrain correction config (shared across subswaths) ──────────────────
-    let tc_pixel_spacing = opts.pixel_spacing_deg;
+    // ── Resolve output CRS and pixel spacing ─────────────────────────────────
+    let scene_centre = (
+        0.5 * (bb.min_lon_deg + bb.max_lon_deg),
+        0.5 * (bb.min_lat_deg + bb.max_lat_deg),
+    );
+    let output_crs = resolve_crs(&opts.crs, Some(scene_centre))?;
+    let tc_pixel_spacing = if output_crs.is_metric() {
+        opts.pixel_spacing_m
+    } else {
+        opts.pixel_spacing_deg
+    };
     if tc_pixel_spacing <= 0.0 {
-        bail!("--pixel-spacing-deg must be > 0 (got {})", tc_pixel_spacing);
+        bail!("pixel spacing must be > 0 (got {})", tc_pixel_spacing);
     }
 
     // ── Build output basename (strip extension from opts.output) ─────────────
@@ -1063,6 +1072,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
 
         let mut tc_cfg = TerrainCorrectionConfig::new(geoid.clone());
         tc_cfg.pixel_spacing_deg = tc_pixel_spacing;
+        tc_cfg.crs = output_crs;
         tc_cfg.flatten = false;  // coherence has no radiometric normalisation
 
         let coh_geocoded = terrain_correction(&coh_merged, &ml_scene, &dem, &iw_grids, &tc_cfg)
@@ -1079,17 +1089,31 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
 
         // ── Write coherence GeoTIFF ───────────────────────────────────────────
         let coh_path = format!("{out_base_str}_{iw_str}_coherence.tif");
-        tracing::info!("writing coherence GeoTIFF → {}", coh_path);
         let t_export = Instant::now();
-        write_geotiff_with_crs(
-            &coh_path,
-            &coh_geocoded.data,
-            coh_geocoded.cols,
-            coh_geocoded.rows,
-            coh_geocoded.geotransform,
-            &coh_geocoded.crs,
-        )
-        .with_context(|| format!("writing coherence GeoTIFF: {coh_path}"))?;
+        if opts.cog {
+            tracing::info!("writing coherence COG → {}", coh_path);
+            crate::export::write_cog_with_crs(
+                &coh_path,
+                &coh_geocoded.data,
+                coh_geocoded.cols,
+                coh_geocoded.rows,
+                coh_geocoded.geotransform,
+                &coh_geocoded.crs,
+                512,
+            )
+            .with_context(|| format!("writing coherence COG: {coh_path}"))?;
+        } else {
+            tracing::info!("writing coherence GeoTIFF → {}", coh_path);
+            write_geotiff_with_crs(
+                &coh_path,
+                &coh_geocoded.data,
+                coh_geocoded.cols,
+                coh_geocoded.rows,
+                coh_geocoded.geotransform,
+                &coh_geocoded.crs,
+            )
+            .with_context(|| format!("writing coherence GeoTIFF: {coh_path}"))?;
+        }
 
         // ── Write phase GeoTIFF (optional) ────────────────────────────────────
         if opts.output_phase {
@@ -1114,16 +1138,30 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             report_timing("terrain_correction_phase", t_tc_phase);
 
             let phase_path = format!("{out_base_str}_{iw_str}_phase.tif");
-            tracing::info!("writing phase GeoTIFF → {}", phase_path);
-            write_geotiff_with_crs(
-                &phase_path,
-                &phase_geocoded.data,
-                phase_geocoded.cols,
-                phase_geocoded.rows,
-                phase_geocoded.geotransform,
-                &phase_geocoded.crs,
-            )
-            .with_context(|| format!("writing phase GeoTIFF: {phase_path}"))?;
+            if opts.cog {
+                tracing::info!("writing phase COG → {}", phase_path);
+                crate::export::write_cog_with_crs(
+                    &phase_path,
+                    &phase_geocoded.data,
+                    phase_geocoded.cols,
+                    phase_geocoded.rows,
+                    phase_geocoded.geotransform,
+                    &phase_geocoded.crs,
+                    512,
+                )
+                .with_context(|| format!("writing phase COG: {phase_path}"))?;
+            } else {
+                tracing::info!("writing phase GeoTIFF → {}", phase_path);
+                write_geotiff_with_crs(
+                    &phase_path,
+                    &phase_geocoded.data,
+                    phase_geocoded.cols,
+                    phase_geocoded.rows,
+                    phase_geocoded.geotransform,
+                    &phase_geocoded.crs,
+                )
+                .with_context(|| format!("writing phase GeoTIFF: {phase_path}"))?;
+            }
         }
         report_timing("export", t_export);
 
@@ -1141,6 +1179,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             &igram,
             &coreg_result,
             wavelength_m,
+            opts.output_phase,
         );
         std::fs::write(&prov_path, &prov_json)
             .with_context(|| format!("writing provenance JSON: {prov_path}"))?;
@@ -1186,6 +1225,7 @@ fn build_insar_provenance_json(
     igram: &crate::insar::interferogram::Interferogram,
     coreg: &crate::insar::coreg::CoregResult,
     wavelength_m: f64,
+    output_phase: bool,
 ) -> String {
     let ref_orbit_str = reference_orbit
         .and_then(|p| p.to_str())
@@ -1214,7 +1254,9 @@ fn build_insar_provenance_json(
             "  \"ref_azimuth_pixel_spacing_m\": {aps:.6},\n",
             "  \"ref_slant_range_time_s\": {srt:.12e},\n",
             "  \"coreg_n_valid\": {n_valid},\n",
-            "  \"coreg_rms_px\": {rms:.6}\n",
+            "  \"coreg_rms_px\": {rms:.6},\n",
+            "  \"output_phase\": {output_phase},\n",
+            "  \"reramped\": {reramped}\n",
             "}}\n"
         ),
         ref = ref_str,
@@ -1233,6 +1275,8 @@ fn build_insar_provenance_json(
         srt = ref_sw.slant_range_time_s,
         n_valid = coreg.n_valid,
         rms = coreg.fit_residual_rms,
+        output_phase = output_phase,
+        reramped = output_phase,
     )
 }
 

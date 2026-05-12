@@ -315,7 +315,16 @@ pub struct InsarOptions {
     /// Geoid model spec: `"auto"`, `"zero"`, or a path to an EGM96 grid.
     pub geoid: String,
     /// Output pixel spacing in degrees (WGS84 lat/lon grid).
+    /// Ignored when `crs` resolves to a projected CRS — use `pixel_spacing_m` in that case.
     pub pixel_spacing_deg: f64,
+    /// Output pixel spacing in metres.  Used when `crs` resolves to a metric
+    /// (projected) CRS such as UTM.  Default 10 m.
+    pub pixel_spacing_m: f64,
+    /// Output CRS: `"wgs84"` (default, EPSG:4326), `"auto"` (UTM zone from scene centre),
+    /// or an explicit `"EPSG:NNNNN"` code.
+    pub crs: String,
+    /// Write Cloud-Optimised GeoTIFF output using the pure-Rust tiled writer.
+    pub cog: bool,
     /// Number of Rayon threads.  0 = use all available cores.
     pub threads: usize,
 }
@@ -338,6 +347,9 @@ impl InsarOptions {
             output_phase: false,
             geoid: "auto".to_owned(),
             pixel_spacing_deg: 0.0001,
+            pixel_spacing_m: 10.0,
+            crs: "wgs84".to_owned(),
+            cog: false,
             threads: 0,
         }
     }
