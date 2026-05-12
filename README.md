@@ -1,103 +1,192 @@
 # SARdine
 
-Sentinel-1 IW SLC backscatter processing pipeline in Rust.
+**Sentinel-1 IW SLC backscatter processing pipeline in pure Rust.**
 
-> **Status (May 2026):** pre-1.0. The end-to-end pipeline is implemented and
-> empirically validated against ASF RTC10 GAMMA at **+0.016 dB median linear
-> bias** on S1B (10×10 multilook). **362 unit tests + 1 guard integration
-> test** pass (`cargo test`).
+> ⚠️ **Prototype — not production-ready.**
+> SARdine is research and reference software. It is not validated for
+> operational use, does not carry a stability guarantee, and has known
+> limitations (see [below](#limitations)). Use results at your own risk and
+> always verify outputs against a trusted reference product.
 
-The active codebase is a single Rust crate at
-[`new_pipeline/scene/`](new_pipeline/scene/) (`sardine-scene` v0.1.0). Python
-bindings live at [`new_pipeline/sardine-py/`](new_pipeline/sardine-py/)
-(`sardine` PyO3 wheel, built with maturin). The Python-and-Rust package under
-[`legacy/`](legacy/) is **reference-only** — see
-[LEGACY_STATUS.md](LEGACY_STATUS.md) and [AGENTS.md](AGENTS.md).
+[![CI](https://github.com/SteveMHill/SARdine/actions/workflows/ci.yml/badge.svg)](https://github.com/SteveMHill/SARdine/actions/workflows/ci.yml)
 
-## What works
+---
 
-- **Full terrain-correction pipeline** (`sardine process`): parse SAFE →
-  POEORB precise orbit → calibration + per-pixel NESZ → TOPS midpoint deburst
-  → IW1+IW2+IW3 merge → DEM mosaic (SRTM-1 or Copernicus GLO-30) → backward
-  Range-Doppler geocoding → Small (2011) terrain flattening (σ⁰ → γ⁰) → dB
-  → GeoTIFF
-- **Ground-range projection** (`sardine grd`): deburst + calibrate + project
-  to ground range, no DEM required
-- Single-polarization per run (`--polarization VV` or `VH`)
-- Output CRS: EPSG:4326, UTM 326XX/327XX, or `auto` (UTM zone from scene
-  centre); selectable pixel spacing (`--pixel-spacing-m`)
-- Output formats: stripped Float32 GeoTIFF, tiled Cloud-Optimised GeoTIFF
-  (`--cog`), BigTIFF for outputs >4 GiB
-- Speckle filtering on linear power before dB conversion: `none`, `boxcar`,
-  `lee`, `frost`, `gamma_map`, `refined_lee` (`--speckle KIND --speckle-window N`)
-- LIA and shadow/layover mask raster sidecars (`--write-lia`, `--write-mask`)
-- Provenance JSON sidecar written next to every output GeoTIFF
-- Per-pixel NESZ noise-floor masking (`--noise-floor-margin-db`)
-- EGM96 geoid correction (`--geoid auto|<path>|zero`); `--geoid` is **required**
-  (no silent default)
-- Pre-flight DEM coverage check before heavy processing starts
-- Auto-fetch POEORB from ESA STEP / AWS S3 (`--features orbit-fetch`)
-- SLC download from ASF Vertex (`--features slc-fetch`)
-- EGM96 geoid auto-fetch and cache (`--features geoid-fetch`)
-- Python bindings: `sardine.process()`, `sardine.grd()`, `sardine.fetch_orbit()`,
-  `sardine.download_slc()`, `sardine.fetch_geoid()`, `sardine.features()`
-- No GDAL dependency in `sardine-scene`; pure-Rust TIFF reader and writer
+## What is SARdine?
 
-## What is **not** in the active code
+SARdine reads a Sentinel-1 IW SLC product (`.SAFE` directory) and produces a
+calibrated, terrain-corrected, geocoded backscatter raster (σ⁰ or γ⁰) with no
+external dependencies beyond the Rust toolchain. There is no GDAL dependency;
+TIFF reading and writing are handled in pure Rust.
 
-- No single CLI call for dual-pol VV+VH (run twice, once per polarization)
-- No coherence / polarimetric workflow (intensity-only deburst by design)
-- No batch / multi-scene mosaic driver
-- No anti-meridian handling (scenes crossing ±180° produce incorrect bboxes)
-- IW mode only (EW and StripMap acquisition modes are not supported)
+The pipeline implements:
+
+1. **Parse** — annotation XMLs, calibration XMLs, noise XMLs
+2. **Precise orbit** — apply POEORB/RESORB (auto-fetch from ESA STEP / AWS S3
+   with `--features orbit-fetch`)
+3. **Calibration** — σ⁰ = (|DN|² − N) / K² using the LUT-based formula from
+   the Sentinel-1 Product Specification; per-pixel NESZ noise-floor correction
+4. **TOPS deburst** — midpoint-selection intensity deburst across all 9 bursts
+   per IW subswath
+5. **IW merge** — pixel-exact integer-offset merge of IW1 + IW2 + IW3
+6. **Terrain correction** — backward Range-Doppler geocoding with Newton
+   zero-Doppler solver; EGM96 or EGM2008 geoid undulation (auto-fetch with
+   `--features geoid-fetch`); DEM from SRTM-1 tiles or Copernicus GLO-30
+   (auto-fetch with `--features dem-fetch`)
+7. **Terrain flattening** — Small (2011) γ⁰ correction (optional, `--flatten`)
+8. **Speckle filtering** — boxcar, Lee (1981), Frost (1982), Gamma-MAP (Lopes
+   1990), Refined Lee (Lopes–Touzi–Nezry 1990); all behind a `SpeckleKernel`
+   trait for third-party extensions
+9. **Export** — Float32 GeoTIFF or Cloud-Optimised GeoTIFF (`--cog`),
+   BigTIFF auto-selected for outputs > 4 GiB; EPSG:4326, UTM, or `auto`
+10. **Provenance** — `.provenance.json` and `.stac.json` sidecars next to
+    every output
+
+**Python bindings** (PyO3, `sardine` wheel, `new_pipeline/sardine-py/`):
+`sardine.process()`, `sardine.grd()`, `sardine.fetch_orbit()`,
+`sardine.download_slc()`, `sardine.fetch_geoid()`, `sardine.features()`.
+
+---
+
+## Validation
+
+| Metric | Value |
+|--------|-------|
+| Reference product | ASF RTC10 GAMMA (S1B 2019-01-23, IW, DVP) |
+| Median linear bias | **+0.016 dB** (after 10×10 multilook) |
+| Test suite | **372 unit tests + 1 guard integration test** (`cargo test`) |
+
+The guard integration test (`tests/no_silent_fallbacks.rs`) enforces that no
+`.unwrap_or*`, `todo!`, `panic!`, or hardcoded Sentinel-1 constants exist in
+production code without an explicit `// SAFETY-OK:` annotation.
+
+---
 
 ## Quick start
 
-### Rust CLI
+### Requirements
+
+- Rust stable ≥ 1.80 (`rustup update stable`)
+- A Sentinel-1 IW SLC product (`.SAFE` directory), freely available from
+  [ASF Vertex](https://search.asf.alaska.edu/) or
+  [Copernicus Dataspace](https://dataspace.copernicus.eu/)
+
+### Build and test
 
 ```sh
 cd new_pipeline/scene
-cargo test                              # 358 unit + 1 guard test must pass
+cargo test          # 372 unit + 1 guard test must pass
 cargo build --release
+```
 
-# Inspect a SAFE product
-cargo run --release -- inspect /path/to/S1B.SAFE
+### Inspect a SAFE product
 
-# Full terrain-correction pipeline
+```sh
+cargo run --release -- inspect /path/to/S1B_IW_SLC__1SDV_....SAFE
+```
+
+### Full terrain-correction pipeline
+
+```sh
 cargo run --release --features orbit-fetch,dem-fetch,geoid-fetch -- process \
     --safe         /path/to/S1B.SAFE \
     --dem          /path/to/dem_tiles_dir/ \
-    --output       sardine_out.tiff \
+    --output       output_sigma0.tif \
     --polarization VV \
     --geoid        auto \
     --crs          auto \
-    --cog                               # write Cloud-Optimised GeoTIFF
-
-# Auto-fetch orbit (no --orbit flag needed with --features orbit-fetch):
-#   tries AWS S3 s1-orbits first, falls back to ESA STEP
-# --geoid auto fetches and caches EGM96 (needs --features geoid-fetch)
-# Set RUST_LOG=sardine_scene=debug for detailed progress
+    --cog
 ```
+
+Key flags:
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--polarization` | *(required)* | `VV`, `VH`, `VV+VH` (dual-pol writes two files) |
+| `--geoid` | *(required)* | `auto` (fetch+cache EGM96), `egm2008`, or path to grid file |
+| `--crs` | `epsg:4326` | `auto` (UTM from scene centre), `utm32n`, … |
+| `--pixel-spacing-m` | 10.0 | Output pixel spacing in metres |
+| `--flatten` | off | Apply Small (2011) terrain flattening (γ⁰) |
+| `--speckle` | `none` | `boxcar`, `lee`, `frost`, `gamma_map`, `refined_lee` |
+| `--resampling` | `bilinear` | `bicubic`, `lanczos3` |
+| `--cog` | off | Write Cloud-Optimised GeoTIFF |
+| `--write-lia` | off | Write local incidence angle sidecar |
+| `--write-mask` | off | Write shadow/layover mask sidecar |
+| `--noise-floor-margin-db` | off | Mask pixels within N dB of NESZ |
+
+Auto-fetch behaviour (requires the corresponding feature flag at compile time):
+
+- **`--features orbit-fetch`** — `--orbit` can be omitted; POEORB fetched from
+  AWS S3 `s1-orbits`, fallback to ESA STEP
+- **`--features dem-fetch`** — `--dem` can be omitted; Copernicus GLO-30 tiles
+  fetched and cached
+- **`--features geoid-fetch`** — `--geoid auto` downloads and caches the EGM96
+  grid (≈ 7 MB)
+
+Set `RUST_LOG=sardine_scene=info` for a progress log.
 
 ### Python bindings
 
 ```sh
 cd new_pipeline/sardine-py
 python3 -m venv .venv && source .venv/bin/activate
-pip install maturin pytest
-maturin develop --features slc-fetch
-python3 -c "import sardine; print(sardine.features())"
+pip install maturin
+maturin develop --release --features slc-fetch
 ```
 
-## Documentation
+```python
+import sardine
 
-- [docs/HANDOVER.md](docs/HANDOVER.md) — full developer handover (current state,
-  validation results, open items)
-- [docs/PROGRESS.md](docs/PROGRESS.md) — step-by-step build log and next steps
-- [docs/architecture_overview.md](docs/architecture_overview.md) — module map
-- [AGENTS.md](AGENTS.md) — non-negotiable working rules for contributors and AI agents
-- [LEGACY_STATUS.md](LEGACY_STATUS.md) — why the legacy package is reference-only
+result = sardine.process(
+    safe_path="/path/to/S1B.SAFE",
+    output_path="output.tif",
+    polarization="VV",
+    geoid="auto",
+    crs="auto",
+    cog=True,
+)
+print(result)
+```
+
+---
+
+## Repository layout
+
+```
+new_pipeline/
+    scene/          sardine-scene Rust crate (the pipeline)
+    sardine-py/     Python bindings (PyO3 / maturin)
+legacy/             Reference-only legacy Python+Rust code (do not use)
+docs/               Architecture notes, handover doc, progress log
+scripts/            Validation and diagnostic Python scripts
+data/               Test data (not committed — see .gitignore)
+AGENTS.md           Non-negotiable working rules for contributors and AI agents
+```
+
+---
+
+## Limitations
+
+- **Prototype only** — outputs have not been independently validated beyond the
+  single S1B scene referenced above
+- IW acquisition mode only (EW, StripMap not supported)
+- Anti-meridian scenes (crossing ±180°) produce incorrect bounding boxes
+- No coherence or polarimetric decomposition (intensity-only deburst)
+- No batch/multi-scene mosaic driver
+- The `legacy/` directory contains the original Python pipeline, which is kept
+  as reference material only and is known to contain errors — do not use it for
+  processing
+
+---
+
+## Contributing
+
+Read [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before
+making changes. The core rules: no silent fallbacks, no hardcoded Sentinel-1
+constants, every failure is a typed error variant.
+
+---
 
 ## License
 
-See repository.
+Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
