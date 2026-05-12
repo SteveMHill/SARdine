@@ -254,9 +254,15 @@ impl AzimuthFmRate {
 
 /// Geographic bounding box in WGS84 degrees.
 ///
-/// **Limitation:** This uses simple min/max and does NOT handle anti-meridian
-/// wrapping. Scenes crossing ±180° longitude (e.g. in the Pacific) will
-/// produce invalid `min_lon > max_lon` and fail validation.
+/// For normal scenes (not crossing the anti-meridian) both longitude fields
+/// are in `[−180, 180]` with `min_lon_deg < max_lon_deg`.
+///
+/// **Anti-meridian crossing scenes** (e.g. in the Pacific) are represented
+/// with `min_lon_deg ∈ [0, 180]` and `max_lon_deg > 180` (up to ~360°).
+/// For example, a scene spanning 178°E to 182°E (= 178°W) is stored as
+/// `min_lon_deg = 178, max_lon_deg = 182`.  Consumers that need standard
+/// `[−180, 180]` coordinates (STAC JSON, tile filenames) should normalise:
+/// `if lon > 180.0 { lon - 360.0 } else { lon }`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BoundingBox {
     pub min_lat_deg: f64,

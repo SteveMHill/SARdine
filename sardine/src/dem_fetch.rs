@@ -154,7 +154,11 @@ mod inner {
         let mut corners = Vec::new();
         for lat in lat0..=lat1 {
             for lon in lon0..=lon1 {
-                corners.push((lat, lon));
+                // Normalise to standard [−180, 180) range for tile filenames
+                // and download URLs; anti-meridian bboxes (max_lon > 180) may
+                // produce lon values above 180 in this loop.
+                let lon_norm = if lon > 180 { lon - 360 } else { lon };
+                corners.push((lat, lon_norm));
             }
         }
         corners

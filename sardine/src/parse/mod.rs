@@ -359,12 +359,32 @@ fn extract_scene_metadata(
     let bounding_box = if all_lats.is_empty() {
         return Err(ParseError::MissingField("geolocation grid points"));
     } else {
-        BoundingBox {
-            min_lat_deg: all_lats.iter().copied().fold(f64::INFINITY, f64::min),
-            max_lat_deg: all_lats.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            min_lon_deg: all_lons.iter().copied().fold(f64::INFINITY, f64::min),
-            max_lon_deg: all_lons.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        }
+        let min_lat_deg = all_lats.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_lat_deg = all_lats.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let raw_min_lon = all_lons.iter().copied().fold(f64::INFINITY, f64::min);
+        let raw_max_lon = all_lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+        // If the naive longitude span > 180°, the scene straddles the
+        // anti-meridian (e.g. GCPs at 178° and −178° give span = 356°,
+        // not a real 356°-wide scene).  Re-wrap negative longitudes by
+        // +360° so the range becomes e.g. [178°, 182°] — max_lon_deg > 180
+        // is the canonical internal representation for anti-meridian
+        // crossing scenes.  Consumers that need standard [−180, 180]
+        // coordinates (STAC JSON, tile names) normalise on output.
+        let (min_lon_deg, max_lon_deg) = if raw_max_lon - raw_min_lon > 180.0 {
+            let rewrapped: Vec<f64> = all_lons
+                .iter()
+                .map(|&l| if l < 0.0 { l + 360.0 } else { l })
+                .collect();
+            (
+                rewrapped.iter().copied().fold(f64::INFINITY, f64::min),
+                rewrapped.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            (raw_min_lon, raw_max_lon)
+        };
+
+        BoundingBox { min_lat_deg, max_lat_deg, min_lon_deg, max_lon_deg }
     };
 
     let scene = SceneMetadata {
@@ -1073,5 +1093,59 @@ mod tests {
                 "dc_estimates not monotonically increasing in time"
             );
         }
+    }
+
+    // ── Anti-meridian bounding-box tests ──────────────────────────
+
+    /// The bounding-box logic should re-wrap GCP longitudes when the naive
+    /// min/max span exceeds 180°, producing max_lon > 180 rather than a
+    /// spurious 356°-wide box.
+    #[test]
+    fn test_bbox_antimeridian_rewrap() {
+        // Simulate GCP lons straddling ±180°.
+        // Naive min = −179, max = 179, span = 358° → triggers re-wrap.
+        // Re-wrapped: [179, 179, 181, 181] → min = 179, max = 181.
+        let all_lons = vec![179.0_f64, 179.5, -179.5, -179.0];
+
+        let raw_min = all_lons.iter().copied().fold(f64::INFINITY, f64::min);
+        let raw_max = all_lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (min_lon, max_lon) = if raw_max - raw_min > 180.0 {
+            let rewrapped: Vec<f64> =
+                all_lons.iter().map(|&l| if l < 0.0 { l + 360.0 } else { l }).collect();
+            (
+                rewrapped.iter().copied().fold(f64::INFINITY, f64::min),
+                rewrapped.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            (raw_min, raw_max)
+        };
+
+        // True span should be ≈ 2°, not 358°
+        assert!(max_lon - min_lon < 180.0, "span should be < 180°, got {}", max_lon - min_lon);
+        assert!(max_lon > 180.0, "anti-meridian crossing: max_lon should be > 180, got {max_lon}");
+        assert!((min_lon - 179.0).abs() < 1e-10, "expected min_lon ≈ 179, got {min_lon}");
+        assert!((max_lon - 181.0).abs() < 1e-10, "expected max_lon ≈ 181, got {max_lon}");
+    }
+
+    /// Normal scenes (not crossing ±180°) should be unaffected.
+    #[test]
+    fn test_bbox_normal_scene_unaffected() {
+        let all_lons = vec![7.5_f64, 8.0, 8.5, 9.0];
+
+        let raw_min = all_lons.iter().copied().fold(f64::INFINITY, f64::min);
+        let raw_max = all_lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (min_lon, max_lon) = if raw_max - raw_min > 180.0 {
+            let rewrapped: Vec<f64> =
+                all_lons.iter().map(|&l| if l < 0.0 { l + 360.0 } else { l }).collect();
+            (
+                rewrapped.iter().copied().fold(f64::INFINITY, f64::min),
+                rewrapped.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            (raw_min, raw_max)
+        };
+
+        assert!((min_lon - 7.5).abs() < 1e-10);
+        assert!((max_lon - 9.0).abs() < 1e-10);
     }
 }

@@ -692,24 +692,28 @@ impl DemMosaic {
     /// Returns `Ok(f32::NAN)` if the point is within a tile's coverage but
     /// the pixel is a void/nodata cell.
     pub fn elevation_at(&self, lat_deg: f64, lon_deg: f64) -> Result<f32, DemError> {
+        // Normalise longitude to [−180, 180) so that anti-meridian wrapped
+        // bounding boxes (max_lon_deg > 180) resolve to standard tile coords.
+        let lon_norm = if lon_deg >= 180.0 { lon_deg - 360.0 } else { lon_deg };
+
         // Warm path: try the last tile that satisfied this worker.
         // `tiles[i]` indexing is provably in-bounds because `index` is
         // built once at construction time and `tiles` is never mutated.
         let last = LAST_HIT_TILE.with(|c| c.get());
         if let Some(li) = last {
-            if let Some(h) = self.tiles[li as usize].elevation_at(lat_deg, lon_deg) {
+            if let Some(h) = self.tiles[li as usize].elevation_at(lat_deg, lon_norm) {
                 return Ok(h);
             }
         }
 
         // Cold path: hash bin then per-bin scan.
-        let key = (lat_deg.floor() as i32, lon_deg.floor() as i32);
+        let key = (lat_deg.floor() as i32, lon_norm.floor() as i32);
         if let Some(bin) = self.index.get(&key) {
             for &ti in bin {
                 if Some(ti) == last {
                     continue;
                 }
-                if let Some(h) = self.tiles[ti as usize].elevation_at(lat_deg, lon_deg) {
+                if let Some(h) = self.tiles[ti as usize].elevation_at(lat_deg, lon_norm) {
                     LAST_HIT_TILE.with(|c| c.set(Some(ti)));
                     return Ok(h);
                 }
@@ -724,8 +728,9 @@ impl DemMosaic {
     /// use; quadratic in the number of tiles per pixel.
     #[doc(hidden)]
     pub fn elevation_at_linear(&self, lat_deg: f64, lon_deg: f64) -> Result<f32, DemError> {
+        let lon_norm = if lon_deg >= 180.0 { lon_deg - 360.0 } else { lon_deg };
         for tile in &self.tiles {
-            if let Some(h) = tile.elevation_at(lat_deg, lon_deg) {
+            if let Some(h) = tile.elevation_at(lat_deg, lon_norm) {
                 return Ok(h);
             }
         }

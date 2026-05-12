@@ -195,7 +195,9 @@ pub(crate) fn build_provenance(
                 min_lat: bb.min_lat_deg,
                 max_lat: bb.max_lat_deg,
                 min_lon: bb.min_lon_deg,
-                max_lon: bb.max_lon_deg,
+                // Normalise anti-meridian crossing scenes (max_lon > 180) back
+                // to standard [-180, 180] for JSON / RFC 7946 compatibility.
+                max_lon: if bb.max_lon_deg > 180.0 { bb.max_lon_deg - 360.0 } else { bb.max_lon_deg },
             },
         },
         orbit: OrbitInfo {
@@ -326,7 +328,7 @@ pub(crate) fn build_grd_provenance(
                 min_lat: bb.min_lat_deg,
                 max_lat: bb.max_lat_deg,
                 min_lon: bb.min_lon_deg,
-                max_lon: bb.max_lon_deg,
+                max_lon: if bb.max_lon_deg > 180.0 { bb.max_lon_deg - 360.0 } else { bb.max_lon_deg },
             },
         },
         orbit: OrbitInfo {

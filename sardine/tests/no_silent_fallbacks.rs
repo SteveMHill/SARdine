@@ -8,11 +8,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Locate the repository root by walking upward until we find `AGENTS.md`.
+/// Locate the repository root by walking upward until we find `LICENSE`.
 fn repo_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
-        if p.join("AGENTS.md").is_file() {
+        if p.join("LICENSE").is_file() {
             return p;
         }
         if !p.pop() {

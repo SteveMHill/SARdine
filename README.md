@@ -154,7 +154,6 @@ data/               Test data (not committed — see .gitignore)
 - **Prototype only** — outputs have not been independently validated beyond the
   single S1B scene referenced above
 - IW acquisition mode only (EW, StripMap not supported)
-- Anti-meridian scenes (crossing ±180°) produce incorrect bounding boxes
 - No coherence or polarimetric decomposition (intensity-only deburst)
 - No batch/multi-scene mosaic driver
 
