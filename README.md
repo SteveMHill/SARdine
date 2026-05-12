@@ -48,20 +48,6 @@ The pipeline implements:
 
 ---
 
-## Validation
-
-| Metric | Value |
-|--------|-------|
-| Reference product | ASF RTC10 GAMMA (S1B 2019-01-23, IW, DVP) |
-| Median linear bias | **+0.016 dB** (after 10×10 multilook) |
-| Test suite | **372 unit tests + 1 guard integration test** (`cargo test`) |
-
-The guard integration test (`tests/no_silent_fallbacks.rs`) enforces that no
-`.unwrap_or*`, `todo!`, `panic!`, or hardcoded Sentinel-1 constants exist in
-production code without an explicit `// SAFETY-OK:` annotation.
-
----
-
 ## Quick start
 
 ### Requirements
@@ -159,7 +145,6 @@ sardine-validate/   End-to-end radiometric regression harness
 docs/               Architecture notes, handover doc, progress log
 scripts/            Validation and diagnostic Python scripts
 data/               Test data (not committed — see .gitignore)
-AGENTS.md           Non-negotiable working rules for contributors and AI agents
 ```
 
 ---
@@ -172,17 +157,6 @@ AGENTS.md           Non-negotiable working rules for contributors and AI agents
 - Anti-meridian scenes (crossing ±180°) produce incorrect bounding boxes
 - No coherence or polarimetric decomposition (intensity-only deburst)
 - No batch/multi-scene mosaic driver
-- The `legacy/` directory contains the original Python pipeline, which is kept
-  as reference material only and is known to contain errors — do not use it for
-  processing
-
----
-
-## Contributing
-
-Read [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md) before
-making changes. The core rules: no silent fallbacks, no hardcoded Sentinel-1
-constants, every failure is a typed error variant.
 
 ---
 
