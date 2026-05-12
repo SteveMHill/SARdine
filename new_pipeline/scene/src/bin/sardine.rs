@@ -295,6 +295,8 @@ struct ProcessArgs {
     ///   `bilinear` (default): 4-tap bilinear — low-pass, no overshoot.
     ///   `bicubic`           : 16-tap Keys kernel (α=−0.5) — sharper but
     ///                         can ring near bright point targets.
+    ///   `lanczos3`          : 36-tap Lanczos-3 kernel — sharpest; best
+    ///                         for outputs much coarser than input spacing.
     #[arg(long, value_name = "KERNEL", default_value = "bilinear")]
     resampling: String,
 }
@@ -310,14 +312,15 @@ fn parse_iw_selection(iw: &str, burst_range: Option<&str>) -> Result<IwSelection
         .with_context(|| format!("--iw / --burst-range: invalid selection (iw={iw:?})"))
 }
 
-/// Parse `--resampling bilinear|bicubic`.
+/// Parse `--resampling bilinear|bicubic|lanczos3`.
 fn parse_resampling(s: &str) -> Result<sardine_scene::run::ResamplingKernel> {
     use sardine_scene::run::ResamplingKernel;
     match s.trim().to_ascii_lowercase().as_str() {
         "bilinear" => Ok(ResamplingKernel::Bilinear),
         "bicubic"  => Ok(ResamplingKernel::Bicubic),
+        "lanczos3" => Ok(ResamplingKernel::Lanczos3),
         other      => anyhow::bail!(
-            "unknown resampling kernel '{other}'; valid values: bilinear, bicubic"
+            "unknown resampling kernel '{other}'; valid values: bilinear, bicubic, lanczos3"
         ),
     }
 }

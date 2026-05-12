@@ -35,6 +35,7 @@ use crate::geoid::GeoidModel;
 use crate::merge_subswaths::MergedSigma0;
 use crate::orbit::{interpolate_orbit_and_accel, OrbitError};
 use crate::output_crs::{OutputCrs, OutputCrsError, Projector};
+use crate::pipeline_options::{RadarImage, ResamplingKernel};
 use crate::types::{
     GeolocationGridPoint, OrbitData, SceneMetadata, SubSwathId, SPEED_OF_LIGHT_M_S,
 };
@@ -699,7 +700,7 @@ impl RadarGeometry {
     /// the required timing parameters.
     fn from_scene_and_merged(
         scene: &SceneMetadata,
-        merged: &MergedSigma0,
+        merged: &dyn RadarImage,
     ) -> Result<Self, TerrainCorrectionError> {
         // All IW subswaths share the same azimuth time interval to within
         // numerical precision; pick the first available subswath.
@@ -724,18 +725,18 @@ impl RadarGeometry {
         // product-level `scene.start_time`, which differs by up to a few ms
         // (~1 line) from the debursted line-0 time and produced a constant
         // global azimuth bias.
-        let az_start = merged.azimuth_start_time;
+        let az_start = merged.azimuth_start_time();
 
         // Near range from the merged image header.
-        let near_range_m = merged.near_slant_range_time_s * SPEED_OF_LIGHT_M_S / 2.0;
+        let near_range_m = merged.near_slant_range_time_s() * SPEED_OF_LIGHT_M_S / 2.0;
 
         Ok(RadarGeometry {
             azimuth_start_time: az_start,
             azimuth_time_interval_s: ati,
             near_range_m,
-            range_pixel_spacing_m: merged.range_pixel_spacing_m,
-            n_lines: merged.lines,
-            n_samples: merged.samples,
+            range_pixel_spacing_m: merged.range_pixel_spacing_m(),
+            n_lines: merged.lines(),
+            n_samples: merged.samples(),
         })
     }
 
@@ -872,20 +873,113 @@ fn bicubic_sample_slice(
 
 /// Resample the merged sigma0 image at fractional coordinates using the
 /// configured [`crate::pipeline_options::ResamplingKernel`].
+#[cfg(test)]
 fn resample_merged(
     merged: &MergedSigma0,
     line: f64,
     sample: f64,
     kernel: crate::pipeline_options::ResamplingKernel,
 ) -> f32 {
-    match kernel {
-        crate::pipeline_options::ResamplingKernel::Bilinear => {
-            bilinear_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
-        }
-        crate::pipeline_options::ResamplingKernel::Bicubic => {
-            bicubic_sample_slice(&merged.data, merged.lines, merged.samples, line, sample)
+    merged.sample_at(line, sample, kernel)
+}
+
+// ── RadarImage impl for MergedSigma0 ──────────────────────────────
+
+impl RadarImage for MergedSigma0 {
+    fn sample_at(&self, line: f64, sample: f64, kernel: ResamplingKernel) -> f32 {
+        match kernel {
+            ResamplingKernel::Bilinear => {
+                bilinear_sample_slice(&self.data, self.lines, self.samples, line, sample)
+            }
+            ResamplingKernel::Bicubic => {
+                bicubic_sample_slice(&self.data, self.lines, self.samples, line, sample)
+            }
+            ResamplingKernel::Lanczos3 => {
+                lanczos_sample_slice(&self.data, self.lines, self.samples, line, sample)
+            }
         }
     }
+
+    fn nesz_at(&self, line: f64, sample: f64) -> Option<f32> {
+        Some(bilinear_sample_slice(
+            &self.nesz, self.lines, self.samples, line, sample,
+        ))
+    }
+
+    fn lines(&self) -> usize {
+        self.lines
+    }
+
+    fn samples(&self) -> usize {
+        self.samples
+    }
+
+    fn azimuth_start_time(&self) -> chrono::DateTime<chrono::Utc> {
+        self.azimuth_start_time
+    }
+
+    fn near_slant_range_time_s(&self) -> f64 {
+        self.near_slant_range_time_s
+    }
+
+    fn range_pixel_spacing_m(&self) -> f64 {
+        self.range_pixel_spacing_m
+    }
+}
+
+// ── Lanczos-3 interpolation ────────────────────────────────────────
+
+/// Lanczos kernel weight for distance `x` (in pixels) from the sample point.
+///
+/// `L(x) = sinc(x) · sinc(x/3)` for `|x| < 3`, zero otherwise.
+/// Computed as `sin(πx)/(πx) · sin(πx/3)/(πx/3)`; L(0) = 1 by L'Hôpital.
+/// Negative sidelobes in `|x| ∈ (1, 3)` produce mild ringing near step edges.
+#[inline(always)]
+fn lanczos_weight(x: f64) -> f64 {
+    const A: f64 = 3.0;
+    let ax = x.abs();
+    if ax < 1e-10 {
+        1.0
+    } else if ax < A {
+        let px = std::f64::consts::PI * x;
+        let pxa = std::f64::consts::PI * x / A;
+        px.sin() * pxa.sin() / (px * pxa)
+    } else {
+        0.0
+    }
+}
+
+/// 36-tap Lanczos-3 interpolation over a flat row-major `f32` slice.
+///
+/// Samples a 6 × 6 neighbourhood (offsets −2 to +3 in each dimension).
+/// Returns NaN if any tap is NaN (propagates nodata cleanly).  Boundary
+/// taps are clamped to the nearest valid row/column, consistent with
+/// [`bilinear_sample_slice`] and [`bicubic_sample_slice`].
+fn lanczos_sample_slice(
+    data: &[f32],
+    n_lines: usize,
+    n_samples: usize,
+    line: f64,
+    sample: f64,
+) -> f32 {
+    let max_l = (n_lines as isize) - 1;
+    let max_s = (n_samples as isize) - 1;
+    let l_floor = line.floor() as isize;
+    let s_floor = sample.floor() as isize;
+    let mut acc = 0.0_f64;
+    for li in -2_isize..=3 {
+        let row = (l_floor + li).clamp(0, max_l) as usize;
+        let wl = lanczos_weight(line - (l_floor + li) as f64);
+        for si in -2_isize..=3 {
+            let col = (s_floor + si).clamp(0, max_s) as usize;
+            let v = data[row * n_samples + col];
+            if v.is_nan() {
+                return f32::NAN;
+            }
+            acc += v as f64 * wl * lanczos_weight(sample - (s_floor + si) as f64);
+        }
+    }
+    acc as f32
 }
 
 // ── Zero-Doppler solver ────────────────────────────────────────────
@@ -1149,7 +1243,7 @@ pub(crate) fn row_chunk_ranges(
 }
 
 pub fn terrain_correction(
-    merged: &MergedSigma0,
+    merged: &dyn RadarImage,
     scene: &SceneMetadata,
     dem: &dyn DemSource,
     grids: &[(SubSwathId, Vec<GeolocationGridPoint>)],
@@ -1503,7 +1597,7 @@ pub fn terrain_correction(
                     };
 
                 // 6. Resample from the merged σ⁰ image.
-                let mut sigma0 = resample_merged(merged, frac_line, frac_sample, config.resampling);
+                let mut sigma0 = merged.sample_at(frac_line, frac_sample, config.resampling);
                 if sigma0.is_nan() {
                     // The radar pixel exists but the source value is itself NaN
                     // (merge seam gap, deburst nodata, or invalid calibration).
@@ -1624,18 +1718,18 @@ pub fn terrain_correction(
 
                 // 8. Per-pixel NESZ noise floor masking (σ⁰ domain, before flattening
                 //    modifies the value).  Pixels where σ⁰ ≤ NESZ × 10^(margin/10)
-                //    are set to NaN.  Skipped when margin = NEG_INFINITY (default).
+                //    are set to NaN.  Skipped when margin = NEG_INFINITY (default),
+                //    or when the image source provides no NESZ layer.
                 if config.noise_floor_margin_db.is_finite() {
-                    let nesz = bilinear_sample_slice(
-                        &merged.nesz, merged.lines, merged.samples, frac_line, frac_sample,
-                    );
-                    // If NESZ is NaN (no coverage at this pixel), pass through unmasked.
-                    if !nesz.is_nan() {
-                        let threshold = nesz * 10f32.powf(config.noise_floor_margin_db / 10.0);
-                        if sigma0 <= threshold {
-                            noise_masked += 1;
-                            if config.compute_lia { row_mask[col] = mask_code::NOISE_MASKED; }
-                            continue;
+                    if let Some(nesz) = merged.nesz_at(frac_line, frac_sample) {
+                        // If NESZ is NaN (no coverage at this pixel), pass through unmasked.
+                        if !nesz.is_nan() {
+                            let threshold = nesz * 10f32.powf(config.noise_floor_margin_db / 10.0);
+                            if sigma0 <= threshold {
+                                noise_masked += 1;
+                                if config.compute_lia { row_mask[col] = mask_code::NOISE_MASKED; }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -2649,5 +2743,125 @@ mod tests {
     #[should_panic(expected = "chunk_size must be > 0")]
     fn row_chunk_ranges_rejects_zero_chunk_size() {
         let _ = row_chunk_ranges(100, 0).collect::<Vec<_>>(); // SAFETY-OK: discarded value is never reached; .collect must be evaluated to trigger the panic asserted by #[should_panic]
+    }
+
+    // ── Lanczos-3 kernel tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn lanczos_weight_at_zero_is_one() {
+        assert!((lanczos_weight(0.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lanczos_weight_at_nonzero_integers_is_zero() {
+        // Interpolation property: L(n) = 0 for all integer n ≠ 0.
+        // Follows from sinc(n) = 0 for n ∈ ℤ \ {0}.
+        for n in [-3, -2, -1, 1, 2, 3] {
+            let w = lanczos_weight(n as f64);
+            assert!(
+                w.abs() < 1e-12,
+                "lanczos_weight({n}) = {w}, expected 0"
+            );
+        }
+    }
+
+    #[test]
+    fn lanczos_constant_field_returns_constant() {
+        // Lanczos-3 does NOT have exact partition-of-unity at non-integer
+        // positions (the sinc window breaks it); the reconstruction error
+        // is typically < 2 %.  Test that results are within 5 % of the
+        // input constant, and exact at integer positions.
+        let data = vec![5.0_f32; 8 * 8];
+        // Non-integer positions: allow ~5 % relative error.
+        for (l, s) in [(2.5_f64, 2.5_f64), (3.7, 4.2)] {
+            let v = lanczos_sample_slice(&data, 8, 8, l, s);
+            assert!(
+                (v - 5.0).abs() < 0.25,
+                "constant field: got {v} at ({l},{s}), expected ≈ 5.0"
+            );
+        }
+        // Integer position: must be exact (partition-of-unity holds at nodes).
+        let v = lanczos_sample_slice(&data, 8, 8, 4.0, 4.0);
+        assert!(
+            (v - 5.0).abs() < 1e-4,
+            "constant field at exact node: got {v}"
+        );
+    }
+
+    #[test]
+    fn lanczos_at_exact_grid_node_returns_value() {
+        // At exact integer coordinates the result equals the grid value.
+        let data: Vec<f32> = (0..25).map(|i| i as f32).collect();
+        let v = lanczos_sample_slice(&data, 5, 5, 3.0, 4.0);
+        let expected = data[3 * 5 + 4];
+        assert!(
+            (v - expected).abs() < 1e-3,
+            "exact node: got {v}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn lanczos_nan_tap_propagates_nan() {
+        let mut data = vec![1.0_f32; 8 * 8];
+        data[4 * 8 + 4] = f32::NAN;
+        let v = lanczos_sample_slice(&data, 8, 8, 3.5, 3.5);
+        assert!(v.is_nan(), "NaN tap must propagate to NaN result");
+    }
+
+    // ── RadarImage trait tests ─────────────────────────────────────────────────
+
+    fn make_merged(data: Vec<f32>, lines: usize, samples: usize) -> MergedSigma0 {
+        let n = lines * samples;
+        MergedSigma0 {
+            data,
+            nesz: vec![0.01_f32; n],
+            lines,
+            samples,
+            near_slant_range_time_s: 0.005,
+            range_pixel_spacing_s: 1e-8,
+            range_pixel_spacing_m: 2.33,
+            cal_lut_extrapolation_gap_px: 0,
+            noise_lut_extrapolation_gap_px: 0,
+            azimuth_start_time: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn radar_image_bilinear_matches_slice_fn() {
+        // RadarImage::sample_at with Bilinear must equal bilinear_sample_slice.
+        let m = make_merged(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3);
+        for (l, s) in [(0.0_f64, 0.0_f64), (0.7, 1.3), (1.5, 0.5), (2.0, 2.0)] {
+            let expected = bilinear_sample_slice(&m.data, m.lines, m.samples, l, s);
+            let got = m.sample_at(l, s, ResamplingKernel::Bilinear);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "bilinear mismatch at ({l},{s}): {got} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn radar_image_nesz_at_returns_some() {
+        let m = make_merged(vec![1.0_f32; 4], 2, 2);
+        let result = m.nesz_at(0.5, 0.5);
+        assert!(result.is_some(), "MergedSigma0::nesz_at must return Some");
+        let nesz = result.unwrap(); // SAFETY-OK: asserted Some above
+        assert!(nesz.is_finite(), "NESZ value must be finite");
+    }
+
+    #[test]
+    fn radar_image_default_nesz_returns_none() {
+        // A minimal RadarImage implementor without NESZ must return None.
+        struct ConstantImage(f32);
+        impl RadarImage for ConstantImage {
+            fn sample_at(&self, _l: f64, _s: f64, _k: ResamplingKernel) -> f32 { self.0 }
+            fn lines(&self) -> usize { 1 }
+            fn samples(&self) -> usize { 1 }
+            fn azimuth_start_time(&self) -> chrono::DateTime<chrono::Utc> { Utc::now() }
+            fn near_slant_range_time_s(&self) -> f64 { 0.005 }
+            fn range_pixel_spacing_m(&self) -> f64 { 2.33 }
+        }
+        let img = ConstantImage(3.0);
+        assert!(img.nesz_at(0.0, 0.0).is_none());
     }
 }

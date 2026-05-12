@@ -80,6 +80,58 @@ pub enum ResamplingKernel {
     /// Catmull-Rom / cubic Hermite spline).  Sharper than bilinear but
     /// can introduce ringing artefacts near high-contrast edges.
     Bicubic,
+
+    /// 36-tap Lanczos-3 kernel (a = 3 sinc window).  Samples a 6 × 6
+    /// neighbourhood; sharpest of the three kernels.  Can produce mild
+    /// ringing near high-contrast boundaries (urban edges, ship returns)
+    /// and negative sidelobes on sub-Nyquist detail.  Prefer for outputs
+    /// that are substantially coarser than the input pixel spacing.
+    Lanczos3,
+}
+
+/// A source raster that can be sampled at sub-pixel radar coordinates.
+///
+/// Implement this trait to feed any radar image (σ⁰ intensity, coherence,
+/// interferometric phase, etc.) through the terrain-correction geocoding
+/// engine without recompiling the engine.
+///
+/// Implementors must be [`Send`] + [`Sync`] because the geocoding loop is
+/// parallelised across output rows by Rayon.
+pub trait RadarImage: Send + Sync {
+    /// Sample the image at fractional `(line, sample)` coordinates using
+    /// the specified resampling kernel.
+    ///
+    /// Returns `f32::NAN` for out-of-bounds or nodata locations.
+    fn sample_at(&self, line: f64, sample: f64, kernel: ResamplingKernel) -> f32;
+
+    /// Return the noise-equivalent sigma-zero (NESZ) at the given image
+    /// coordinates, or `None` if no NESZ layer is available for this image
+    /// type.
+    ///
+    /// The default implementation returns `None`.  Override it for intensity
+    /// images that carry a per-pixel noise floor estimate.
+    fn nesz_at(&self, line: f64, sample: f64) -> Option<f32> {
+        let _ = (line, sample); // SAFETY-OK: default no-NESZ impl; args intentionally unused
+        None
+    }
+
+    /// Number of azimuth lines in the image.
+    fn lines(&self) -> usize;
+
+    /// Number of range samples in the image.
+    fn samples(&self) -> usize;
+
+    /// UTC time of azimuth line 0 in the merged/debursted image.
+    ///
+    /// Used by the terrain-correction engine to anchor the Range-Doppler
+    /// zero-Doppler solver to the correct azimuth window.
+    fn azimuth_start_time(&self) -> chrono::DateTime<chrono::Utc>;
+
+    /// Two-way slant-range time (seconds) for range sample 0.
+    fn near_slant_range_time_s(&self) -> f64;
+
+    /// Range pixel spacing in metres (slant-range domain).
+    fn range_pixel_spacing_m(&self) -> f64;
 }
 
 /// Plain (non-clap) input set for [`crate::run::run_process`].

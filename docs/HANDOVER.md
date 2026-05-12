@@ -494,10 +494,9 @@ in [PROGRESS.md §12](PROGRESS.md).
 
 ### Nice to have later
 
-- EGM2008 geoid (currently EGM96 only)
-- `RadarImage` trait so an SLC / coherence / polarimetric branch can
-  reuse the geocoding code
-- Cubic / sinc resampling kernels (today bilinear only)
+- ~~EGM2008 geoid~~ — **DONE**: `GeoidModel::Egm2008(Egm2008Grid)` + `fetch_egm2008()` + COG fetch in `geoid_fetch.rs`; `--geoid egm2008` CLI flag
+- ~~`RadarImage` trait~~ — **DONE**: `pub trait RadarImage` in `pipeline_options.rs`; `impl RadarImage for MergedSigma0`; `terrain_correction()` now takes `&dyn RadarImage`; new `sample_at`, `nesz_at`, `azimuth_start_time`, `near_slant_range_time_s`, `range_pixel_spacing_m` methods
+- ~~Cubic / sinc resampling kernels~~ — **DONE**: `ResamplingKernel::Bicubic` (16-tap Keys α=−0.5) and `ResamplingKernel::Lanczos3` (36-tap Lanczos-3 a=3); `--resampling bicubic|lanczos3` CLI flags
 - Batch / multi-scene driver
 - SIMD inner loops in calibration + geocoding
 
