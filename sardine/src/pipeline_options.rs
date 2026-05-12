@@ -304,7 +304,7 @@ pub struct InsarOptions {
     pub reference_orbit: Option<PathBuf>,
     /// Path to a POEORB `.EOF` file for the secondary scene.
     pub secondary_orbit: Option<PathBuf>,
-    /// Polarization channel: `"VV"` or `"VH"`.
+    /// Polarization channel: `"VV"`, `"VH"`, `"HH"`, or `"HV"`.
     pub polarization: String,
     /// Azimuth multi-look factor (coherence window height in SLC lines).
     pub az_looks: usize,
@@ -550,11 +550,12 @@ pub fn resolve_geoid(spec: &str) -> Result<crate::geoid::GeoidModel> {
 ///
 /// Accepted spellings (case-insensitive):
 ///
-/// * Single pol: `"VV"`, `"VH"`.
-/// * Dual pol  : `"VV+VH"`, `"VV,VH"`, `"vh+vv"`, `"dual"`, `"both"`.
+/// * Single pol: `"VV"`, `"VH"`, `"HH"`, `"HV"`.
+/// * Dual pol  : `"VV+VH"`, `"VV,VH"`, `"vh+vv"`, `"HH+HV"`, `"dual"`, `"both"`.
 ///
-/// `dual` / `both` always expand to `["VV", "VH"]`.  Any other spelling
-/// preserves the input order so the caller can choose the output order.
+/// `dual` / `both` always expand to `["VV", "VH"]` (the standard S-1 IW DV
+/// product combination).  Any other spelling preserves the input order so
+/// the caller can choose the output order.
 /// Duplicate tokens (e.g. `"VV+VV"`) are silently deduplicated.
 ///
 /// # Errors
@@ -571,15 +572,16 @@ pub fn parse_polarizations(spec: &str) -> Result<Vec<String>> {
             .collect(),
     };
 
+    let valid = ["VV", "VH", "HH", "HV"];
     let mut out: Vec<String> = Vec::new();
     for tok in raw_tokens {
         if tok.is_empty() {
             bail!("polarization spec contains an empty token: {:?}", spec);
         }
-        if tok != "VV" && tok != "VH" {
+        if !valid.contains(&tok.as_str()) {
             bail!(
                 "Unsupported polarization token: {:?} in spec {:?}. \
-                 Use VV, VH, VV+VH, dual, or both.",
+                 Use VV, VH, HH, HV or a combination such as VV+VH or HH+HV.",
                 tok,
                 spec
             );

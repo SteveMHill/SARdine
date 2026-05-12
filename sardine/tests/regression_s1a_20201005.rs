@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sardine_scene::run::ProcessOptions;
+use sardine::run::ProcessOptions;
 
 // ─── Fixture paths ────────────────────────────────────────────────────────────
 
@@ -142,7 +142,7 @@ fn s1a_20201005_vv_pipeline_smoke() {
     opts.enl = 1.0;
 
     eprintln!("regression_s1a_20201005: running full pipeline …");
-    sardine_scene::run::run_process(&opts)
+    sardine::run::run_process(&opts)
         .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
 
     assert!(output.exists(), "output TIFF not created: {}", output.display());

@@ -725,7 +725,12 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
     let pol = match opts.polarization.to_uppercase().as_str() {
         "VV" => Polarization::VV,
         "VH" => Polarization::VH,
-        other => bail!("Unsupported polarization: {}. Use VV or VH.", other),
+        "HH" => Polarization::HH,
+        "HV" => Polarization::HV,
+        other => bail!(
+            "Unsupported polarization: {}. Use VV, VH, HH, or HV.",
+            other
+        ),
     };
     let pol_str = format!("{pol}").to_lowercase();
 
@@ -907,6 +912,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             &sec_sw,
             &sec_scene.orbit,
             sec_first_utc,
+            Some((&dem, &geoid)),
         )
         .with_context(|| format!("co-registration offset computation for {:?}", iw_id))?;
         tracing::info!(
@@ -1269,8 +1275,23 @@ mod multipol_tests {
 
     #[test]
     fn parse_polarizations_rejects_unknown() {
-        let err = parse_polarizations("HH").unwrap_err().to_string();
+        let err = parse_polarizations("XX").unwrap_err().to_string();
         assert!(err.contains("Unsupported polarization token"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_polarizations_accepts_hh() {
+        assert_eq!(parse_polarizations("HH").unwrap(), vec!["HH"]);
+    }
+
+    #[test]
+    fn parse_polarizations_accepts_hv() {
+        assert_eq!(parse_polarizations("HV").unwrap(), vec!["HV"]);
+    }
+
+    #[test]
+    fn parse_polarizations_accepts_hh_hv_pair() {
+        assert_eq!(parse_polarizations("HH+HV").unwrap(), vec!["HH", "HV"]);
     }
 
     #[test]
@@ -1282,11 +1303,9 @@ mod multipol_tests {
 
     #[test]
     fn parse_polarizations_rejects_three_distinct() {
+        // VV+VH+HH has 3 distinct valid tokens — should fail with "at most 2".
         let err = parse_polarizations("VV+VH+HH").unwrap_err().to_string();
-        assert!(
-            err.contains("Unsupported") || err.contains("at most 2"),
-            "got: {err}"
-        );
+        assert!(err.contains("at most 2"), "got: {err}");
     }
 
     #[test]
@@ -1414,7 +1433,7 @@ mod multipol_tests {
             dem_source: "srtm1".to_owned(),
             output: PathBuf::from("/tmp/no_such_out.tif"),
             orbit: None,
-            polarization: "HH".to_owned(),
+            polarization: "QQ".to_owned(),
             no_flatten: false,
             noise_floor_db: 0.0,
             pixel_spacing_deg: 0.0001,

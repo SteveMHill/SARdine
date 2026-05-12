@@ -29,7 +29,7 @@
 #[cfg(feature = "slc-fetch")]
 mod slc_fetch_tests {
     use std::path::{Path, PathBuf};
-    use sardine_scene::slc_fetch::{
+    use sardine::slc_fetch::{
         credentials_from_env, fetch_slc, fetch_slc_result, search_slc,
         SlcSearchParams,
     };

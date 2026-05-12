@@ -32,11 +32,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
-use sardine_scene::orbit::{apply_precise_orbit, parse_eof_file, OrbitError};
-use sardine_scene::parse::parse_safe_directory;
+use sardine::orbit::{apply_precise_orbit, parse_eof_file, OrbitError};
+use sardine::parse::parse_safe_directory;
 #[cfg(feature = "dem-fetch")]
-use sardine_scene::scene_prep::check_srtm1_tiles_present;
-use sardine_scene::types::{BoundingBox, OrbitData, StateVector};
+use sardine::scene_prep::check_srtm1_tiles_present;
+use sardine::types::{BoundingBox, OrbitData, StateVector};
 
 // ─── Fixture paths ────────────────────────────────────────────────────────────
 
@@ -398,7 +398,7 @@ fn pipeline_s1b_with_explicit_orbit_and_dem() {
 
     let output = std::env::temp_dir().join("sardine_orbit_dem_fit_s1b.tiff");
 
-    let mut opts = sardine_scene::run::ProcessOptions::new(
+    let mut opts = sardine::run::ProcessOptions::new(
         PathBuf::from(SAFE_S1B),
         Some(PathBuf::from(DEM_SRTM1)),
         output.clone(),
@@ -410,7 +410,7 @@ fn pipeline_s1b_with_explicit_orbit_and_dem() {
     opts.no_provenance = true;
 
     eprintln!("orbit_dem_fit: running full S1B pipeline …");
-    sardine_scene::run::run_process(&opts)
+    sardine::run::run_process(&opts)
         .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
 
     assert!(output.exists(), "output TIFF not created: {}", output.display());
@@ -461,7 +461,7 @@ fn pipeline_s1b_missing_dem_tile_errors_explicitly() {
 
     let output = std::env::temp_dir().join("sardine_orbit_dem_fit_bad_dem.tiff");
 
-    let mut opts = sardine_scene::run::ProcessOptions::new(
+    let mut opts = sardine::run::ProcessOptions::new(
         PathBuf::from(SAFE_S1B),
         Some(tmp_dem.path().to_path_buf()),
         output.clone(),
@@ -471,7 +471,7 @@ fn pipeline_s1b_missing_dem_tile_errors_explicitly() {
     opts.polarization = "VV".to_owned();
     opts.no_provenance = true;
 
-    let err = sardine_scene::run::run_process(&opts)
+    let err = sardine::run::run_process(&opts)
         .expect_err(
             "run_process must return Err when the DEM directory is missing required tiles"
         );
@@ -525,7 +525,7 @@ fn pipeline_s1b_auto_dem_cache_hit() {
     let output = std::env::temp_dir().join("sardine_orbit_dem_fit_s1b_auto_dem.tiff");
 
     // dem = None → resolve_dem takes the auto-download branch.
-    let mut opts = sardine_scene::run::ProcessOptions::new(
+    let mut opts = sardine::run::ProcessOptions::new(
         PathBuf::from(SAFE_S1B),
         None,
         output.clone(),
@@ -536,7 +536,7 @@ fn pipeline_s1b_auto_dem_cache_hit() {
     opts.no_provenance = true;
 
     eprintln!("orbit_dem_fit::pipeline_s1b_auto_dem_cache_hit: running pipeline (dem=None, cache-hit) …");
-    sardine_scene::run::run_process(&opts)
+    sardine::run::run_process(&opts)
         .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
 
     assert!(output.exists(), "output TIFF not created: {}", output.display());
@@ -601,7 +601,7 @@ fn pipeline_s1b_full_auto_download() {
 
     // dem = None, orbit = None → both resolve_dem and resolve_orbit take the
     // auto-download branch.
-    let mut opts = sardine_scene::run::ProcessOptions::new(
+    let mut opts = sardine::run::ProcessOptions::new(
         PathBuf::from(SAFE_S1B),
         None,
         output.clone(),
@@ -618,7 +618,7 @@ fn pipeline_s1b_full_auto_download() {
         dem_dir.path().display(),
     );
 
-    sardine_scene::run::run_process(&opts)
+    sardine::run::run_process(&opts)
         .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
 
     assert!(output.exists(), "output TIFF not created: {}", output.display());

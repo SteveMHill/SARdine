@@ -224,7 +224,7 @@ pub fn form_interferogram(
                 // using the proper 3-equation system (zero-Doppler + range + ellipsoid).
                 // For flat-earth purposes a 1 mm convergence threshold is sufficient.
                 let flat_ecef = match ecef_from_slant_range_doppler(
-                    sv_ref.position_m, sv_ref.velocity_m_s, r_ref, 10, 1.0,
+                    sv_ref.position_m, sv_ref.velocity_m_s, r_ref, 0.0, 10, 1.0,
                 ) {
                     Ok(p) => p,
                     Err(_) => {

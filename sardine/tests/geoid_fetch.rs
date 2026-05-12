@@ -9,8 +9,8 @@
 ///   cargo test --features geoid-fetch --test geoid_fetch
 #[cfg(feature = "geoid-fetch")]
 mod tests {
-    use sardine_scene::geoid_fetch::fetch_egm96;
-    use sardine_scene::geoid::GeoidModel;
+    use sardine::geoid_fetch::fetch_egm96;
+    use sardine::geoid::GeoidModel;
 
     /// Verify the full fetch-and-convert path produces a usable geoid model.
     ///

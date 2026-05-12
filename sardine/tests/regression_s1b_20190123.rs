@@ -39,7 +39,7 @@
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use sardine_scene::run::ProcessOptions;
+use sardine::run::ProcessOptions;
 
 // ─── Fixture paths ────────────────────────────────────────────────────────────
 
@@ -192,7 +192,7 @@ fn s1b_20190123_vv_refined_lee_bias_vs_asf() {
     opts.speckle = "refined-lee".to_owned();
     opts.enl = 1.0;
 
-    sardine_scene::run::run_process(&opts)
+    sardine::run::run_process(&opts)
         .unwrap_or_else(|e| panic!("run_process failed: {e:#}"));
 
     assert!(output.is_file(), "sardine output TIFF must exist after run_process");

@@ -542,7 +542,12 @@ pub fn prepare_merged_scene(
     let pol = match polarization.to_uppercase().as_str() {
         "VV" => Polarization::VV,
         "VH" => Polarization::VH,
-        other => bail!("Unsupported polarization: {}. Use VV or VH.", other),
+        "HH" => Polarization::HH,
+        "HV" => Polarization::HV,
+        other => bail!(
+            "Unsupported polarization: {}. Use VV, VH, HH, or HV.",
+            other
+        ),
     };
 
     tracing::info!("parsing SAFE metadata …");
@@ -764,7 +769,12 @@ pub fn prepare_merged_scene_assembled(
     let pol = match polarization.to_uppercase().as_str() {
         "VV" => Polarization::VV,
         "VH" => Polarization::VH,
-        other => bail!("Unsupported polarization: {}. Use VV or VH.", other),
+        "HH" => Polarization::HH,
+        "HV" => Polarization::HV,
+        other => bail!(
+            "Unsupported polarization: {}. Use VV, VH, HH, or HV.",
+            other
+        ),
     };
 
     let scene = assembled.scene.clone();

@@ -18,19 +18,28 @@
 //! Orbit-state smoothness means 20 × 50 = 1000 grid points capture all
 //! variation; polynomial evaluation is then O(1) per pixel.
 //!
-//! # Height assumption
+//! # Height handling
 //!
-//! Forward geocoding assumes the target lies on the WGS84 reference
-//! ellipsoid (h = 0).  For typical Sentinel-1 IW geometry this introduces
-//! a co-registration range error of ≈ h / (2 · sin(θ_inc)) / rps in pixels,
-//! which is < 0.03 px for h < 100 m.  Coherence magnitude is not sensitive
-//! to sub-pixel errors of this magnitude.
+//! Forward geocoding uses a two-pass approach when a DEM is available:
+//!
+//! 1. Solve at h = 0 (WGS84 ellipsoid) to obtain an approximate ECEF target.
+//! 2. Convert to geodetic (lat, lon) and look up the DEM elevation + geoid
+//!    undulation to obtain the ellipsoidal height `h_ell`.
+//! 3. Re-solve at h = `h_ell` for the accurate target position.
+//!
+//! Without a DEM (`dem = None`) the pipeline falls back to h = 0, which
+//! introduces a range error of ≈ h / (2 · sin(θ_inc)) / rps pixels — less
+//! than 0.03 px for h < 100 m.  Passing a DEM eliminates this error for
+//! scenes over mountainous or high-elevation terrain.
 
 use chrono::{DateTime, Duration, Utc};
 use rayon::prelude::*;
 
 use crate::{
     deburst::DeburstArray,
+    dem::DemMosaic,
+    geodesy::ecef_to_geodetic,
+    geoid::GeoidModel,
     insar::{deramp::Deramped, error::InsarError},
     orbit::interpolate_orbit_and_accel,
     terrain_correction::{solve_zero_doppler, ZeroDopplerOutcome},
@@ -125,6 +134,14 @@ pub struct CoregResult {
 /// # Returns
 ///
 /// `CoregResult` with the degree-2 bivariate polynomial offset and fit diagnostics.
+///
+/// # DEM height correction
+///
+/// When `dem` is `Some((mosaic, geoid))`, forward geocoding uses a two-pass
+/// approach: first solve at h = 0 to locate the approximate geodetic position,
+/// then look up the DEM elevation + geoid undulation, and re-solve at the
+/// correct ellipsoidal height.  Pass `None` to use h = 0 (backward-compatible;
+/// suitable when scene relief is < 100 m or no DEM is loaded yet).
 pub fn compute_coreg_offsets(
     ref_swath: &SubSwathMetadata,
     ref_orbit: &OrbitData,
@@ -133,6 +150,7 @@ pub fn compute_coreg_offsets(
     sec_swath: &SubSwathMetadata,
     sec_orbit: &OrbitData,
     sec_first_utc: DateTime<Utc>,
+    dem: Option<(&DemMosaic, &GeoidModel)>,
 ) -> Result<CoregResult, InsarError> {
     let ref_lines = ref_deburst.lines;
     let ref_samples = ref_deburst.samples;
@@ -173,15 +191,40 @@ pub fn compute_coreg_offsets(
                 // Get reference satellite state vector at azimuth time.
                 let (sv_ref, _accel) = interpolate_orbit_and_accel(ref_orbit, t_az_ref).ok()?; // SAFETY-OK: orbit interpolation failure for a sparse sample point returns None, skipping this point; the n_valid >= 6 guard downstream ensures sufficient coverage
 
-                // Forward geocoding: reference SAR pixel → ECEF on WGS84 ellipsoid.
-                let target_ecef = ecef_from_slant_range_doppler(
+                // Forward geocoding: reference SAR pixel → ECEF.
+                //
+                // Pass 1: solve at h = 0 to get an approximate target.
+                let ecef_approx = ecef_from_slant_range_doppler(
                     sv_ref.position_m,
                     sv_ref.velocity_m_s,
                     range_m,
+                    0.0,
                     20,
                     1e-3, // 1 mm convergence
                 )
                 .ok()?; // SAFETY-OK: forward geocoding non-convergence for a sparse sample point returns None, skipping this point; n_valid >= 6 guard ensures polynomial fit has sufficient coverage
+
+                // Pass 2 (only when DEM provided): refine using terrain height.
+                let target_ecef = if let Some((mosaic, geoid)) = dem {
+                    let (lat, lon, _) = ecef_to_geodetic(ecef_approx);
+                    let h_ell = mosaic
+                        .elevation_at(lat, lon)
+                        .ok()
+                        .filter(|h| h.is_finite())
+                        .map(|h_ortho| h_ortho as f64 + geoid.undulation_m(lat, lon))
+                        .unwrap_or(0.0); // SAFETY-OK: DEM tile missing or void pixel → h=0 ellipsoid fallback; coreg error < 0.03 px for h < 100 m, acceptable for coherence estimation
+                    ecef_from_slant_range_doppler(
+                        sv_ref.position_m,
+                        sv_ref.velocity_m_s,
+                        range_m,
+                        h_ell,
+                        20,
+                        1e-3,
+                    )
+                    .ok()? // SAFETY-OK: same as pass-1 convergence guard above
+                } else {
+                    ecef_approx
+                };
 
                 // Backward geocoding: ECEF → secondary SAR coordinates.
                 let (l_sec, c_sec) = secondary_sar_coords(
@@ -261,36 +304,41 @@ pub fn resample_secondary(
 
 // ─── Forward geocoding ────────────────────────────────────────────────────
 
-/// Project a reference SAR pixel to ECEF on the WGS84 ellipsoid using
-/// Newton-Raphson on the 3-equation system:
+/// Project a reference SAR pixel to ECEF on a constant-height ellipsoidal
+/// surface using Newton-Raphson on the 3-equation system:
 ///
 /// ```text
-/// F1: (T − P) · V = 0                          [zero-Doppler plane]
-/// F2: (T − P)_x² + (T − P)_y² + (T − P)_z² − R² = 0   [range sphere]
-/// F3: T_x²/a² + T_y²/a² + T_z²/b² − 1 = 0   [WGS84 ellipsoid]
+/// F1: (T − P) · V = 0                                   [zero-Doppler plane]
+/// F2: (T − P)² − R² = 0                                 [range sphere]
+/// F3: T_x²/(a+h)² + T_y²/(a+h)² + T_z²/(b+h)² − 1 = 0 [height surface]
 /// ```
+///
+/// Setting `h_m = 0` recovers the WGS84 ellipsoid.
 ///
 /// # Arguments
 ///
 /// * `sat_pos`  — Satellite ECEF position at azimuth time (m).
 /// * `sat_vel`  — Satellite velocity at azimuth time (m/s).
 /// * `range_m`  — One-way slant range (m).
+/// * `h_m`      — Ellipsoidal height of the target (m above WGS84).  Use 0.0
+///                for the first-pass or when no DEM is available.
 /// * `max_iter` — Maximum Newton iterations (20 is sufficient for < 1 mm).
 /// * `tol_m`    — Convergence tolerance on position update norm (m).
 pub(crate) fn ecef_from_slant_range_doppler(
     sat_pos: [f64; 3],
     sat_vel: [f64; 3],
     range_m: f64,
+    h_m: f64,
     max_iter: usize,
     tol_m: f64,
 ) -> Result<[f64; 3], ()> {
     let [px, py, pz] = sat_pos;
     let [vx, vy, vz] = sat_vel;
     let r = range_m;
-    let a = WGS84_A;
-    let b = WGS84_B;
+    let a = WGS84_A + h_m;
+    let b = WGS84_B + h_m;
 
-    // Initial guess: satellite nadir direction, scaled to WGS84 surface.
+    // Initial guess: satellite nadir direction, scaled to height-surface.
     // The nadir point is along −ẑ_ecef direction; we project sat_pos to
     // the ellipsoid along the unit radial direction.
     let sat_r = (px * px + py * py + pz * pz).sqrt();
@@ -310,9 +358,9 @@ pub(crate) fn ecef_from_slant_range_doppler(
         let f3 = tx * tx / (a * a) + ty * ty / (a * a) + tz * tz / (b * b) - 1.0;
 
         // Jacobian rows (∂F_i / ∂[tx, ty, tz]):
-        // J[0] = [vx, vy, vz]
-        // J[1] = [2*dx, 2*dy, 2*dz]
-        // J[2] = [2*tx/a², 2*ty/a², 2*tz/b²]
+        // J[0] = [vx, vy, vz]          (F1 = (T−P)·V,  independent of T only via T)
+        // J[1] = [2*dx, 2*dy, 2*dz]    (F2 = ‖T−P‖² − R²)
+        // J[2] = [2*tx/a², 2*ty/a², 2*tz/b²]  (F3, a=(A+h), b=(B+h))
         let j00 = vx;
         let j01 = vy;
         let j02 = vz;
@@ -652,14 +700,14 @@ mod tests {
         // Slant range ~700 km — right-looking at moderate incidence.
         let range_m = 700_000.0_f64;
 
-        let result = ecef_from_slant_range_doppler(sat_pos, sat_vel, range_m, 20, 1e-3);
+        let result = ecef_from_slant_range_doppler(sat_pos, sat_vel, range_m, 0.0, 20, 1e-3);
         let target = result.expect("forward geocoding should converge");
 
         let [tx, ty, tz] = target;
         let [px, py, pz] = sat_pos;
         let [vx, vy, vz] = sat_vel;
 
-        // 1. Target on ellipsoid (|F3| < 1e-6).
+        // 1. Target on WGS84 ellipsoid (h=0, |F3| < 1e-6).
         let ell =
             tx * tx / (WGS84_A * WGS84_A) + ty * ty / (WGS84_A * WGS84_A)
                 + tz * tz / (WGS84_B * WGS84_B) - 1.0;
@@ -677,6 +725,44 @@ mod tests {
             "Doppler residual / range = {}",
             doppler / range_m
         );
+    }
+
+    // ── Test: forward geocoding at h > 0 lies on expanded ellipsoid ──
+
+    #[test]
+    fn forward_geocoding_converges_at_nonzero_height() {
+        let sat_pos = [4_750_000.0_f64, 2_600_000.0, 4_540_000.0];
+        let sat_vel = [3_640.0_f64, -6_664.0, 0.0];
+        let range_m = 700_000.0_f64;
+        let h_m = 3000.0; // 3 km elevation (high mountain scenario)
+
+        let result = ecef_from_slant_range_doppler(sat_pos, sat_vel, range_m, h_m, 20, 1e-3);
+        let target = result.expect("forward geocoding at h=3000 m should converge");
+
+        let [tx, ty, tz] = target;
+        let [px, py, pz] = sat_pos;
+        let [vx, vy, vz] = sat_vel;
+        let ah = WGS84_A + h_m;
+        let bh = WGS84_B + h_m;
+
+        // 1. Target on expanded ellipsoid (h=3000 m, |F3| < 1e-6).
+        let ell = tx * tx / (ah * ah) + ty * ty / (ah * ah) + tz * tz / (bh * bh) - 1.0;
+        assert!(ell.abs() < 1e-6, "target not on h=3000 m surface: F3 = {ell}");
+
+        // 2. Slant range correct (< 1 m).
+        let r = ((tx - px).powi(2) + (ty - py).powi(2) + (tz - pz).powi(2)).sqrt();
+        assert!((r - range_m).abs() < 1.0, "range error = {} m", r - range_m);
+
+        // 3. Zero-Doppler condition.
+        let doppler = (tx - px) * vx + (ty - py) * vy + (tz - pz) * vz;
+        assert!(doppler.abs() / range_m < 1.0, "Doppler residual / range = {}", doppler / range_m);
+
+        // 4. h > 0 solution must be farther from Earth's centre than h = 0 solution.
+        let result_h0 =
+            ecef_from_slant_range_doppler(sat_pos, sat_vel, range_m, 0.0, 20, 1e-3).unwrap();
+        let r_h0 = (result_h0[0].powi(2) + result_h0[1].powi(2) + result_h0[2].powi(2)).sqrt();
+        let r_hm = (tx.powi(2) + ty.powi(2) + tz.powi(2)).sqrt();
+        assert!(r_hm > r_h0, "h=3000 m target should be further from Earth centre than h=0");
     }
 
     // ── Test: least-squares polynomial fit recovers known coefficients ──

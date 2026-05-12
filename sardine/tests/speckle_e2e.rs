@@ -32,19 +32,19 @@
 
 use std::path::Path;
 
-use sardine_scene::apply_calibration::apply_calibration;
-use sardine_scene::calibration::parse_calibration_noise;
-use sardine_scene::dem::DemMosaic;
-use sardine_scene::deburst::deburst_subswath;
-use sardine_scene::geoid::GeoidModel;
-use sardine_scene::geoid_fetch::fetch_egm96;
-use sardine_scene::merge_subswaths::{merge_subswaths, SwathInput};
-use sardine_scene::orbit::{apply_precise_orbit, parse_eof_file};
-use sardine_scene::parse::{parse_geolocation_grids, parse_safe_directory};
-use sardine_scene::slc_reader::SlcReader;
-use sardine_scene::speckle::{apply_speckle_filter, SpeckleFilter};
-use sardine_scene::terrain_correction::{terrain_correction, TerrainCorrectionConfig};
-use sardine_scene::types::{Polarization, SubSwathId, SubSwathMetadata};
+use sardine::apply_calibration::apply_calibration;
+use sardine::calibration::parse_calibration_noise;
+use sardine::dem::DemMosaic;
+use sardine::deburst::deburst_subswath;
+use sardine::geoid::GeoidModel;
+use sardine::geoid_fetch::fetch_egm96;
+use sardine::merge_subswaths::{merge_subswaths, SwathInput};
+use sardine::orbit::{apply_precise_orbit, parse_eof_file};
+use sardine::parse::{parse_geolocation_grids, parse_safe_directory};
+use sardine::slc_reader::SlcReader;
+use sardine::speckle::{apply_speckle_filter, SpeckleFilter};
+use sardine::terrain_correction::{terrain_correction, TerrainCorrectionConfig};
+use sardine::types::{Polarization, SubSwathId, SubSwathMetadata};
 
 const SAFE: &str = "/home/datacube/dev/SARdine/data/SLC/\
     S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833.SAFE";
@@ -82,7 +82,7 @@ fn fixture_present() -> bool {
 /// Run the full pipeline up to terrain correction and return the linear
 /// γ⁰ geocoded image.  This is the same sequence the `dump_s1b_tc`
 /// example uses, minus the dB conversion and TIFF write at the end.
-fn build_geocoded() -> sardine_scene::terrain_correction::GeocodedImage {
+fn build_geocoded() -> sardine::terrain_correction::GeocodedImage {
     let scene = parse_safe_directory(Path::new(SAFE)).expect("parse SAFE");
     let eof = parse_eof_file(Path::new(EOF_FILE)).expect("parse EOF");
     let scene = apply_precise_orbit(scene, &eof).expect("apply POEORB");
