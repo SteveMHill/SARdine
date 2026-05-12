@@ -943,7 +943,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             rg_looks: opts.rg_looks,
             compute_phase: opts.output_phase,
         };
-        let igram = form_interferogram(
+        let mut igram = form_interferogram(
             &coreg,
             &ref_sw,
             &ref_scene.orbit,
@@ -954,6 +954,33 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
         )
         .with_context(|| format!("interferogram formation for {:?}", iw_id))?;
         report_timing("interferogram", t_igram);
+
+        // ── Reramp interferometric phase ──────────────────────────────────────
+        //
+        // The interferogram was formed in the deramped domain (exp(−jφ_TOPS)
+        // was applied to both SLCs before cross-multiplication).  Without
+        // reramping, the wrapped phase would contain a residual −φ_ref_TOPS
+        // steering-phase ramp that varies rapidly across each burst and is not
+        // geophysically meaningful.  Reramping adds back +φ_ref_TOPS and wraps
+        // to (−π, π], so the geocoded phase represents only the topographic
+        // and deformation signal.
+        //
+        // Coherence magnitude is phase-invariant; reramp is skipped for it.
+        if opts.output_phase && !igram.phase.is_empty() {
+            use crate::insar::deramp::reramp_interferogram_phase;
+            let t_reramp = Instant::now();
+            tracing::info!("reramping {:?} phase …", iw_id);
+            reramp_interferogram_phase(
+                &mut igram.phase,
+                igram.lines,
+                igram.samples,
+                coreg.ref_data.valid_sample_offset,
+                &ref_sw,
+                ref_first_utc,
+            )
+            .with_context(|| format!("reramping phase for {:?}", iw_id))?;
+            report_timing("reramp_phase", t_reramp);
+        }
 
         tracing::info!(
             "  {:?} coherence image: {} lines × {} samples",

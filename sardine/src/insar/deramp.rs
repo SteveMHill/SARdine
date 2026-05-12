@@ -281,6 +281,118 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+// ── Reramp ────────────────────────────────────────────────────────────────
+
+/// Reramp a full-resolution interferometric phase array.
+///
+/// Adds the reference TOPS steering phase `+2π · f_DC(τ_c) · t_az(l)` to
+/// every element of `phase` and wraps the result to (−π, π].
+///
+/// This is the inverse of the deramping applied to the reference SLC in
+/// [`deramp_subswath`].  It must be called **after** coherence estimation
+/// but **before** terrain-correction geocoding so that the geocoded wrapped
+/// phase is free of TOPS-mode steering artefacts.
+///
+/// # Coherence output
+///
+/// Reramp is NOT required for coherence magnitude (`|γ|` is phase-invariant).
+/// Only call this function when producing a wrapped-phase output.
+///
+/// # Arguments
+///
+/// * `phase`               — Wrapped interferometric phase (rad), modified in
+///                           place.  Length must equal `lines × samples`.
+/// * `lines`               — Number of azimuth lines in the reference SLC
+///                           geometry.
+/// * `samples`             — Number of range samples per line.
+/// * `valid_sample_offset` — First valid range column in the full-TIFF
+///                           geometry (same as [`Deramped::valid_sample_offset`]).
+/// * `swath`               — Reference subswath metadata (DC estimates + timing).
+/// * `burst_start_utc`     — UTC azimuth time of line 0 of `phase`.
+///
+/// # Errors
+///
+/// Returns [`InsarError::NoDcEstimates`] if `swath.dc_estimates` is empty.
+pub fn reramp_interferogram_phase(
+    phase: &mut [f32],
+    lines: usize,
+    samples: usize,
+    valid_sample_offset: usize,
+    swath: &SubSwathMetadata,
+    burst_start_utc: chrono::DateTime<chrono::Utc>,
+) -> Result<(), InsarError> {
+    debug_assert_eq!(
+        phase.len(),
+        lines * samples,
+        "phase buffer length {} ≠ lines({}) × samples({})",
+        phase.len(),
+        lines,
+        samples
+    );
+
+    let dc_estimates = &swath.dc_estimates;
+    if dc_estimates.is_empty() {
+        return Err(InsarError::NoDcEstimates {
+            swath: format!("{:?}", swath.id),
+        });
+    }
+
+    let delta_tau_r =
+        2.0 * swath.range_pixel_spacing_m / crate::types::SPEED_OF_LIGHT_M_S;
+    let near_tau = swath.slant_range_time_s;
+    let ati_s = swath.azimuth_time_interval_s;
+
+    // Pre-compute slant-range time per column (identical to deramp_subswath).
+    let tau_col: Vec<f64> = (0..samples)
+        .map(|c| near_tau + (c + valid_sample_offset) as f64 * delta_tau_r)
+        .collect();
+
+    // Convert DC estimate azimuth times to seconds since burst_start_utc.
+    let est_times_s: Vec<f64> = dc_estimates
+        .iter()
+        .map(|e| {
+            (e.azimuth_time - burst_start_utc)
+                .num_microseconds()
+                .unwrap_or(0) as f64 // SAFETY-OK: intra-scene duration < 30 s; µs value << i64::MAX
+                / 1e6
+        })
+        .collect();
+
+    // Pre-compute interpolated DC polynomial per line.
+    let line_poly: Vec<[f64; 4]> = (0..lines)
+        .map(|l| {
+            let t_az = l as f64 * ati_s;
+            interp_dc_poly(dc_estimates, &est_times_s, t_az)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Parallel reramp: φ_out = wrap(φ_in + 2π·f_DC(τ_c)·t_az(l)).
+    phase
+        .par_chunks_mut(samples)
+        .enumerate()
+        .for_each(|(l, row)| {
+            let [a0, a1, a2, t0] = line_poly[l];
+            let t_az = l as f64 * ati_s;
+            for (c, phi_out) in row.iter_mut().enumerate() {
+                let tau = tau_col[c];
+                let dt = tau - t0;
+                let f_dc = a0 + a1 * dt + a2 * dt * dt;
+                // Reramp: opposite sign to deramp (add back the steering phase).
+                let phi_reramp = std::f64::consts::TAU * f_dc * t_az;
+                // Wrap to (−π, π].
+                let raw = *phi_out as f64 + phi_reramp;
+                let wrapped = raw.rem_euclid(std::f64::consts::TAU);
+                *phi_out = (if wrapped > std::f64::consts::PI {
+                    wrapped - std::f64::consts::TAU
+                } else {
+                    wrapped
+                }) as f32;
+            }
+        });
+
+    Ok(())
+}
+
 // ── Unit tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -465,5 +577,79 @@ mod tests {
             (q1 + 100.0).abs() < 0.5,
             "line 1 q_out = {q1:.3} — expected ≈−100"
         );
+    }
+
+    /// [`reramp_interferogram_phase`] is the exact inverse of the deramp.
+    ///
+    /// After deramp the phase of each sample equals `−2π·f_DC·t_az`.
+    /// After reramp it should return to the original phase (0 for pure-real input).
+    #[test]
+    fn reramp_inverts_deramp() {
+        let epoch = Utc.with_ymd_and_hms(2019, 1, 23, 5, 33, 48).unwrap();
+        // Non-zero DC so the phase rotation is measurable.
+        let dc = vec![
+            make_dc_estimate(0.0, 80.0),
+            make_dc_estimate(3.0, 80.0),
+        ];
+        let swath = make_subswath(dc);
+        let deburst = make_deburst(5, 4);
+
+        // Step 1: deramp.
+        let deramped = deramp_subswath(&deburst, &swath, epoch).unwrap();
+
+        // Step 2: extract phase from the deramped output.
+        let mut phase: Vec<f32> = deramped
+            .data
+            .iter()
+            .map(|&[i, q]| q.atan2(i))
+            .collect();
+
+        // Step 3: reramp — should recover the original phase (0 everywhere,
+        // since the input is pure-real [100, 0]).
+        reramp_interferogram_phase(
+            &mut phase,
+            deramped.lines,
+            deramped.samples,
+            deramped.valid_sample_offset,
+            &swath,
+            epoch,
+        )
+        .unwrap();
+
+        for (idx, &p) in phase.iter().enumerate() {
+            // Allow for f32 round-trip and sin/cos precision (~1e-4 rad).
+            assert!(
+                p.abs() < 2e-3,
+                "reramp should restore phase to 0 at idx={idx}, got {p:.5} rad"
+            );
+        }
+    }
+
+    /// Reramping an all-zero phase array with zero DC returns all zeros.
+    #[test]
+    fn reramp_zero_dc_is_identity() {
+        let epoch = Utc.with_ymd_and_hms(2019, 1, 23, 5, 33, 48).unwrap();
+        let dc = vec![
+            make_dc_estimate(0.0, 0.0),
+            make_dc_estimate(3.0, 0.0),
+        ];
+        let swath = make_subswath(dc);
+        let mut phase = vec![0.0_f32; 6];
+
+        reramp_interferogram_phase(&mut phase, 2, 3, 0, &swath, epoch).unwrap();
+
+        for &p in &phase {
+            assert!(p.abs() < 1e-6, "expected 0, got {p:.6}");
+        }
+    }
+
+    /// Empty DC estimates must return NoDcEstimates error.
+    #[test]
+    fn reramp_empty_dc_returns_error() {
+        let epoch = Utc.with_ymd_and_hms(2019, 1, 23, 5, 33, 48).unwrap();
+        let swath = make_subswath(vec![]);
+        let mut phase = vec![0.0_f32; 4];
+        let err = reramp_interferogram_phase(&mut phase, 2, 2, 0, &swath, epoch).unwrap_err();
+        assert!(matches!(err, InsarError::NoDcEstimates { .. }));
     }
 }
