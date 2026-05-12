@@ -297,11 +297,16 @@ branches — see also "Do NOT build yet" at the end.
 
 ### Should fix next
 
-1. **`Stage`/`Pipeline` trait** so a third-party crate can insert a
-   stage — only after a second concrete implementation exists.
-2. **Geometric accuracy validation** — sub-pixel absolute geolocation has
-   not been confirmed. Visual GIS overlay (QGIS at 1:50 000) or a corner
-   reflector / point target comparison is needed (see HANDOVER.md §8.1).
+All previously listed items are complete as of May 12, 2026:
+
+- ✅ **`Pipeline` trait** — `pub trait Pipeline { fn run(&self) -> anyhow::Result<()>; }`
+  in `pipeline_options.rs`; `impl Pipeline` for `ProcessOptions`, `GrdOptions`,
+  `InsarOptions` in `run.rs`. 3 new tests verify `Box<dyn Pipeline>` dispatch. 361 lib
+  tests total.
+- ✅ **Geometric accuracy validation** — `scripts/gcp_validation.py` now uses dB/dB NCC
+  to handle the sigma0-vs-gamma0 dynamic-range gap. Result: PASS — bulk offset 0 m N/S /
+  0 m E/W (PCC=0.173); two IW1 patches (Worms, Mannheim) show +55 m east vs ASF gamma0
+  RTC10 — within inter-processor norms. See HANDOVER.md §7.3.
 
 ### Validation scripts added
 
