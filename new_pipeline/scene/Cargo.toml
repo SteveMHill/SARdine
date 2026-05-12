@@ -14,7 +14,7 @@ categories = ["science::geo"]
 
 [features]
 default      = ["orbit-fetch", "dem-fetch"]
-orbit-fetch  = ["dep:ureq"]
+orbit-fetch  = ["dep:ureq", "dep:flate2"]
 slc-fetch    = ["dep:ureq", "dep:md5"]
 geoid-fetch  = ["dep:ureq"]
 dem-fetch    = ["dep:ureq", "dep:flate2"]

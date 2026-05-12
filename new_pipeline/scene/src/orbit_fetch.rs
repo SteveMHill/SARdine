@@ -478,12 +478,15 @@ mod inner {
                         Ok(compressed_data.to_vec())
                     }
                     8 => {
-                        // DEFLATE — requires flate2; return error suggesting it
-                        // (ESA files are rarely STORE, but we cannot add flate2 without deps)
-                        let _ = uncompressed_size; // SAFETY-OK: DEFLATE branch returns Err immediately; size is unused only because we refuse to decompress without flate2
-                        Err("ZIP: DEFLATE compression requires the 'flate2' crate; \
-                             add it to Cargo.toml or use the AWS source (no ZIP)"
-                            .to_string())
+                        // DEFLATE
+                        use flate2::read::DeflateDecoder;
+                        use std::io::Read;
+                        let mut decoder = DeflateDecoder::new(compressed_data);
+                        let mut out = Vec::with_capacity(uncompressed_size);
+                        decoder.read_to_end(&mut out).map_err(|e| {
+                            format!("ZIP: DEFLATE decompression failed: {}", e)
+                        })?;
+                        Ok(out)
                     }
                     c => Err(format!("ZIP: unsupported compression method {}", c)),
                 };
