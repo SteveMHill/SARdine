@@ -1199,6 +1199,28 @@ fn build_insar_provenance_json(
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipeline trait impls
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl crate::pipeline_options::Pipeline for ProcessOptions {
+    fn run(&self) -> anyhow::Result<()> {
+        run_process(self)
+    }
+}
+
+impl crate::pipeline_options::Pipeline for GrdOptions {
+    fn run(&self) -> anyhow::Result<()> {
+        run_grd(self)
+    }
+}
+
+impl crate::pipeline_options::Pipeline for InsarOptions {
+    fn run(&self) -> anyhow::Result<()> {
+        run_insar(self)
+    }
+}
+
 #[cfg(test)]
 mod multipol_tests {
     use super::*;
@@ -1558,5 +1580,49 @@ mod multilook_tests {
             err.contains("image dimensions") || err.contains("larger than"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pipeline_trait_tests {
+    use std::path::PathBuf;
+
+    use crate::pipeline_options::{GrdOptions, InsarOptions, Pipeline, ProcessOptions};
+
+    /// Verify that `Box<dyn Pipeline>` dispatch compiles and that calling
+    /// `run()` with a bogus (non-existent) SAFE path returns `Err`, not
+    /// a panic.  This exercises the vtable without needing real data.
+    #[test]
+    fn process_options_pipeline_trait_dispatch_returns_err_on_bogus_path() {
+        let opts = ProcessOptions::new(
+            PathBuf::from("/nonexistent/scene.SAFE"),
+            None,
+            PathBuf::from("/tmp/sardine_test_out.tif"),
+            "zero".to_owned(),
+        );
+        let runner: Box<dyn Pipeline> = Box::new(opts);
+        assert!(runner.run().is_err(), "expected Err for non-existent SAFE");
+    }
+
+    #[test]
+    fn grd_options_pipeline_trait_dispatch_returns_err_on_bogus_path() {
+        let opts = GrdOptions::new(
+            PathBuf::from("/nonexistent/scene.SAFE"),
+            PathBuf::from("/tmp/sardine_test_grd_out.tif"),
+        );
+        let runner: Box<dyn Pipeline> = Box::new(opts);
+        assert!(runner.run().is_err(), "expected Err for non-existent SAFE");
+    }
+
+    #[test]
+    fn insar_options_pipeline_trait_dispatch_returns_err_on_bogus_path() {
+        let opts = InsarOptions::new(
+            PathBuf::from("/nonexistent/reference.SAFE"),
+            PathBuf::from("/nonexistent/secondary.SAFE"),
+            PathBuf::from("/tmp/sardine_test_insar_out"),
+            None,
+        );
+        let runner: Box<dyn Pipeline> = Box::new(opts);
+        assert!(runner.run().is_err(), "expected Err for non-existent SAFE");
     }
 }

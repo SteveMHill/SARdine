@@ -292,6 +292,34 @@ impl InsarOptions {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pipeline trait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Common interface for all top-level sardine pipeline entry points.
+///
+/// Each options struct ([`ProcessOptions`], [`GrdOptions`], [`InsarOptions`])
+/// implements this trait so callers can dispatch dynamically via
+/// `Box<dyn Pipeline>` without knowing which pipeline is being run.
+///
+/// ```rust,no_run
+/// use sardine_scene::pipeline_options::{Pipeline, ProcessOptions};
+/// use std::path::PathBuf;
+///
+/// let opts = ProcessOptions::new(
+///     PathBuf::from("scene.SAFE"),
+///     None,
+///     PathBuf::from("out.tif"),
+///     "zero".to_owned(),
+/// );
+/// let runner: Box<dyn Pipeline> = Box::new(opts);
+/// // runner.run() would execute the full process pipeline
+/// ```
+pub trait Pipeline {
+    /// Execute the pipeline with the options stored in `self`.
+    fn run(&self) -> anyhow::Result<()>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Resolver helpers
 // ─────────────────────────────────────────────────────────────────────────────
 

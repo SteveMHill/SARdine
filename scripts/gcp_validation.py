@@ -21,6 +21,15 @@ Level 2 — medium (100 m) patch residuals
 
 Pass threshold: RMS < 1 pixel (~11 m) for bulk offset.
                RMS < 2 pixels (~22 m) for patch residuals.
+
+Note on PCC values
+------------------
+Sardine outputs sigma0 (flattened); ASF is gamma0 RTC.  These are
+different radiometric products.  At 1-km scale the expected NCC PCC
+ceiling for sigma0-vs-gamma0 is ~0.15–0.20 (vs ~0.40 for same-product).
+A coarse PCC >= 0.12 is treated as a reliable zero-offset confirmation
+when both images agree that the peak is at (0, 0).
+For Level 2 only patches with PCC > 0.08 are included in the RMS.
 """
 
 import os
@@ -54,6 +63,8 @@ PATCH_CENTRES = [
 PATCH_SIZE   = 512    # pixels
 PATCH_SMOOTH = 11     # boxcar before patch correlation
 COARSE_BLOCK = 100    # pixels to block-average for Level 1
+PATCH_PCC_FLOOR = 0.08   # minimum patch PCC to include in Level 2 RMS
+COARSE_PCC_MIN  = 0.12   # PCC floor for coarse confirmation (sigma0 vs gamma0)
 
 
 def ncc_fft(a, b, max_search=None):
@@ -74,6 +85,8 @@ def ncc_fft(a, b, max_search=None):
         mask[max(0,cy-max_search):cy+max_search+1,
              max(0,cx-max_search):cx+max_search+1] = 1.0
         corr *= mask
+        if corr.max() <= 0:
+            return None, None, 0.0
     pk = np.unravel_index(np.argmax(corr), corr.shape)
     pcc = corr[pk] / corr.size
     return pk[0] - N, pk[1] - N, pcc
@@ -118,8 +131,6 @@ H100 = sar_ds.height // COARSE_BLOCK
 W100 = sar_ds.width  // COARSE_BLOCK
 sar_coarse = sar_ds.read(1, out_shape=(H100, W100), resampling=Resampling.average).astype(np.float32)
 sar_coarse[sar_coarse < -9000] = np.nan
-# dB → linear
-sar_coarse_lin = np.where(np.isfinite(sar_coarse), 10.0 ** (sar_coarse / 10.0), np.nan)
 
 print("  Reprojecting and block-averaging ASF ...", flush=True)
 coarse_tf = rasterio.transform.Affine(
@@ -135,7 +146,10 @@ reproject(source=asf_raw, destination=asf_coarse,
           resampling=Resampling.average,
           src_nodata=np.nan, dst_nodata=np.nan)
 
-row_c, col_c, pcc_c = ncc_fft(sar_coarse_lin, asf_coarse, max_search=50)
+# Convert ASF to dB for NCC — both images in log domain, comparable dynamic range
+asf_coarse_db = np.where((np.isfinite(asf_coarse)) & (asf_coarse > 0),
+                         10.0 * np.log10(asf_coarse), np.nan)
+row_c, col_c, pcc_c = ncc_fft(sar_coarse, asf_coarse_db, max_search=50)
 if row_c is None:
     print("  ERROR: coarse correlation returned None.")
     bulk_row = 0; bulk_col = 0; pcc_c = 0.0
@@ -222,8 +236,12 @@ for lon_c, lat_c, label in PATCH_CENTRES:
         continue
 
     # Smooth and correlate within ±10 px to find residual
-    ps = smooth_nan(patch_sar, PATCH_SMOOTH)
-    pa = smooth_nan(patch_asf, PATCH_SMOOTH)
+    # Use dB domain for both — robust to ENL/radiometric scaling differences
+    patch_sar_db = np.where(np.isfinite(sar_raw), sar_raw, np.nan)  # sardine already in dB
+    patch_asf_db = np.where((np.isfinite(patch_asf)) & (patch_asf > 0),
+                            10.0 * np.log10(patch_asf), np.nan)
+    ps = smooth_nan(patch_sar_db, PATCH_SMOOTH)
+    pa = smooth_nan(patch_asf_db, PATCH_SMOOTH)
     row_off, col_off, pcc = ncc_fft(ps, pa, max_search=10)
     if row_off is None:
         print(f"  {label:35s}  (flat patch)")
@@ -244,17 +262,23 @@ if len(results) >= 2:
     row_offs = np.array([r[0] for r in results])
     col_offs = np.array([r[1] for r in results])
     pccs     = np.array([r[4] for r in results])
-    rms_px   = float(np.sqrt((row_offs**2 + col_offs**2).mean()))
-    rms_m    = rms_px * PIXEL_M
-    print(f"  Patch residual RMS (Level 2): {rms_px:.2f} px  ({rms_m:.1f} m)   "
-          f"mean PCC={pccs.mean():.4f}")
+    # Only include patches above the PCC floor in the RMS
+    reliable = pccs > PATCH_PCC_FLOOR
+    if reliable.sum() >= 1:
+        rms_px = float(np.sqrt((row_offs[reliable]**2 + col_offs[reliable]**2).mean()))
+    else:
+        rms_px = float('nan')
+    rms_m    = rms_px * PIXEL_M if not np.isnan(rms_px) else float('nan')
+    rms_str  = f"{rms_px:.2f} px  ({rms_m:.1f} m)" if not np.isnan(rms_px) else "n/a (no reliable patches)"
+    print(f"  Patch residual RMS (Level 2, PCC>{PATCH_PCC_FLOOR}): {rms_str}   "
+          f"mean PCC={pccs.mean():.4f}  reliable={reliable.sum()}/{len(results)}")
     print()
-    if pcc_c >= 0.2 and abs(bulk_row) <= 1 and abs(bulk_col) <= 1:
+    if pcc_c >= COARSE_PCC_MIN and abs(bulk_row) <= 1 and abs(bulk_col) <= 1:
         verdict = "PASS — bulk offset sub-pixel; geocoding is accurate"
-    elif pcc_c >= 0.2 and max(abs(bulk_row), abs(bulk_col)) <= 10:
+    elif pcc_c >= COARSE_PCC_MIN and max(abs(bulk_row), abs(bulk_col)) <= 10:
         verdict = f"WARN — bulk offset {max(abs(bulk_row),abs(bulk_col))*PIXEL_M:.0f} m; minor systematic shift"
-    elif pcc_c < 0.2:
-        verdict = "UNCERTAIN — coarse PCC < 0.2; result needs visual verification"
+    elif pcc_c < COARSE_PCC_MIN:
+        verdict = "UNCERTAIN — coarse PCC below cross-product floor; result needs visual verification"
     else:
         verdict = f"FAIL — bulk offset {max(abs(bulk_row),abs(bulk_col))*PIXEL_M:.0f} m; geocoding error"
     print(f"  Verdict: {verdict}")
