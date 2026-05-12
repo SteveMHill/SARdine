@@ -167,9 +167,9 @@ Float32 GeoTIFF, EPSG:4326       [export.rs]
 
 ## 6. Test Coverage
 
-**169 tests total, 169 passing** (as of April 24, 2026):
+**362 tests total, 362 passing** (as of May 12, 2026):
 
-- 168 unit tests embedded in source files
+- 361 unit tests embedded in source files
 - 1 integration test: `tests/no_silent_fallbacks.rs`
 
 The integration test runs `scripts/check_no_silent_fallbacks.sh` at `cargo test` time. It blocks:
@@ -322,7 +322,7 @@ Test: `validate::tests::anti_meridian_crossing_rejected`.
 
 `sardine-py` PyO3 bindings implemented. See README § Python quick-start. 20/20 smoke tests pass.
 
-### 8.9 Memory / streaming
+### 8.10 Memory / streaming
 
 The pipeline reads full subswath SLC TIFFs into memory before processing. For IW at full resolution (3 subswaths × ~12,000 lines × ~20,000–24,000 samples × 4 bytes), peak memory for the debursted arrays is ~11 GiB before calibration. The merge step holds all three calibrated arrays simultaneously (~3 × 1 GiB = ~3 GiB merged slant-range image). There is no streaming or tiling. This is a known architectural limitation.
 
