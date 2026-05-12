@@ -290,42 +290,41 @@ Per-pixel NESZ masking is now implemented end-to-end:
 - `examples/dump_s1b_tc.rs` — now uses `noise_floor_margin_db: 3.0` (3 dB above per-pixel NESZ).
 - 164 tests pass (up from 163); new assertions in `sigma0_s1a_iw1_vv_smoke_test` verify NESZ shape and typical S-1 dB range.
 
-### 8.3 DEM is SRTM1 — Copernicus GLO-30 is preferred
+### ~~8.3 DEM is SRTM1 — Copernicus GLO-30 is preferred~~ — DONE
 
-SRTM1 has more voids over mountainous terrain and is less accurate than Copernicus GLO-30 (available freely). The terrain flattening formula is DEM-normal-dependent; better DEM → better γ⁰.
+GLO-30 support is fully implemented: `Glo30Tile` in `dem.rs`, `fetch_glo30_tiles` in `dem_fetch.rs`. Pass `--dem-source glo30` to auto-download Copernicus GLO-30 tiles from AWS.
 
-**What to do:** Add a DEM loader for Copernicus GLO-30 GeoTIFF tiles. The current `DemMosaic` interface accepts any `.hgt` files; GLO-30 is distributed as GeoTIFF and would need a new tile loader alongside or replacing the SRTM `.hgt` reader. Alternatively, convert GLO-30 tiles to `.hgt` format.
+### ~~8.4 `ground_range.rs` is orphaned~~ — DONE
 
-### 8.4 `ground_range.rs` is orphaned
-
-`ground_range.rs` (722 lines, 7 tests) implements ground range projection and multilooking. It was the Step I product from an earlier development phase. It is not called by the CLI binary and is not wired into the terrain correction step.
-
-**Status options:**
-- **Keep as an optional intermediate** — useful for generating a GRD product without terrain correction (quick radiometric preview, no DEM required). Wire it up as a `--grd-only` flag or secondary output.
-- **Remove** — reduces maintenance surface and avoids confusion about which path is active.
-- **No current risk** — the module is safe and tested but unused.
+`to_ground_range` is called by `run_grd` in `run.rs` (line 557). The `sardine grd` subcommand is the production GRD path.
 
 ### 8.5 ~~No parallel processing~~ — DONE (April 23, 2026)
 
 Rayon parallelization is **active** in `terrain_correction.rs` (the outer row loop uses `into_par_iter()` at line 626). The full S1B scene processes in ~30 minutes on 30 threads (eo2cube, 80 logical CPUs). `DemMosaic` is `Sync`. No further action needed for single-scene use.
 
-### 8.6 BigTIFF output not supported
+### ~~8.6 BigTIFF output not supported~~ — DONE
 
-`write_geotiff()` writes classic TIFF (≤ 4 GiB). Full-scene S1 GeoTIFF outputs at 10 m pixel spacing and float32 can exceed 4 GiB for large scenes. Currently the pipeline writes 0.0001° WGS84 output (~11 m) which is well under 4 GiB for a single IW scene, but large-area mosaics would fail.
-
-**What to do:** Either add BigTIFF support to `write_geotiff()` (requires changing the TIFF header, IFD entry widths, and using 8-byte offsets), or use GDAL as an optional output backend.
+`write_geotiff_with_crs` and `write_geotiff` auto-select BigTIFF when the estimated output exceeds 4 GiB (`needs_bigtiff` check in `export.rs`).
 
 ### 8.7 Only IW mode is supported
 
 The CLI and pipeline assume 3 subswaths (IW1, IW2, IW3). Extra-Wide (EW) swath mode (5 subswaths) and StripMap mode are not handled. The type system accepts `AcquisitionMode::EW` and `AcquisitionMode::SM` but `merge_subswaths()` requires ≥ 2 inputs and the CLI hardcodes the IW1/IW2/IW3 list.
 
-### 8.8 No anti-meridian handling
+### ~~8.8 No anti-meridian handling~~ — DONE (May 2026)
 
-`BoundingBox` is WGS84 lon/lat and assumes scenes do not cross the ±180° meridian. S1 scenes near the anti-meridian will have an incorrect bounding box (wrapping from near −180° to near +180°). This is documented as a known limitation.
+The pipeline now **fails explicitly** rather than silently producing a wrong bounding box. `check_bounding_box` in `validate.rs` detects when `max_lon − min_lon > 180°` (the signature of raw GCPs straddling ±180°) and returns `ValidationError::AntiMeridianCrossing { span_deg }` with an actionable message. This error propagates through `scene.validated()` → `ParseError::Validation` → all pipeline entry points.
 
-### 8.9 No Python bindings / no streaming
+Test: `validate::tests::anti_meridian_crossing_rejected`.
 
-The pipeline reads full subswath SLC TIFFs into memory before processing. For IW at full resolution (3 subswaths × ~12,000 lines × ~20,000–24,000 samples × 4 bytes), peak memory for the debursted arrays is ~11 GiB before calibration. The merge step holds all three calibrated arrays simultaneously (~3 × 1 GiB = ~3 GiB merged slant-range image). There is no streaming or tiling.
+**Remaining limitation:** the pipeline still cannot *process* anti-meridian scenes. It now refuses them cleanly instead of producing corrupt output.
+
+### ~~8.9 No Python bindings~~ — DONE
+
+`sardine-py` PyO3 bindings implemented. See README § Python quick-start. 20/20 smoke tests pass.
+
+### 8.9 Memory / streaming
+
+The pipeline reads full subswath SLC TIFFs into memory before processing. For IW at full resolution (3 subswaths × ~12,000 lines × ~20,000–24,000 samples × 4 bytes), peak memory for the debursted arrays is ~11 GiB before calibration. The merge step holds all three calibrated arrays simultaneously (~3 × 1 GiB = ~3 GiB merged slant-range image). There is no streaming or tiling. This is a known architectural limitation.
 
 ---
 

@@ -36,6 +36,21 @@ pub enum ValidationError {
         detail: String,
     },
 
+    /// The scene's raw GCP longitudes span more than 180°, which means the
+    /// scene crosses the ±180° anti-meridian.  Simple min/max bounding-box
+    /// arithmetic is not valid for such scenes — the pipeline cannot process
+    /// them without a longitude-wrapping strategy.
+    ///
+    /// To process such a scene, re-project the GCPs to a coordinate system
+    /// where the scene does not cross a discontinuity (e.g. EPSG:3832
+    /// Pacific-centred UTM).
+    #[error(
+        "scene crosses the anti-meridian (longitude span {span_deg:.1}° > 180°); \
+         min/max bounding-box arithmetic is invalid for this scene — \
+         re-project GCPs to a Pacific-centred CRS before processing"
+    )]
+    AntiMeridianCrossing { span_deg: f64 },
+
     #[error("{mode} mode requires at least one sub-swath")]
     NoSubSwaths { mode: AcquisitionMode },
 
@@ -202,6 +217,14 @@ fn check_bounding_box(bb: &BoundingBox, errors: &mut Vec<ValidationError>) {
                 bb.min_lon_deg, bb.max_lon_deg
             ),
         });
+    }
+
+    // Detect anti-meridian crossing: a raw min/max span > 180° means the
+    // GCPs straddle ±180° (e.g. lons 178° and −178° give span = 356°).
+    // Normal S-1 IW scenes are 3–5° wide; 180° is a conservative threshold.
+    let lon_span = bb.max_lon_deg - bb.min_lon_deg;
+    if lon_span > 180.0 {
+        errors.push(ValidationError::AntiMeridianCrossing { span_deg: lon_span });
     }
 }
 
@@ -613,6 +636,26 @@ mod tests {
         assert!(has_error(&errors, |e| {
             matches!(e, ValidationError::InvalidBoundingBox { field: "latitude", .. })
         }));
+    }
+
+    #[test]
+    fn anti_meridian_crossing_rejected() {
+        // Simulate GCPs straddling ±180°: raw min/max gives span > 180°.
+        // e.g. lons [-178°, +179°] → span = 357° (a ~1° scene at the anti-meridian,
+        // not a ~357° scene).
+        let mut m = valid_metadata();
+        m.bounding_box.min_lon_deg = -178.5;
+        m.bounding_box.max_lon_deg = 179.0;
+        let errors = check(&m);
+        assert!(
+            has_error(&errors, |e| matches!(
+                e,
+                ValidationError::AntiMeridianCrossing { span_deg }
+                    if *span_deg > 180.0
+            )),
+            "expected AntiMeridianCrossing, got: {:?}",
+            errors
+        );
     }
 
     #[test]
