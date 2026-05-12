@@ -282,11 +282,26 @@ branches — see also "Do NOT build yet" at the end.
   into all three write paths in `export.rs`; the 4 GiB pre-flight gate
   was removed.
 
+### Done since the previous revision (cont.)
+
+- **COG output** (tiled + overviews) — `write_cog_with_crs` in `export.rs`
+  builds a full overview pyramid via `downsample_2x` and writes a
+  spec-compliant COG with all overview IFDs before the full-res IFD.
+  `sardine process --cog` uses this pure-Rust writer; `sardine grd --cog`
+  still delegates to `gdal_translate`.
+- **`ground_range.rs`** — wired into `sardine grd` via `run::run_grd` →
+  `ground_range::to_ground_range`. Not orphaned.
+- **Dual-pol** — `--polarization VV+VH` / `dual` / `both` supported in the
+  `process` and `grd` subcommands; the pipeline runs once per polarization
+  and inserts `_VV` / `_VH` into the output filename.
+
 ### Should fix next
 
-1. **COG output** (tiled + overviews) for downstream tile servers.
-2. **`Stage`/`Pipeline` trait** so a third-party crate can insert a
+1. **`Stage`/`Pipeline` trait** so a third-party crate can insert a
    stage — only after a second concrete implementation exists.
+2. **Geometric accuracy validation** — sub-pixel absolute geolocation has
+   not been confirmed. Visual GIS overlay (QGIS at 1:50 000) or a corner
+   reflector / point target comparison is needed (see HANDOVER.md §8.1).
 
 ### Validation scripts added
 
