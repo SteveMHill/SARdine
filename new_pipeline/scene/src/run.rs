@@ -109,14 +109,15 @@ pub fn apply_speckle_step(
     data: &mut Vec<f32>,
     cols: usize,
     rows: usize,
-    choice: Option<crate::speckle::SpeckleFilter>,
+    choice: Option<&dyn crate::speckle::SpeckleKernel>,
 ) -> Result<()> {
     let Some(filter) = choice else {
         return Ok(());
     };
-    tracing::info!("applying speckle filter {filter:?} …");
-    let out = crate::speckle::apply_speckle_filter(data, cols, rows, filter)
-        .with_context(|| format!("speckle filter {filter:?}"))?;
+    tracing::info!("applying speckle filter …");
+    let out = filter
+        .apply(data, cols, rows)
+        .with_context(|| "speckle filter")?;
     *data = out;
     Ok(())
 }
@@ -248,7 +249,8 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     )?;
     if opts.speckle_order == SpeckleOrder::BeforeTc {
         let t_speckle = Instant::now();
-        apply_speckle_step(&mut merged.data, merged.samples, merged.lines, speckle_choice)?;
+        apply_speckle_step(&mut merged.data, merged.samples, merged.lines,
+            speckle_choice.as_ref().map(|f| f as &dyn crate::speckle::SpeckleKernel))?;
         report_timing("speckle_before_tc", t_speckle);
     }
 
@@ -385,7 +387,8 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     // ── Post-TC speckle (map geometry, after terrain correction, default) ─────
     if opts.speckle_order == SpeckleOrder::AfterTc {
         let t_speckle = Instant::now();
-        apply_speckle_step(&mut geocoded.data, geocoded.cols, geocoded.rows, speckle_choice)?;
+        apply_speckle_step(&mut geocoded.data, geocoded.cols, geocoded.rows,
+            speckle_choice.as_ref().map(|f| f as &dyn crate::speckle::SpeckleKernel))?;
         report_timing("speckle", t_speckle);
     }
 
@@ -579,7 +582,8 @@ fn run_grd_from_prepared(
     let mut grd = grd;
     let speckle_choice = resolve_speckle(speckle, speckle_window, enl, frost_damping)?;
     let t_speckle = Instant::now();
-    apply_speckle_step(&mut grd.data, grd.samples, grd.lines, speckle_choice)?;
+    apply_speckle_step(&mut grd.data, grd.samples, grd.lines,
+        speckle_choice.as_ref().map(|f| f as &dyn crate::speckle::SpeckleKernel))?;
     report_timing("speckle", t_speckle);
 
     let output_str = output_path

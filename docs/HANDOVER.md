@@ -470,10 +470,12 @@ in [PROGRESS.md §12](PROGRESS.md).
   enum in `output_crs.rs`; `--crs` CLI flag; fully plumbed through
   `terrain_correction.rs` and `export.rs`. Supports WGS84, UTM N/S, LAEA,
   Web Mercator.
-- **One speckle filter primitive behind a `Filter` trait** (start with boxcar +
-  Refined Lee). Current design is a clean `SpeckleFilter` enum with all five
-  filters in `speckle.rs`. A `Filter` trait would allow third-party filters; not
-  needed unless a second implementor exists. *Only remaining should-fix item.*
+- ~~**One speckle filter primitive behind a `Filter` trait**~~ — **DONE.**
+  `pub trait SpeckleKernel: Send + Sync` in `speckle.rs` with one required
+  method `apply(&self, data: &[f32], cols: usize, rows: usize) -> Result<Vec<f32>, SpeckleError>`.
+  `SpeckleFilter` implements it; `apply_speckle_step` in `run.rs` now takes
+  `Option<&dyn SpeckleKernel>`.  Re-exported from `lib.rs`; 2 new tests.
+  *All should-fix items are now resolved.*
 - ~~Export the layover/shadow mask and local incidence angle as separate GeoTIFF
   bands~~ — **DONE.** `--write-lia` and `--write-mask` CLI flags; written as
   `.lia.tif` and `.mask.tif` sidecars; forced on in `--mode nrb`.

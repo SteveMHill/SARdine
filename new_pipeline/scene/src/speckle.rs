@@ -569,6 +569,40 @@ fn refined_lee(data: &[f32], cols: usize, rows: usize, enl: f32) -> Vec<f32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SpeckleKernel trait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extension trait for speckle filters.
+///
+/// `SpeckleKernel` provides a single method `apply` that takes a
+/// row-major raster (linear-power floats, NaN nodata) and returns a
+/// freshly-allocated filtered output.  The crate-native [`SpeckleFilter`]
+/// enum implements this trait; third-party crates can implement it for
+/// their own filter algorithms and pass a `&dyn SpeckleKernel` to
+/// [`crate::run::apply_speckle_step`].
+///
+/// Implementors must be [`Send`] + [`Sync`] because the pipeline may
+/// call the filter from a Rayon thread pool.
+pub trait SpeckleKernel: Send + Sync {
+    /// Apply the filter to `data` (row-major, `rows × cols`, linear-power
+    /// floats with NaN nodata) and return a freshly-allocated output buffer.
+    ///
+    /// Errors are the same as those returned by [`apply_speckle_filter`].
+    fn apply(
+        &self,
+        data: &[f32],
+        cols: usize,
+        rows: usize,
+    ) -> Result<Vec<f32>, SpeckleError>;
+}
+
+impl SpeckleKernel for SpeckleFilter {
+    fn apply(&self, data: &[f32], cols: usize, rows: usize) -> Result<Vec<f32>, SpeckleError> {
+        apply_speckle_filter(data, cols, rows, *self)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -963,5 +997,50 @@ mod tests {
             matches!(err, SpeckleError::DimensionMismatch { got: 24, expected: 25 }),
             "got {err:?}"
         );
+    }
+
+    // ── SpeckleKernel trait tests ─────────────────────────────────────────────
+
+    /// A third-party struct implementing SpeckleKernel (identity — passes every
+    /// pixel through unchanged) can be called via `&dyn SpeckleKernel`.  This
+    /// verifies the trait is object-safe and can be used as an extension point.
+    #[test]
+    fn custom_speckle_kernel_is_callable_via_trait_object() {
+        struct IdentityFilter;
+        impl SpeckleKernel for IdentityFilter {
+            fn apply(&self, data: &[f32], cols: usize, rows: usize) -> Result<Vec<f32>, SpeckleError> {
+                if data.len() != cols * rows {
+                    return Err(SpeckleError::DimensionMismatch {
+                        got: data.len(),
+                        expected: cols * rows,
+                    });
+                }
+                Ok(data.to_vec())
+            }
+        }
+
+        let data: Vec<f32> = (0..25).map(|i| i as f32).collect();
+        let kernel: &dyn SpeckleKernel = &IdentityFilter;
+        let out = kernel.apply(&data, 5, 5).expect("identity filter must succeed");
+        assert_eq!(out.len(), data.len());
+        for (a, b) in out.iter().zip(data.iter()) {
+            assert!((a - b).abs() < 1e-9, "identity filter must pass values through unchanged");
+        }
+    }
+
+    /// SpeckleFilter::Boxcar implements SpeckleKernel; calling through the
+    /// trait object must give the same result as calling apply_speckle_filter
+    /// directly.
+    #[test]
+    fn speckle_filter_trait_impl_matches_free_fn() {
+        let data: Vec<f32> = (1..=9).map(|i| i as f32 * 0.1).collect();
+        let f = SpeckleFilter::Boxcar { window: 3 };
+        let expected = apply_speckle_filter(&data, 3, 3, f).expect("direct call");
+        let kernel: &dyn SpeckleKernel = &f;
+        let via_trait = kernel.apply(&data, 3, 3).expect("trait call");
+        assert_eq!(expected.len(), via_trait.len());
+        for (a, b) in expected.iter().zip(via_trait.iter()) {
+            assert!((a - b).abs() < 1e-9, "trait impl and free fn must agree");
+        }
     }
 }

@@ -48,3 +48,4 @@ pub mod validate;
 pub use types::*;
 pub use validate::{ValidationError, ValidationErrors};
 pub use pipeline_options::RadarImage;
+pub use speckle::SpeckleKernel;
