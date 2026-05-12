@@ -436,37 +436,28 @@ in [PROGRESS.md §12](PROGRESS.md).
 
 ### Must fix before any external scientific use
 
-1. **Default geoid is `Zero` → silent ~40 m geolocation bias on land.**
-   `GeoidModel::default()` returns `Zero`, which the CLI and examples
-   inherit. EGM96 support exists (`geoid.rs`, `geoid_fetch.rs` behind the
-   `geoid-fetch` feature) but is opt-in. Either change the default to
-   `Egm96` with auto-fetch + cache (failing loudly if the network is
-   unavailable and no cached file exists), or refuse to run without an
-   explicit `--geoid <path|zero>` CLI flag. The current default is the
-   bug, not the implementation.
-2. **`write_geotiff` is classic TIFF only (≤4 GiB).** The verified S1B
-   run wrote a 2.8 GiB file; a slightly larger scene or finer pixel
-   spacing will silently truncate or corrupt the output. Add BigTIFF
-   support, or at minimum detect oversize and return a typed error before
-   the write.
-3. **Pre-flight DEM coverage check.** Today, missing tiles propagate as
-   NaN through geocoding without an early failure. Add a check in
-   `bin/sardine.rs::process` that the DEM mosaic covers the scene
-   bounding box plus margin, before the heavy stages run.
-4. **Replace the legacy root README.** The repository has no top-level
-   `README.md` describing the active code; the legacy README in `legacy/`
-   advertises a Python CLI that does not exist in the rebuild. Add a
-   short root README pointing to `new_pipeline/scene/`, stating what
-   works and what does not (no Python, no speckle filter, no CRS choice,
-   no COG, no batch).
+1. ~~**Default geoid is `Zero` → silent ~40 m geolocation bias on land.**~~ — **DONE.**
+   `ProcessOptions.geoid` has no default and rejects an empty string with an
+   actionable error message. `resolve_geoid("")` returns an explicit error;
+   `InsarOptions` defaults to `"auto"` (EGM96 fetch). The `GeoidModel::default()`
+   impl was removed. See `pipeline_options.rs::resolve_geoid`.
+2. ~~**`write_geotiff` is classic TIFF only (≤4 GiB).**~~ — **DONE (§8.6).**
+   `export.rs` auto-selects BigTIFF when the estimated output exceeds 4 GiB.
+3. ~~**Pre-flight DEM coverage check.**~~ — **DONE.**
+   Both `run_process` and `run_insar` call `dem.covers_bbox(bb, margin_deg=0.05)`
+   immediately after `DemMosaic::load_directory`, returning a typed
+   `DemError::CoverageGap` with exact missing coverage extents before any heavy
+   processing starts.
+4. ~~**Replace the legacy root README.**~~ — **DONE.**
+   `README.md` at the repo root describes the active Rust codebase, validated
+   accuracy, quick-start, and what is and is not supported.
 5. **Add a regression test in CI.** The +0.016 dB ASF validation is a
    hand-run script today. Pin the S1B 2019-01-23 scene + ASF reference
    and assert "median linear bias within ±0.05 dB" on `cargo test
    --features regression` (or behind an `--ignored` gate run nightly).
-6. **Decide `ground_range.rs`'s fate.** Implemented (726 LOC, 7 unit
-   tests) but not on any user-facing path. Either expose it as a
-   `--grd-only` CLI mode (skip TC, write slant-projected GRD) or remove
-   it. The current state — present but invisible — is the worst option.
+   *This is the only remaining must-fix item.*
+6. ~~**Decide `ground_range.rs`'s fate.**~~ — **DONE (§8.4).**
+   `to_ground_range` is wired into `run_grd` / `sardine grd` subcommand.
 
 ### Should fix before declaring a public release
 
@@ -481,8 +472,8 @@ in [PROGRESS.md §12](PROGRESS.md).
 - Provenance sidecar (input SAFE, orbit, DEM tile list, geoid, code SHA,
   pixel-spacing, masks applied) written next to every GeoTIFF
 - Replace `eprintln!` with `tracing` + a real progress reporter
-- PyO3 bindings (one `process_scene(...) -> dict` to start)
-- `Stage`/`Pipeline` trait so a third-party crate can insert a stage
+- PyO3 bindings (one `process_scene(...) -> dict` to start) — **DONE** (`sardine-py`, 20/20 smoke tests)
+- `Stage`/`Pipeline` trait so a third-party crate can insert a stage — **DONE** (`pipeline_options.rs`, May 2026)
 
 ### Nice to have later
 
@@ -516,11 +507,18 @@ a typed error variant; PR self-checklist must be filled in.
 - Rayon parallelization (active, 30-thread run at ~30 min)
 - `orbit.rs` `.unwrap()` fix
 - Seam continuity verification (IW1/IW2, IW2/IW3 both < 0.2 dB)
-- Radiometric bias root-cause analysis (Jensen / ENL mismatch, not a
-  calibration bug)
+- Radiometric bias root-cause analysis (Jensen / ENL mismatch, not a calibration bug)
 - Copernicus GLO-30 DEM support via `DemSource` trait
 - Per-pixel NESZ noise-floor masking through full pipeline
-- EGM96 geoid implementation (default still `Zero` — see must-fix #1)
+- EGM96 geoid implementation; `ProcessOptions` requires explicit `--geoid` (no silent default)
+- BigTIFF auto-selection in `export.rs` when output >4 GiB
+- Pre-flight DEM coverage check in `run_process` + `run_insar` (`DemError::CoverageGap`)
+- Root `README.md` added; accurate as of May 2026
+- `sardine-py` PyO3 bindings (20/20 smoke tests)
+- `Pipeline` trait + `impl Pipeline for ProcessOptions/GrdOptions/InsarOptions`
+- `ValidationError::AntiMeridianCrossing` guard in `check_bounding_box`
+- Geometric accuracy validated: NCC-FFT vs ASF RTC10, two urban patches PCC ≈ 0.25 (May 2026)
+- 362 lib tests + 1 guard integration test pass
 
 ---
 
@@ -536,7 +534,7 @@ From AGENTS.md (non-negotiable):
 - Every new `unwrap_or*` or `.ok()?` pattern must have a same-line `// SAFETY-OK:` annotation
 - No hardcoded Sentinel-1 constants in production code — read from `SubSwathMetadata` or annotation parser
 - No `todo!`, `unimplemented!`, `panic!`, `// TODO/FIXME/XXX` in production code
-- Run `cargo test` after every change; all 169 tests must pass
+- Run `cargo test` after every change; all 362 tests must pass
 
 The mandatory guard runs automatically:
 ```bash
