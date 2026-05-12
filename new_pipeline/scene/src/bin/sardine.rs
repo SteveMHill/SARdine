@@ -220,8 +220,7 @@ struct ProcessArgs {
 
     /// Write a Cloud-Optimised GeoTIFF instead of a stripped TIFF.
     ///
-    /// Requires `gdal_translate` (GDAL ≥ 3.1) in PATH.
-    /// The output file is converted in-place after writing.
+    /// Uses the pure-Rust tiled COG writer; no external tools required.
     #[arg(long)]
     cog: bool,
 
