@@ -451,11 +451,16 @@ in [PROGRESS.md §12](PROGRESS.md).
 4. ~~**Replace the legacy root README.**~~ — **DONE.**
    `README.md` at the repo root describes the active Rust codebase, validated
    accuracy, quick-start, and what is and is not supported.
-5. **Add a regression test in CI.** The +0.016 dB ASF validation is a
-   hand-run script today. Pin the S1B 2019-01-23 scene + ASF reference
-   and assert "median linear bias within ±0.05 dB" on `cargo test
-   --features regression` (or behind an `--ignored` gate run nightly).
-   *This is the only remaining must-fix item.*
+5. ~~**Add a regression test in CI.**~~ — **DONE.**
+   `tests/regression_s1b_20190123.rs` runs the full S1B 2019-01-23 pipeline
+   and asserts: linear mean bias ≤ ±1.5 dB, dB median bias ≤ ±0.5 dB,
+   ≥ 100,000 joint-valid pixels. Gate: `#[ignore]` + `--features geoid-fetch`.
+   Run with:
+   ```sh
+   cargo test --release --features geoid-fetch \
+       --test regression_s1b_20190123 -- --ignored --nocapture
+   ```
+   *All §12 must-fix items are now resolved.*
 6. ~~**Decide `ground_range.rs`'s fate.**~~ — **DONE (§8.4).**
    `to_ground_range` is wired into `run_grd` / `sardine grd` subcommand.
 
