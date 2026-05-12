@@ -27,3 +27,4 @@ data/MPC/
 # IDE
 .vscode/settings.json
 .idea/
+new_pipeline/sardine-py/.venv/
