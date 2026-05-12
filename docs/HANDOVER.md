@@ -466,19 +466,31 @@ in [PROGRESS.md §12](PROGRESS.md).
 
 ### Should fix before declaring a public release
 
-- `OutputGrid` abstraction + `--output-crs` CLI flag (today EPSG:4326 is
-  hard-wired across `terrain_correction.rs` and `export.rs`)
-- One speckle filter primitive behind a `Filter` trait (start with boxcar
-  + Refined Lee — not the legacy 5-filter zoo)
-- Export the layover/shadow mask and local incidence angle as separate
-  GeoTIFF bands (both are computed today, then thrown away)
-- Single CLI invocation for dual-pol VV+VH (currently requires two runs)
-- COG output (tiled + overviews) for downstream tile servers
-- Provenance sidecar (input SAFE, orbit, DEM tile list, geoid, code SHA,
-  pixel-spacing, masks applied) written next to every GeoTIFF
-- Replace `eprintln!` with `tracing` + a real progress reporter
-- PyO3 bindings (one `process_scene(...) -> dict` to start) — **DONE** (`sardine-py`, 20/20 smoke tests)
-- `Stage`/`Pipeline` trait so a third-party crate can insert a stage — **DONE** (`pipeline_options.rs`, May 2026)
+- ~~`OutputGrid` abstraction + `--output-crs` CLI flag~~ — **DONE.** `OutputCrs`
+  enum in `output_crs.rs`; `--crs` CLI flag; fully plumbed through
+  `terrain_correction.rs` and `export.rs`. Supports WGS84, UTM N/S, LAEA,
+  Web Mercator.
+- **One speckle filter primitive behind a `Filter` trait** (start with boxcar +
+  Refined Lee). Current design is a clean `SpeckleFilter` enum with all five
+  filters in `speckle.rs`. A `Filter` trait would allow third-party filters; not
+  needed unless a second implementor exists. *Only remaining should-fix item.*
+- ~~Export the layover/shadow mask and local incidence angle as separate GeoTIFF
+  bands~~ — **DONE.** `--write-lia` and `--write-mask` CLI flags; written as
+  `.lia.tif` and `.mask.tif` sidecars; forced on in `--mode nrb`.
+- ~~Single CLI invocation for dual-pol VV+VH~~ — **DONE.** `--polarization VV+VH`
+  (or `dual`) parsed by `multi_pol.rs::parse_polarizations`; runs pipeline once
+  per pol, writes `_VV.tif` + `_VH.tif`.
+- ~~COG output (tiled + overviews) for downstream tile servers~~ — **DONE.**
+  Pure-Rust tiled COG writer in `export.rs::write_cog_with_crs`; activated via
+  `--cog`.
+- ~~Provenance sidecar~~ — **DONE.** `.provenance.json` + `.stac.json` written
+  next to every output; gated on `!opts.no_provenance`. Schema in
+  `provenance.rs`.
+- ~~Replace `eprintln!` with `tracing` + a real progress reporter~~ — **DONE.**
+  All production code uses `tracing::info!` / `tracing::warn!`. Remaining
+  `eprintln!` calls are in `#[cfg(test)]` fixture-skip guards only.
+- ~~PyO3 bindings (one `process_scene(...) -> dict` to start)~~ — **DONE** (`sardine-py`, 20/20 smoke tests)
+- ~~`Stage`/`Pipeline` trait so a third-party crate can insert a stage~~ — **DONE** (`pipeline_options.rs`, May 2026)
 
 ### Nice to have later
 
