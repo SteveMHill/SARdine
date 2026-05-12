@@ -20,7 +20,7 @@ library entry points are exposed as a Python extension
 ## Quick-start for a new session
 
 ```
-cd /home/datacube/dev/SARdine/new_pipeline/scene
+cd /home/datacube/dev/SARdine/./scene
 cargo test                                  # all 362 unit + 1 guard test must pass
 cargo build --release
 
@@ -41,7 +41,7 @@ cargo run --release --features geoid-fetch -- process \
 Python extension (built once, then importable):
 
 ```
-cd /home/datacube/dev/SARdine/new_pipeline/sardine-py
+cd /home/datacube/dev/SARdine/./sardine-py
 maturin develop --release --features fetch-all
 python3 -c "import sardine; print(sardine.features())"
 ```
@@ -56,7 +56,7 @@ See [HANDOVER.md §3](HANDOVER.md) for the full quick-start and last verified ru
 
 ---
 
-## `sardine-scene` crate — `new_pipeline/scene/`
+## `sardine` crate — `sardine/`
 
 Rust crate. **362 unit tests + 1 guard integration test**, no GDAL dependency.
 
@@ -64,9 +64,9 @@ Rust crate. **362 unit tests + 1 guard integration test**, no GDAL dependency.
 `proj4rs 0.1`, `rayon 1`, `tempfile 3` (dev). Optional: `reqwest`, `zip`,
 `tokio` behind `orbit-fetch` / `geoid-fetch` / `slc-fetch` features.
 
-The Python extension lives in a sibling crate `new_pipeline/sardine-py/`
+The Python extension lives in a sibling crate `sardine-py/`
 (PyO3 0.22, abi3-py38), built with `maturin develop`. It depends on
-`sardine-scene` and re-exports library entry points to Python.
+`sardine` and re-exports library entry points to Python.
 
 ### Modules
 
@@ -213,7 +213,7 @@ A short version:
 | Selectable output CRS (EPSG:4326 + UTM via `proj4rs`) | ✅ |
 | LIA / shadow-layover mask raster outputs (`--write-lia`, `--write-mask`) | ✅ |
 | Provenance JSON sidecar | ✅ |
-| Library entry points (`sardine_scene::run`) | ✅ |
+| Library entry points (`sardine::run`) | ✅ |
 | Python bindings (`sardine-py`, PyO3 + maturin) | ✅ |
 | BigTIFF output (>4 GiB) | ✅ (`needs_bigtiff()` + `write_bigtiff_raw_inner()` wired into all three write paths in `export.rs`) |
 | Coherence / polarimetric workflows | ❌ (intensity-only deburst by design) |
@@ -277,7 +277,7 @@ branches — see also "Do NOT build yet" at the end.
   `terrain_correction.rs`, `slc_fetch.rs`, `orbit_fetch.rs`, and
   `geoid_fetch.rs` replaced with `tracing::info!`, `tracing::warn!`, or
   `tracing::debug!`.  `bin/sardine.rs` initialises a `tracing-subscriber`
-  with `EnvFilter`; users can set `RUST_LOG=sardine_scene=debug`.
+  with `EnvFilter`; users can set `RUST_LOG=sardine=debug`.
 - **BigTIFF output** — `needs_bigtiff()` + `write_bigtiff_raw_inner()` wired
   into all three write paths in `export.rs`; the 4 GiB pre-flight gate
   was removed.

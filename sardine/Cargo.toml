@@ -1,0 +1,40 @@
+[package]
+name = "sardine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Sentinel-1 IW SLC backscatter pipeline (calibration, deburst, geocoding, terrain flattening) for SARdine"
+readme = "../README.md"
+keywords = ["sentinel-1", "sar", "remote-sensing", "geospatial", "radar"]
+categories = ["science::geo"]
+
+[features]
+default      = ["orbit-fetch", "dem-fetch"]
+orbit-fetch  = ["dep:ureq", "dep:flate2"]
+slc-fetch    = ["dep:ureq", "dep:md5"]
+geoid-fetch  = ["dep:ureq"]
+dem-fetch    = ["dep:ureq", "dep:flate2"]
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+quick-xml = { version = "0.36", features = ["serialize"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "2", features = ["json"], optional = true }
+flate2 = { version = "1", optional = true }
+md5 = { version = "0.7", optional = true }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tiff = "0.11.3"
+proj4rs = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

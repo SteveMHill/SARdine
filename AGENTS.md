@@ -73,7 +73,7 @@ carrier frequency, lines-per-burst) that should always come from annotation
 metadata.
 
 To prevent regressions, `scripts/check_no_silent_fallbacks.sh` is enforced as
-an integration test (`new_pipeline/scene/tests/no_silent_fallbacks.rs`) and
+an integration test (`sardine/tests/no_silent_fallbacks.rs`) and
 runs on every `cargo test`.  The script blocks:
 
 | Pattern class           | Examples                                          |
@@ -97,7 +97,7 @@ intent into code review.
 
 ### PR self-checklist (mandatory)
 
-Copy this into every PR description that touches `new_pipeline/scene/src/`:
+Copy this into every PR description that touches `sardine/src/`:
 
 - [ ] No new `unwrap_or*`, `unwrap_or_default`, `let _ = result`, `.ok()?` patterns (or each is annotated `SAFETY-OK: …` on the same line)
 - [ ] No new hardcoded Sentinel-1 constants in production code (read from `SubSwathMetadata` / annotation parser instead)

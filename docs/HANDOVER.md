@@ -33,7 +33,7 @@ SARdine/
 │   └── rebuild_boundary_01.md  ← scope boundary definition
 ├── legacy/                      ← old Python+Rust pipeline (reference only)
 │   └── old_package_copy/SARdine/
-├── new_pipeline/
+├── ./
 │   └── scene/                  ← THE ACTIVE CODEBASE (single Rust crate)
 │       ├── Cargo.toml
 │       ├── src/                 ← all production source (see §4)
@@ -69,7 +69,7 @@ SARdine/
 ## 3. Quick Start
 
 ```bash
-cd /home/datacube/dev/SARdine/new_pipeline/scene
+cd /home/datacube/dev/SARdine/./scene
 
 # Build (release recommended — terrain correction is slow in debug)
 cargo build --release
@@ -139,7 +139,7 @@ Float32 GeoTIFF, EPSG:4326       [export.rs]
 
 ## 5. Module Reference
 
-### `new_pipeline/scene/src/`
+### `sardine/src/`
 
 | Module | Lines | Trust | Purpose |
 |--------|-------|-------|---------|
@@ -397,10 +397,10 @@ The following `SAFETY-OK` annotations exist in production code. Each is justifie
 
 ## 11. Crate Metadata
 
-**Crate name:** `sardine-scene`  
+**Crate name:** `sardine`  
 **Version:** 0.1.0  
 **Edition:** 2021  
-**Location:** `new_pipeline/scene/`
+**Location:** `sardine/`
 
 **Dependencies:**
 

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "sardine",
+    "sardine-py",
+    "sardine-validate",
+]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "Apache-2.0"
+repository = "https://github.com/SteveMHill/SARdine"
+homepage   = "https://github.com/SteveMHill/SARdine"
+authors    = ["SARdine contributors"]
+rust-version = "1.75"

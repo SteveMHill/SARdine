@@ -17,7 +17,6 @@ non-negotiable rules and the local workflow.
 
 ```sh
 # build + test (runs the no-silent-fallbacks guard automatically)
-cd new_pipeline
 cargo test --workspace
 
 # guard alone
@@ -29,11 +28,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The Python extension is built via `maturin develop` from
-`new_pipeline/sardine-py/`.
+`sardine-py/`.
 
 ## Pull-request checklist
 
-Copy this into every PR description that touches `new_pipeline/scene/src/`:
+Copy this into every PR description that touches `sardine/src/`:
 
 - [ ] No new `unwrap_or*`, `unwrap_or_default`, `let _ = result`, `.ok()?`
       patterns (or each is annotated `// SAFETY-OK: …` on the same line).
@@ -64,4 +63,4 @@ Please include:
 Numerical correctness is the highest bar. A change that ships faster code
 at the cost of unverified output will be rejected. Phase-3 of the perf
 work is a worked example of what "bit-equivalent on a real scene" looks
-like — see the regression tests in `new_pipeline/scene/src/orbit.rs`.
+like — see the regression tests in `sardine/src/orbit.rs`.

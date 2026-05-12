@@ -1,0 +1,425 @@
+//! `sardine` — Sentinel-1 backscatter processing CLI.
+//!
+//! # Subcommands
+//! - `process`     — Full pipeline: calibration → deburst → merge → geocode → dB → GeoTIFF
+//! - `fetch-orbit` — Download POEORB for a SAFE product (requires `--features orbit-fetch`)
+//! - `inspect`     — Print scene metadata (bounding box, polarizations, burst count, timing)
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+
+use sardine_scene::parse::parse_safe_directory;
+use sardine_scene::types::Polarization;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI definition
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(
+    name = "sardine",
+    about = "Sentinel-1 SAR backscatter processing",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the full backscatter pipeline on a Sentinel-1 IW SLC SAFE product.
+    Process(ProcessArgs),
+
+    /// Download a POEORB precise orbit file for a SAFE product.
+    ///
+    /// Requires the crate to be built with `--features orbit-fetch`.
+    FetchOrbit(FetchOrbitArgs),
+
+    /// Print scene metadata for a SAFE product.
+    Inspect(InspectArgs),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Process subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct ProcessArgs {
+    /// Path to the Sentinel-1 IW SLC `.SAFE` directory.
+    #[arg(long, value_name = "PATH")]
+    safe: PathBuf,
+
+    /// Directory containing SRTM1 DEM GeoTIFF tiles.
+    #[arg(long, value_name = "DIR")]
+    dem: PathBuf,
+
+    /// Output path for the dB GeoTIFF (written as Float32 GeoTIFF).
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Path to a POEORB `.EOF` file.
+    ///
+    /// If omitted, the annotation orbit is used only when the environment
+    /// variable `SARDINE_ALLOW_ANNOTATION_ORBIT=1` is set.  Without that
+    /// variable, the command exits with an error.
+    #[arg(long, value_name = "FILE")]
+    orbit: Option<PathBuf>,
+
+    /// Polarization channel to process (VV or VH).
+    #[arg(long, value_name = "POL", default_value = "VV")]
+    polarization: String,
+
+    /// Disable terrain flattening (Small 2011).  Flattening is on by default.
+    #[arg(long)]
+    no_flatten: bool,
+
+    /// Noise floor in dB.  Pixels at or below this level are masked to NaN.
+    ///
+    /// The default (0.0 linear, i.e. no masking beyond ≤0) is appropriate
+    /// for most use cases; set a positive dB value to apply thermal noise masking.
+    #[arg(long, value_name = "DB", default_value_t = 0.0_f32)]
+    noise_floor_db: f32,
+
+    /// Output pixel spacing in degrees (ground range).
+    #[arg(long, value_name = "DEG", default_value_t = 0.0001_f64)]
+    pixel_spacing_deg: f64,
+}
+
+fn cmd_process(args: ProcessArgs) -> Result<()> {
+    use sardine_scene::apply_calibration::apply_calibration;
+    use sardine_scene::calibration::parse_calibration_noise;
+    use sardine_scene::deburst::deburst_subswath;
+    use sardine_scene::dem::DemMosaic;
+    use sardine_scene::export::{to_db_inplace, write_geotiff};
+    use sardine_scene::ground_range::to_ground_range;
+    use sardine_scene::merge_subswaths::{merge_subswaths, SwathInput};
+    use sardine_scene::orbit::{apply_precise_orbit, parse_eof_file};
+    use sardine_scene::parse::parse_safe_directory;
+    use sardine_scene::slc_reader::SlcReader;
+    use sardine_scene::terrain_correction::{terrain_correction, TerrainCorrectionConfig};
+    use sardine_scene::types::SubSwathId;
+
+    // Parse polarization.
+    let pol = match args.polarization.to_uppercase().as_str() {
+        "VV" => Polarization::VV,
+        "VH" => Polarization::VH,
+        other => bail!("Unsupported polarization: {}. Use VV or VH.", other),
+    };
+
+    // Step 1: parse SAFE metadata.
+    eprintln!("sardine: parsing SAFE metadata …");
+    let scene = parse_safe_directory(&args.safe)
+        .with_context(|| format!("parsing SAFE: {}", args.safe.display()))?;
+
+    // Step 2: apply orbit.
+    let scene = if let Some(orbit_path) = &args.orbit {
+        let orbit = parse_eof_file(orbit_path)
+            .with_context(|| format!("parsing orbit file: {}", orbit_path.display()))?;
+        apply_precise_orbit(scene, &orbit)
+            .with_context(|| "applying precise orbit")?
+    } else {
+        let allow = std::env::var("SARDINE_ALLOW_ANNOTATION_ORBIT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !allow {
+            bail!(
+                "No --orbit file provided and SARDINE_ALLOW_ANNOTATION_ORBIT != 1.\n\
+                 Provide a POEORB file with --orbit, or set SARDINE_ALLOW_ANNOTATION_ORBIT=1 \
+                 to use the annotation orbit (metre-level accuracy)."
+            );
+        }
+        eprintln!(
+            "sardine: WARNING — using annotation orbit (metre-level accuracy). \
+             Provide a POEORB file for cm-level accuracy."
+        );
+        scene
+    };
+
+    // Step 3: determine IW subswath IDs and measurement TIFFs.
+    let iw_ids: &[SubSwathId] = &[SubSwathId::IW1, SubSwathId::IW2, SubSwathId::IW3];
+    let measurement_dir = args.safe.join("measurement");
+    let annotation_dir = args.safe.join("annotation");
+    let calibration_dir = args.safe.join("annotation").join("calibration");
+
+    // Build per-swath calibration/noise + SLC data.
+    let mut swath_inputs: Vec<SwathInput> = Vec::new();
+
+    for iw_id in iw_ids {
+        let iw_str = format!("{}", iw_id).to_lowercase();
+        let pol_str = format!("{}", pol).to_lowercase();
+
+        // Find measurement TIFF matching this swath + polarization.
+        let tiff_path = find_measurement_tiff(&measurement_dir, &iw_str, &pol_str)?;
+        let cal_xml = find_calibration_xml(&calibration_dir, "calibration", &iw_str, &pol_str)?;
+        let noise_xml = find_calibration_xml(&calibration_dir, "noise", &iw_str, &pol_str)?;
+        let annotation_xml = find_annotation_xml(&annotation_dir, &iw_str, &pol_str)?;
+
+        let swath_meta = scene
+            .sub_swaths
+            .iter()
+            .find(|s| s.id == *iw_id)
+            .with_context(|| format!("subswath {:?} not found in scene metadata", iw_id))?
+            .clone();
+
+        let (cal, noise) = parse_calibration_noise(&cal_xml, &noise_xml)
+            .with_context(|| format!("parsing calibration for {:?}", iw_id))?;
+
+        let reader = SlcReader::open(&tiff_path)
+            .with_context(|| format!("opening SLC TIFF: {}", tiff_path.display()))?;
+
+        let sigma0_linear = apply_calibration(&reader, &swath_meta, &cal, &noise)
+            .with_context(|| format!("calibration for {:?}", iw_id))?;
+
+        let debursted = deburst_subswath(sigma0_linear, &swath_meta)
+            .with_context(|| format!("deburst for {:?}", iw_id))?;
+
+        let ground = to_ground_range(debursted, &swath_meta)
+            .with_context(|| format!("ground-range conversion for {:?}", iw_id))?;
+
+        swath_inputs.push(SwathInput {
+            id: *iw_id,
+            data: ground,
+            metadata: swath_meta,
+        });
+    }
+
+    // Step 4: merge subswaths.
+    eprintln!("sardine: merging subswaths …");
+    let merged = merge_subswaths(swath_inputs)
+        .with_context(|| "merging subswaths")?;
+
+    // Step 5: load DEM.
+    eprintln!("sardine: loading DEM mosaic …");
+    let dem = DemMosaic::from_directory(&args.dem)
+        .with_context(|| format!("loading DEM from: {}", args.dem.display()))?;
+
+    // Step 6: terrain correction.
+    eprintln!("sardine: terrain correction …");
+    let tc_config = TerrainCorrectionConfig {
+        pixel_spacing_deg: args.pixel_spacing_deg,
+        flatten: !args.no_flatten,
+        ..Default::default()
+    };
+    let mut geocoded = terrain_correction(&merged, &scene, &dem, tc_config)
+        .with_context(|| "terrain correction")?;
+
+    eprintln!(
+        "sardine: geocoded {}×{} pixels — valid={}, dem_missing={}, not_converged={}, flat_masked={}",
+        geocoded.cols,
+        geocoded.rows,
+        geocoded.valid_pixel_count,
+        geocoded.dem_missing_count,
+        geocoded.non_converged_count,
+        geocoded.flat_masked_count,
+    );
+
+    // Step 7: convert to dB.
+    let noise_floor_linear = if args.noise_floor_db <= 0.0 {
+        0.0_f32
+    } else {
+        10.0_f32.powf(args.noise_floor_db / 10.0)
+    };
+    let (converted, masked) = to_db_inplace(&mut geocoded.data, noise_floor_linear)
+        .with_context(|| "dB conversion")?;
+    eprintln!(
+        "sardine: dB conversion — converted={}, noise_masked={}",
+        converted, masked
+    );
+
+    // Step 8: write GeoTIFF.
+    eprintln!("sardine: writing GeoTIFF → {}", args.output.display());
+    write_geotiff(&args.output, &geocoded.data, geocoded.cols, geocoded.rows, geocoded.geotransform)
+        .with_context(|| format!("writing GeoTIFF: {}", args.output.display()))?;
+
+    eprintln!("sardine: done.");
+    Ok(())
+}
+
+/// Find a measurement TIFF in `dir` matching `iw` and `pol` in the filename.
+fn find_measurement_tiff(dir: &std::path::Path, iw: &str, pol: &str) -> Result<PathBuf> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading measurement dir: {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.contains(iw) && name.contains(pol) && name.ends_with(".tiff") {
+            return Ok(entry.path());
+        }
+    }
+    bail!("No measurement TIFF found for iw={} pol={} in {}", iw, pol, dir.display())
+}
+
+/// Find a calibration/noise XML file in `dir` matching `kind`, `iw`, and `pol`.
+fn find_calibration_xml(
+    dir: &std::path::Path,
+    kind: &str,
+    iw: &str,
+    pol: &str,
+) -> Result<PathBuf> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading calibration dir: {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.starts_with(kind) && name.contains(iw) && name.contains(pol) {
+            return Ok(entry.path());
+        }
+    }
+    bail!(
+        "No {} XML found for iw={} pol={} in {}",
+        kind, iw, pol, dir.display()
+    )
+}
+
+/// Find an annotation XML file in `dir` matching `iw` and `pol`.
+fn find_annotation_xml(
+    dir: &std::path::Path,
+    iw: &str,
+    pol: &str,
+) -> Result<PathBuf> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading annotation dir: {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        // Annotation files are named like s1a-iw1-slc-vv-…xml
+        if name.contains(iw) && name.contains(pol) && name.ends_with(".xml") {
+            return Ok(entry.path());
+        }
+    }
+    bail!(
+        "No annotation XML found for iw={} pol={} in {}",
+        iw, pol, dir.display()
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fetch-orbit subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct FetchOrbitArgs {
+    /// Path to the Sentinel-1 `.SAFE` directory (used to derive product ID and sensing time).
+    #[arg(long, value_name = "PATH")]
+    safe: PathBuf,
+
+    /// Directory to write the downloaded `.EOF` file into (created if absent).
+    #[arg(long, value_name = "DIR")]
+    cache_dir: PathBuf,
+}
+
+fn cmd_fetch_orbit(args: FetchOrbitArgs) -> Result<()> {
+    #[cfg(feature = "orbit-fetch")]
+    {
+        use sardine_scene::orbit_fetch::fetch_poeorb;
+
+        // Extract product ID from the SAFE directory name.
+        let safe_name = args
+            .safe
+            .file_name()
+            .with_context(|| "SAFE path has no filename")?
+            .to_string_lossy();
+        let product_id = safe_name.trim_end_matches(".SAFE");
+
+        // Parse the sensing start time from SAFE metadata.
+        eprintln!("sardine: parsing SAFE metadata to extract sensing start …");
+        let scene = parse_safe_directory(&args.safe)
+            .with_context(|| format!("parsing SAFE: {}", args.safe.display()))?;
+
+        let sensing_start = scene.start_time;
+
+        eprintln!(
+            "sardine: fetching POEORB for {} (sensing_start={}) …",
+            product_id,
+            sensing_start.format("%Y-%m-%dT%H:%M:%SZ")
+        );
+
+        let orbit_path = fetch_poeorb(product_id, sensing_start, &args.cache_dir)
+            .with_context(|| "downloading POEORB")?;
+
+        println!("{}", orbit_path.display());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "orbit-fetch"))]
+    {
+        let _ = args;
+        bail!(
+            "The 'fetch-orbit' subcommand requires the 'orbit-fetch' feature.\n\
+             Rebuild with: cargo build --features orbit-fetch"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// inspect subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct InspectArgs {
+    /// Path to the Sentinel-1 `.SAFE` directory.
+    #[arg(value_name = "SAFE")]
+    safe: PathBuf,
+}
+
+fn cmd_inspect(args: InspectArgs) -> Result<()> {
+    let scene = parse_safe_directory(&args.safe)
+        .with_context(|| format!("parsing SAFE: {}", args.safe.display()))?;
+
+    let bb = &scene.bounding_box;
+    let pols: Vec<String> = scene.polarizations.iter().map(|p| format!("{:?}", p)).collect();
+
+    println!("Product ID   : {}", scene.product_id);
+    println!("Mission      : {:?}", scene.mission);
+    println!("Mode         : {:?}", scene.acquisition_mode);
+    println!("Polarizations: {}", pols.join(", "));
+    println!(
+        "Sensing start: {}",
+        scene.start_time.format("%Y-%m-%dT%H:%M:%S.%6fZ")
+    );
+    println!(
+        "Sensing stop : {}",
+        scene.stop_time.format("%Y-%m-%dT%H:%M:%S.%6fZ")
+    );
+    println!(
+        "Duration     : {:.3} s",
+        (scene.stop_time - scene.start_time).num_milliseconds() as f64 / 1000.0
+    );
+    println!(
+        "Bounding box : lon=[{:.4}, {:.4}]  lat=[{:.4}, {:.4}]",
+        bb.lon_min, bb.lon_max, bb.lat_min, bb.lat_max
+    );
+    println!("Subswaths    : {}", scene.sub_swaths.len());
+    println!("Bursts       : {}", scene.bursts.len());
+    println!("Orbit SVs    : {}", scene.orbit.state_vectors.len());
+    println!(
+        "Radar freq   : {:.6} GHz",
+        scene.radar_frequency_hz / 1e9
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Commands::Process(args) => cmd_process(args),
+        Commands::FetchOrbit(args) => cmd_fetch_orbit(args),
+        Commands::Inspect(args) => cmd_inspect(args),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {:#}", e);
+            ExitCode::FAILURE
+        }
+    }
+}

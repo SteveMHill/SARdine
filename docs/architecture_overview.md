@@ -5,9 +5,9 @@
 *Last updated: April 26, 2026*
 
 Sentinel-1 IW SLC backscatter processing pipeline. The active codebase is
-two Rust crates: [`new_pipeline/scene/`](../new_pipeline/scene/)
-(`sardine-scene` v0.1.0, library + CLI) and
-[`new_pipeline/sardine-py/`](../new_pipeline/sardine-py/) (`sardine-py`
+two Rust crates: [`sardine/`](../sardine/)
+(`sardine` v0.1.0, library + CLI) and
+[`sardine-py/`](../sardine-py/) (`sardine-py`
 v0.1.0, PyO3 extension built with maturin). The legacy Python+Rust package
 under `legacy/` is **reference-only** — see
 [LEGACY_STATUS.md](../LEGACY_STATUS.md) and [AGENTS.md](../AGENTS.md).
@@ -76,14 +76,14 @@ than EPSG:4326 / UTM.
 | 15 | Provenance JSON sidecar (`.provenance.json`, schema v1) | ✅ | `provenance.rs` |
 | 16 | Speckle filter on linear-power buffer (boxcar / Lee 1981 / Frost / Gamma-MAP / Refined Lee) | ✅ (CLI: `--speckle KIND`) | `speckle.rs` |
 | 17 | Selectable output CRS (EPSG:4326, UTM 326XX/327XX, `auto`) via `proj4rs` | ✅ (CLI: `--crs`, `--pixel-spacing-m`) | `output_crs.rs`, `terrain_correction.rs` |
-| 18 | Library entry points (`sardine_scene::run::{run_process, run_grd, …}`) | ✅ | `run.rs` |
-| 19 | Python bindings (`sardine.process` / `grd` / `fetch_orbit` / `download_slc` / `fetch_geoid` / `features`) | ✅ (`sardine-py` crate, maturin) | `new_pipeline/sardine-py/src/lib.rs` |
+| 18 | Library entry points (`sardine::run::{run_process, run_grd, …}`) | ✅ | `run.rs` |
+| 19 | Python bindings (`sardine.process` / `grd` / `fetch_orbit` / `download_slc` / `fetch_geoid` / `features`) | ✅ (`sardine-py` crate, maturin) | `sardine-py/src/lib.rs` |
 | — | Coherence / polarimetric workflows | ❌ Foundations not present (intensity-only deburst) | — |
 | — | BigTIFF (>4 GiB) output | ❌ Not implemented; classic-TIFF size enforced pre-flight | — |
 
 ## Module architecture (implemented)
 
-All in `new_pipeline/scene/src/` (line counts current as of 2026-04-24):
+All in `sardine/src/` (line counts current as of 2026-04-24):
 
 ```
 types.rs              domain types, no I/O
@@ -112,13 +112,13 @@ run.rs                Library entry points: run_process, run_grd, prepare_merged
 bin/sardine.rs        Thin clap shim over run.rs (process, grd, inspect, fetch-orbit, download-slc)
 ```
 
-Python extension crate `new_pipeline/sardine-py/`:
+Python extension crate `sardine-py/`:
 
 ```
 src/lib.rs                       PyO3 wrappers: process, grd, fetch_orbit, download_slc, fetch_geoid, features
 python/sardine/__init__.py       Re-exports from compiled `_sardine` module
 pyproject.toml                   maturin config (module-name = sardine._sardine, abi3-py38)
-Cargo.toml                       Standalone crate; passes through fetch features to sardine-scene
+Cargo.toml                       Standalone crate; passes through fetch features to sardine
 ```
 
 Guard: `scripts/check_no_silent_fallbacks.sh` + `tests/no_silent_fallbacks.rs`

@@ -1,10 +1,10 @@
-# Legacy virtualenv (hundreds of MB of Python packages)
-legacy/old_package_copy/SARdine/.venv/
+# Legacy directory (removed from HEAD; .venv not tracked)
+legacy/
 
 # Rust build outputs
-new_pipeline/scene/target/
-new_pipeline/sardine-py/target/
-new_pipeline/validation/target/
+sardine/target/
+sardine-py/target/
+sardine-validate/target/
 target/
 
 # Python bytecode
@@ -27,4 +27,7 @@ data/MPC/
 # IDE
 .vscode/settings.json
 .idea/
-new_pipeline/sardine-py/.venv/
+sardine-py/.venv/
+
+# Temporary diagnostic scripts
+scripts/_diag*.py

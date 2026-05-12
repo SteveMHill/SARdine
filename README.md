@@ -42,7 +42,7 @@ The pipeline implements:
 10. **Provenance** — `.provenance.json` and `.stac.json` sidecars next to
     every output
 
-**Python bindings** (PyO3, `sardine` wheel, `new_pipeline/sardine-py/`):
+**Python bindings** (PyO3, `sardine` wheel, `sardine-py/`):
 `sardine.process()`, `sardine.grd()`, `sardine.fetch_orbit()`,
 `sardine.download_slc()`, `sardine.fetch_geoid()`, `sardine.features()`.
 
@@ -74,7 +74,7 @@ production code without an explicit `// SAFETY-OK:` annotation.
 ### Build and test
 
 ```sh
-cd new_pipeline/scene
+cd sardine
 cargo test          # 372 unit + 1 guard test must pass
 cargo build --release
 ```
@@ -123,12 +123,12 @@ Auto-fetch behaviour (requires the corresponding feature flag at compile time):
 - **`--features geoid-fetch`** — `--geoid auto` downloads and caches the EGM96
   grid (≈ 7 MB)
 
-Set `RUST_LOG=sardine_scene=info` for a progress log.
+Set `RUST_LOG=sardine=info` for a progress log.
 
 ### Python bindings
 
 ```sh
-cd new_pipeline/sardine-py
+cd sardine-py
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
 maturin develop --release --features slc-fetch
@@ -153,10 +153,9 @@ print(result)
 ## Repository layout
 
 ```
-new_pipeline/
-    scene/          sardine-scene Rust crate (the pipeline)
-    sardine-py/     Python bindings (PyO3 / maturin)
-legacy/             Reference-only legacy Python+Rust code (do not use)
+sardine/            sardine Rust crate (the pipeline)
+sardine-py/         Python bindings (PyO3 / maturin)
+sardine-validate/   End-to-end radiometric regression harness
 docs/               Architecture notes, handover doc, progress log
 scripts/            Validation and diagnostic Python scripts
 data/               Test data (not committed — see .gitignore)

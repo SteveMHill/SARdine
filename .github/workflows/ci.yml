@@ -18,7 +18,6 @@ jobs:
         with:
           components: rustfmt
       - name: cargo fmt --check
-        working-directory: new_pipeline
         run: cargo fmt --all -- --check
 
   clippy:
@@ -31,12 +30,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: new_pipeline
+          workspaces: .
       # Note: -D warnings is intentionally NOT set yet. There are pre-existing
       # warnings unrelated to the CI bring-up; they will be tightened in a
       # follow-up PR once the codebase is warning-clean.
       - name: cargo clippy
-        working-directory: new_pipeline
         run: cargo clippy --workspace --all-targets --no-default-features
 
   test:
@@ -47,14 +45,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: new_pipeline
+          workspaces: .
       # 19 unit tests reference Sentinel-1 SAFE products by absolute path
       # (notably the S1A test scene). These are integration-grade tests that
       # depend on data not currently shipped with the repository. Skip them
       # in CI until a proper test-data fixture (download script + cache or
       # git-lfs pointer) is in place. Tracked as A4 follow-up.
       - name: cargo test (workspace, default features)
-        working-directory: new_pipeline
         run: |
           cargo test --workspace --no-default-features -- \
             --skip slc_reader::tests:: \
@@ -86,19 +83,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: new_pipeline
+          workspaces: .
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: install python dependencies
         run: pip install --no-cache-dir numpy rasterio
       - name: build sardine + sardine-validate
-        working-directory: new_pipeline
-        run: cargo build --release --no-default-features -p sardine-scene -p sardine-validation
+        run: cargo build --release --no-default-features -p sardine -p sardine-validation
       - name: sardine-validate
         env:
           SARDINE_VALIDATION_SCENES_DIR: ${{ vars.SARDINE_VALIDATION_SCENES_DIR }}
         run: |
-          new_pipeline/target/release/sardine-validate \
-            --sardine-bin new_pipeline/target/release/sardine \
+          target/release/sardine-validate \
+            --sardine-bin target/release/sardine \
             --multilook-compare scripts/multilook_compare.py
