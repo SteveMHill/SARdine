@@ -45,7 +45,7 @@ pub use crate::run_provenance::speckle_provenance_fields;
 pub(crate) use crate::run_provenance::collect_quality_flags;
 pub use crate::scene_prep::{prepare_merged_scene, prepare_merged_scene_assembled, PreparedScene};
 pub(crate) use crate::scene_prep::apply_multilook;
-pub use crate::multi_pol::{run_grd_multi, run_process_multi};
+pub use crate::multi_pol::{run_grd_multi, run_insar_multi, run_process_multi};
 
 /// Emit a single `[timing]` line on stderr.  Centralised so the format stays
 /// consistent across stages and so future migration to a structured

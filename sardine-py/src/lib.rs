@@ -32,7 +32,7 @@ use pyo3::prelude::*;
 use sardine::run::
 {
     parse_iw_selection, parse_output_mode, parse_speckle_order,
-    run_grd_multi, run_insar, run_process_multi, GrdOptions, InsarOptions, ProcessOptions, ResamplingKernel,
+    run_grd_multi, run_insar_multi, run_process_multi, GrdOptions, InsarOptions, ProcessOptions, ResamplingKernel,
 };
 
 /// Convert an `anyhow::Error` into a Python `RuntimeError` with the
@@ -287,7 +287,7 @@ fn insar(
         cog,
         threads,
     };
-    py.allow_threads(|| run_insar(&opts)).map_err(py_err)
+    py.allow_threads(|| run_insar_multi(&opts)).map_err(py_err)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

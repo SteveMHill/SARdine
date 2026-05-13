@@ -977,7 +977,7 @@ fn cmd_insar(args: InsarArgs) -> Result<()> {
         cog: args.cog,
         threads: args.threads,
     };
-    sardine::run::run_insar(&opts)
+    sardine::run::run_insar_multi(&opts)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
