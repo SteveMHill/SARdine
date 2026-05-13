@@ -307,10 +307,10 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     tc_config.pixel_spacing_deg = spacing;
     tc_config.flatten = !opts.no_flatten;
     tc_config.resampling = opts.resampling;
-    // NRB mode forces LIA and mask computation.
+    // NRB mode forces LIA, mask, and COG output.
     let effective_write_lia = opts.write_lia || opts.mode == OutputMode::Nrb;
     let effective_write_mask = opts.write_mask || opts.mode == OutputMode::Nrb;
-    let _effective_cog = opts.cog || opts.mode == OutputMode::Nrb;
+    let effective_cog = opts.cog || opts.mode == OutputMode::Nrb;
     tc_config.compute_lia = effective_write_mask || effective_write_lia;
     let t_tc = Instant::now();
     let geocoded = terrain_correction(&merged, &scene, &dem, &grids, &tc_config)
@@ -352,32 +352,63 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
 
     let lia_sidecar_path: Option<String> = if effective_write_lia {
         let lia_path = sidecar_path(&opts.output, ".lia.tif")?;
-        tracing::info!("writing LIA sidecar → {}", lia_path);
-        crate::export::write_geotiff_with_crs(
-            &lia_path,
-            &geocoded.cos_lia,
-            geocoded.cols,
-            geocoded.rows,
-            geocoded.geotransform,
-            &geocoded.crs,
-        )
-        .with_context(|| format!("writing LIA GeoTIFF: {lia_path}"))?;
+        if effective_cog {
+            tracing::info!("writing LIA COG sidecar → {}", lia_path);
+            crate::export::write_cog_with_crs(
+                &lia_path,
+                &geocoded.cos_lia,
+                geocoded.cols,
+                geocoded.rows,
+                geocoded.geotransform,
+                &geocoded.crs,
+                512,
+            )
+            .with_context(|| format!("writing LIA COG: {lia_path}"))?;
+        } else {
+            tracing::info!("writing LIA sidecar → {}", lia_path);
+            crate::export::write_geotiff_with_crs(
+                &lia_path,
+                &geocoded.cos_lia,
+                geocoded.cols,
+                geocoded.rows,
+                geocoded.geotransform,
+                &geocoded.crs,
+            )
+            .with_context(|| format!("writing LIA GeoTIFF: {lia_path}"))?;
+        }
         Some(lia_path)
     } else {
         None
     };
     let mask_sidecar_path: Option<String> = if effective_write_mask {
         let mask_path = sidecar_path(&opts.output, ".mask.tif")?;
-        tracing::info!("writing quality mask sidecar → {}", mask_path);
-        crate::export::write_geotiff_u8_with_crs(
-            &mask_path,
-            &geocoded.mask,
-            geocoded.cols,
-            geocoded.rows,
-            geocoded.geotransform,
-            &geocoded.crs,
-        )
-        .with_context(|| format!("writing mask GeoTIFF: {mask_path}"))?;
+        if effective_cog {
+            // Upcast u8 mask codes (0–6) to f32 for the COG writer.  All values
+            // are small integers, exactly representable as f32; no precision loss.
+            let mask_f32: Vec<f32> = geocoded.mask.iter().map(|&v| v as f32).collect();
+            tracing::info!("writing quality mask COG sidecar → {}", mask_path);
+            crate::export::write_cog_with_crs(
+                &mask_path,
+                &mask_f32,
+                geocoded.cols,
+                geocoded.rows,
+                geocoded.geotransform,
+                &geocoded.crs,
+                512,
+            )
+            .with_context(|| format!("writing mask COG: {mask_path}"))?;
+        } else {
+            tracing::info!("writing quality mask sidecar → {}", mask_path);
+            crate::export::write_geotiff_u8_with_crs(
+                &mask_path,
+                &geocoded.mask,
+                geocoded.cols,
+                geocoded.rows,
+                geocoded.geotransform,
+                &geocoded.crs,
+            )
+            .with_context(|| format!("writing mask GeoTIFF: {mask_path}"))?;
+        }
         Some(mask_path)
     } else {
         None
@@ -429,7 +460,7 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("output path contains non-UTF-8 characters"))?;
     let t_export = Instant::now();
-    if opts.cog {
+    if effective_cog {
         tracing::info!("writing COG → {}", output_str);
         crate::export::write_cog_with_crs(
             output_str,
@@ -455,7 +486,10 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     }
     report_timing("export_geotiff", t_export);
 
-    if !opts.no_provenance {
+    // NRB mode requires both provenance and STAC sidecars; --no-provenance
+    // only suppresses them for RTC/GRD.
+    let write_provenance = !opts.no_provenance || opts.mode == OutputMode::Nrb;
+    if write_provenance {
         let prov = crate::run_provenance::build_provenance(
             opts,
             &scene,
