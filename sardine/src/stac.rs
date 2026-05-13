@@ -503,6 +503,7 @@ mod tests {
                 speckle_enl: None,
                 speckle_damping: None,
                 speckle_order: None,
+                resampling_kernel: None,
             },
             output: OutputInfo {
                 raster_path: "/out/scene_VV.tif".to_owned(),

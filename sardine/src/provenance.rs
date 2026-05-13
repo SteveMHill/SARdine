@@ -260,6 +260,11 @@ pub struct ProcessingInfo {
     /// `null` when `speckle_filter` is `null` (no speckle applied) or for `mode=grd`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speckle_order: Option<String>,
+    /// Resampling kernel used for σ⁰ image interpolation during terrain
+    /// correction.  `"bilinear"` (default), `"bicubic"`, or `"lanczos3"`.
+    /// `null` for `mode=grd` (no terrain correction performed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resampling_kernel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -435,6 +440,7 @@ mod tests {
                 speckle_enl: Some(1.0),
                 speckle_damping: None,
                 speckle_order: None,
+                resampling_kernel: None,
             },
             output: OutputInfo {
                 raster_path: "/out/scene.tif".to_owned(),
@@ -616,6 +622,7 @@ mod tests {
             speckle_enl: None,
             speckle_damping: None,
             speckle_order: None,
+            resampling_kernel: None,
         };
         p.output = OutputInfo {
             raster_path: "/out/scene.grd.tif".to_owned(),

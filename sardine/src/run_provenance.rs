@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::pipeline_options::{OutputMode, SpeckleOrder};
+use crate::pipeline_options::{OutputMode, ResamplingKernel, SpeckleOrder};
 use crate::types::Polarization;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +237,11 @@ pub(crate) fn build_provenance(
                 SpeckleOrder::BeforeTc => "before_tc",
                 SpeckleOrder::AfterTc => "after_tc",
             }.to_owned()),
+            resampling_kernel: Some(match opts.resampling {
+                ResamplingKernel::Bilinear => "bilinear",
+                ResamplingKernel::Bicubic  => "bicubic",
+                ResamplingKernel::Lanczos3 => "lanczos3",
+            }.to_owned()),
         },
         output: OutputInfo {
             raster_path: output_path.to_owned(),
@@ -359,6 +364,7 @@ pub(crate) fn build_grd_provenance(
             speckle_enl: speckle_enl_field,
             speckle_damping: speckle_damping_field,
             speckle_order: None,
+            resampling_kernel: None,
         },
         output: OutputInfo {
             raster_path: output_path.to_owned(),

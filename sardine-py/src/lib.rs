@@ -82,6 +82,7 @@ fn py_err(e: anyhow::Error) -> PyErr {
     speckle_order = "after".to_owned(),
     iw = "".to_owned(),
     burst_range = None,
+    resampling = "bilinear".to_owned(),
 ))]
 #[allow(clippy::too_many_arguments)]
 fn process(
@@ -112,10 +113,19 @@ fn process(
     speckle_order: String,
     iw: String,
     burst_range: Option<String>,
+    resampling: String,
 ) -> PyResult<()> {
     let iw_selection = parse_iw_selection(&iw, burst_range.as_deref()).map_err(py_err)?;
     let mode = parse_output_mode(&mode).map_err(py_err)?;
     let speckle_order = parse_speckle_order(&speckle_order).map_err(py_err)?;
+    let resampling = match resampling.trim().to_ascii_lowercase().as_str() {
+        "bilinear" => ResamplingKernel::Bilinear,
+        "bicubic"  => ResamplingKernel::Bicubic,
+        "lanczos3" => ResamplingKernel::Lanczos3,
+        other => return Err(PyRuntimeError::new_err(format!(
+            "unknown resampling kernel '{other}'; valid values: bilinear, bicubic, lanczos3"
+        ))),
+    };
     let opts = ProcessOptions {
         safe,
         dem: Some(dem),
@@ -144,7 +154,7 @@ fn process(
         iw_selection,
         mode,
         speckle_order,
-        resampling: ResamplingKernel::default(),
+        resampling,
     };
     py.allow_threads(|| run_process_multi(&opts)).map_err(py_err)
 }
