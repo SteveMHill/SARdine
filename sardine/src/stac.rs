@@ -147,13 +147,12 @@ pub fn write_stac_item(prov: &Provenance, path: &Path) -> Result<(), StacError> 
     // Platform string: lower-case, e.g. "sentinel-1b".
     let platform = prov.input.mission.to_lowercase();
 
-    // Product type: γ⁰ RTC, σ⁰ RTC, or GRD.
+    // Product type: follow SAR STAC extension conventions.
+    // mode strings are set by build_provenance / build_grd_provenance in run_provenance.rs.
     let sar_product_type = match prov.processing.mode.as_deref() {
-        Some("tc") => match prov.processing.flatten {
-            Some(true) => "RTC-Gamma0",
-            _ => "RTC",
-        },
-        _ => "GRD",
+        Some("rtc") => "RTC",
+        Some("nrb") => "NRB",
+        _ => "GRD", // covers "grd" and any unknown mode
     }
     .to_owned();
 
@@ -492,7 +491,7 @@ mod tests {
             dem: DemInfo { directory: "/dem".to_owned(), tile_count: 4 },
             geoid: GeoidInfo { spec: "zero".to_owned() },
             processing: ProcessingInfo {
-                mode: Some("tc".to_owned()),
+                mode: Some("rtc".to_owned()),
                 pixel_spacing_deg: Some(0.0001),
                 target_spacing_m: None,
                 flatten: Some(true),
@@ -614,7 +613,7 @@ mod tests {
         // properties
         assert_eq!(v["properties"]["platform"], "s1b");
         assert_eq!(v["properties"]["sar:instrument_mode"], "IW");
-        assert_eq!(v["properties"]["sar:product_type"], "RTC-Gamma0");
+        assert_eq!(v["properties"]["sar:product_type"], "RTC");
         assert_eq!(v["properties"]["proj:epsg"], 4326);
         assert_eq!(v["properties"]["sardine:orbit_source"], "poeorb");
         assert_eq!(v["properties"]["sar:looks_range"], 4);
