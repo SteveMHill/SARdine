@@ -1183,6 +1183,37 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
         );
         std::fs::write(&prov_path, &prov_json)
             .with_context(|| format!("writing provenance JSON: {prov_path}"))?;
+
+        // Write STAC sidecar ──────────────────────────────────────────────────
+        let stac_path = format!("{out_base_str}_{iw_str}_coherence.stac.json");
+        tracing::info!("writing STAC sidecar → {}", stac_path);
+        let phase_path_str = if opts.output_phase {
+            Some(format!("{out_base_str}_{iw_str}_phase.tif"))
+        } else {
+            None
+        };
+        crate::stac::write_insar_stac_item(
+            &crate::stac::InsarStacInput {
+                ref_product_id: &ref_scene.product_id,
+                sec_product_id: &sec_scene.product_id,
+                platform: &ref_scene.mission.to_string().to_lowercase(),
+                polarization: &pol_str.to_uppercase(),
+                ref_start_utc: &ref_scene.start_time.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                ref_stop_utc:  &ref_scene.stop_time.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                subswath: &iw_str,
+                az_looks: opts.az_looks,
+                rg_looks: opts.rg_looks,
+                crs_epsg: coh_geocoded.crs.epsg(),
+                geotransform: coh_geocoded.geotransform,
+                cols: coh_geocoded.cols,
+                rows: coh_geocoded.rows,
+                ref_orbit_is_poeorb: opts.reference_orbit.is_some(),
+                coherence_path: &coh_path,
+                phase_path: phase_path_str.as_deref(),
+            },
+            &std::path::PathBuf::from(&stac_path),
+        )
+        .with_context(|| format!("writing STAC JSON: {stac_path}"))?;
     }
 
     tracing::info!("done.");
