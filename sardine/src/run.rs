@@ -224,6 +224,7 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
             opts.target_spacing_m_for_grd(),
             opts.cog,
             opts.no_provenance,
+            opts.noise_floor_db,
             &opts.speckle,
             opts.speckle_window,
             opts.enl,
@@ -496,13 +497,29 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
 
 pub fn run_grd(opts: &GrdOptions) -> Result<()> {
     let t_total = Instant::now();
-    let prepared = prepare_merged_scene(
-        &opts.safe,
-        opts.orbit.as_deref(),
-        &opts.polarization,
-        opts.threads,
-        &opts.iw_selection,
-    )?;
+    let prepared = if !opts.extra_safe_paths.is_empty() {
+        use crate::slice_assembly::assemble_slices;
+        let mut all: Vec<&Path> = vec![opts.safe.as_path()];
+        all.extend(opts.extra_safe_paths.iter().map(|p| p.as_path()));
+        tracing::info!("assembling {} slices …", all.len());
+        let assembled = assemble_slices(&all)
+            .with_context(|| "assembling SAFE slices")?;
+        prepare_merged_scene_assembled(
+            &assembled,
+            opts.orbit.as_deref(),
+            &opts.polarization,
+            opts.threads,
+            &opts.iw_selection,
+        )?
+    } else {
+        prepare_merged_scene(
+            &opts.safe,
+            opts.orbit.as_deref(),
+            &opts.polarization,
+            opts.threads,
+            &opts.iw_selection,
+        )?
+    };
     let PreparedScene {
         scene,
         orbit_source,
@@ -518,6 +535,7 @@ pub fn run_grd(opts: &GrdOptions) -> Result<()> {
         opts.target_spacing_m,
         opts.cog,
         opts.no_provenance,
+        opts.noise_floor_db,
         &opts.speckle,
         opts.speckle_window,
         opts.enl,
@@ -542,6 +560,7 @@ fn run_grd_from_prepared(
     target_spacing_m: f64,
     cog: bool,
     no_provenance: bool,
+    noise_floor_db: f32,
     speckle: &str,
     speckle_window: usize,
     enl: f32,
@@ -585,6 +604,27 @@ fn run_grd_from_prepared(
     apply_speckle_step(&mut grd.data, grd.samples, grd.lines,
         speckle_choice.as_ref().map(|f| f as &dyn crate::speckle::SpeckleKernel))?;
     report_timing("speckle", t_speckle);
+
+    // ── Noise floor masking (linear σ⁰ domain) ────────────────────────────────
+    let noise_masked_count = if noise_floor_db > 0.0 {
+        let threshold = 10.0_f32.powf(noise_floor_db / 10.0);
+        let mut count = 0usize;
+        for v in grd.data.iter_mut() {
+            if v.is_finite() && *v <= threshold {
+                *v = f32::NAN;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                "noise floor ({:.1} dB / {:.3e} linear): {} pixel(s) masked to NaN",
+                noise_floor_db, threshold, count
+            );
+        }
+        count
+    } else {
+        0
+    };
 
     let output_str = output_path
         .to_str()
@@ -641,6 +681,8 @@ fn run_grd_from_prepared(
             pol,
             quality_flags,
             target_spacing_m,
+            noise_floor_db,
+            noise_masked_count,
             speckle,
             speckle_window,
             enl,

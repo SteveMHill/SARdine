@@ -757,9 +757,16 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
 
 #[derive(Parser)]
 struct GrdArgs {
-    /// Path to the Sentinel-1 IW SLC `.SAFE` directory.
-    #[arg(long, value_name = "PATH")]
-    safe: PathBuf,
+    /// Path(s) to Sentinel-1 IW SLC `.SAFE` directories.
+    ///
+    /// For a single scene, pass one path.  For slice-assembled (multi-frame)
+    /// processing, pass multiple paths in ascending temporal order:
+    ///
+    ///   --safe /path/to/slice1.SAFE --safe /path/to/slice2.SAFE
+    ///
+    /// Slices must be from the same orbit pass and be temporally consecutive.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    safe: Vec<PathBuf>,
 
     /// Output path for the ground-range σ⁰ TIFF (Float32, no CRS).
     #[arg(long, value_name = "PATH")]
@@ -815,6 +822,12 @@ struct GrdArgs {
     #[arg(long, value_name = "K", default_value_t = 1.0_f32)]
     frost_damping: f32,
 
+    /// Noise floor in dB.  Pixels at or below this level (in σ⁰ linear power)
+    /// are masked to NaN before writing.  Values ≤ 0.0 disable masking.
+    /// Example: `--noise-floor-db -17` masks everything below −17 dB.
+    #[arg(long, value_name = "DB", default_value_t = 0.0_f32)]
+    noise_floor_db: f32,
+
     /// Sub-swaths to process (comma-separated).  Accepted values: `IW1`, `IW2`, `IW3`.
     /// Default: all three.  Example: `--iw IW2` or `--iw IW1,IW2`.
     #[arg(long, value_name = "LIST", default_value = "")]
@@ -828,10 +841,18 @@ struct GrdArgs {
 }
 
 impl GrdArgs {
-    fn into_options(self) -> Result<GrdOptions> {
+    fn into_options(mut self) -> Result<GrdOptions> {
+        let extra_safe_paths = if self.safe.len() > 1 {
+            self.safe.split_off(1)
+        } else {
+            vec![]
+        };
+        let primary_safe = self.safe.into_iter().next()
+            .expect("clap num_args=1.. guarantees at least one --safe path"); // SAFETY-OK: clap enforces num_args=1..
         let iw_selection = parse_iw_selection(&self.iw, self.burst_range.as_deref())?;
         Ok(GrdOptions {
-            safe: self.safe,
+            safe: primary_safe,
+            extra_safe_paths,
             output: self.output,
             orbit: self.orbit,
             polarization: self.polarization,
@@ -843,6 +864,7 @@ impl GrdArgs {
             speckle_window: self.speckle_window,
             enl: self.enl,
             frost_damping: self.frost_damping,
+            noise_floor_db: self.noise_floor_db,
             iw_selection,
         })
     }

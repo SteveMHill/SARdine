@@ -258,6 +258,15 @@ pub struct GrdOptions {
     pub frost_damping: f32,
     /// Sub-swath and burst selection (IW Split).  Default: all three IWs, all bursts.
     pub iw_selection: IwSelection,
+    /// Noise floor threshold in dB.  Pixels at or below this level (in σ⁰ linear power)
+    /// are masked to NaN before writing.  Values ≤ 0.0 disable masking.  Default: 0.0.
+    pub noise_floor_db: f32,
+    /// Additional SAFE slice paths for multi-slice (assembled) processing.
+    ///
+    /// When non-empty, all paths `[safe] ++ extra_safe_paths` are assembled
+    /// via [`crate::slice_assembly::assemble_slices`] before processing.
+    /// Paths must be ordered ascending in time (earliest slice first).
+    pub extra_safe_paths: Vec<PathBuf>,
 }
 
 impl GrdOptions {
@@ -277,6 +286,8 @@ impl GrdOptions {
             enl: 1.0,
             frost_damping: 1.0,
             iw_selection: IwSelection::default(),
+            noise_floor_db: 0.0,
+            extra_safe_paths: vec![],
         }
     }
 }

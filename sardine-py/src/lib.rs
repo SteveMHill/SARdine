@@ -167,6 +167,7 @@ fn process(
     polarization = "VV".to_owned(),
     target_spacing_m = 10.0,
     no_provenance = false,
+    noise_floor_db = 0.0_f32,
     threads = 0,
     speckle = "none".to_owned(),
     speckle_window = 7,
@@ -174,6 +175,7 @@ fn process(
     frost_damping = 1.0,
     iw = "".to_owned(),
     burst_range = None,
+    extra_safe_paths = vec![],
 ))]
 #[allow(clippy::too_many_arguments)]
 fn grd(
@@ -184,6 +186,7 @@ fn grd(
     polarization: String,
     target_spacing_m: f64,
     no_provenance: bool,
+    noise_floor_db: f32,
     threads: usize,
     speckle: String,
     speckle_window: usize,
@@ -191,6 +194,7 @@ fn grd(
     frost_damping: f32,
     iw: String,
     burst_range: Option<String>,
+    extra_safe_paths: Vec<PathBuf>,
 ) -> PyResult<()> {
     let iw_selection = parse_iw_selection(&iw, burst_range.as_deref()).map_err(py_err)?;
     let opts = GrdOptions {
@@ -206,6 +210,8 @@ fn grd(
         speckle_window,
         enl,
         frost_damping,
+        noise_floor_db,
+        extra_safe_paths,
         iw_selection,
     };
     py.allow_threads(|| run_grd_multi(&opts)).map_err(py_err)
