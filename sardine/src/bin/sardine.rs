@@ -81,6 +81,19 @@ enum Commands {
     /// written.  Output CRS defaults to WGS84 (`--crs wgs84`).
     Insar(InsarArgs),
 
+    /// H/A/Alpha Cloude–Pottier dual-pol decomposition.
+    ///
+    /// Requires a dual-polarisation IW SLC (`VV+VH` or `HH+HV`).  Writes
+    /// three geocoded Float32 GeoTIFFs per scene:
+    ///
+    ///   <output>_H.tif     — Polarimetric entropy H ∈ [0, 1]
+    ///   <output>_A.tif     — Polarimetric anisotropy A ∈ [0, 1]
+    ///   <output>_alpha.tif — Mean scattering angle α ∈ [0°, 90°]
+    ///
+    /// Provenance (`.polsar.provenance.json`) and STAC (`.polsar.stac.json`)
+    /// sidecars are written alongside the outputs.
+    Polsar(PolsarArgs),
+
     /// Process multiple scenes from a JSON batch file.
     ///
     /// Each scene is processed sequentially.  A failure in one scene is
@@ -1042,6 +1055,153 @@ fn cmd_insar(args: InsarArgs) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// polsar subcommand
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+struct PolsarArgs {
+    /// Path(s) to Sentinel-1 IW SLC `.SAFE` directories (dual-pol required).
+    ///
+    /// For slice-assembled processing, pass multiple paths in ascending
+    /// temporal order: `--safe /path/slice1.SAFE --safe /path/slice2.SAFE`.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    safe: Vec<PathBuf>,
+
+    /// Output path basename.  The pipeline writes three GeoTIFFs:
+    ///   `<output>_H.tif`, `<output>_A.tif`, `<output>_alpha.tif`.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Geoid model for DEM height conversion.
+    ///
+    /// Accepted values: `auto` (download and cache EGM96 on first run),
+    /// `zero` (no correction, ocean scenes only), or a path to an EGM96
+    /// grid file (`.bin` / `.gtx` / `.GRD`).
+    #[arg(long, value_name = "SPEC")]
+    geoid: String,
+
+    /// Directory containing DEM tiles.
+    ///
+    /// **Omit for automatic download (default behaviour).**  When not
+    /// supplied, tiles are fetched and cached under `$SARDINE_DEM_DIR`
+    /// (or `$HOME/.sardine/dem/`).
+    #[arg(long, value_name = "DIR")]
+    dem: Option<PathBuf>,
+
+    /// DEM source for automatic tile download: `srtm1` (default) or `glo30`.
+    #[arg(long, value_name = "SOURCE", default_value = "srtm1")]
+    dem_source: String,
+
+    /// Path to a POEORB `.EOF` orbit file.
+    ///
+    /// **Omit for automatic download (default behaviour).**
+    #[arg(long, value_name = "FILE")]
+    orbit: Option<PathBuf>,
+
+    /// Dual-pol channel pair.  One of: `VV+VH` (default), `HH+HV`,
+    /// `dual`, or `both`.
+    #[arg(long, value_name = "POL", default_value = "VV+VH")]
+    polarization: String,
+
+    /// Range multilook factor (number of range samples averaged before
+    /// terrain correction).  Default 3 is a typical PolSAR look count
+    /// for 10 m S-1 IW data.
+    #[arg(long, value_name = "N", default_value_t = 3_usize)]
+    multilook_range: usize,
+
+    /// Azimuth multilook factor.  Default 1 (no azimuth averaging).
+    #[arg(long, value_name = "N", default_value_t = 1_usize)]
+    multilook_azimuth: usize,
+
+    /// Output CRS.  `wgs84` (default, EPSG:4326), `auto` (UTM zone from
+    /// scene centre), or an explicit code such as `EPSG:32632`.
+    #[arg(long, value_name = "SPEC", default_value = "wgs84")]
+    crs: String,
+
+    /// Output pixel spacing in degrees (geographic CRSs).
+    #[arg(long, value_name = "DEG", default_value_t = 0.0001_f64)]
+    pixel_spacing_deg: f64,
+
+    /// Output pixel spacing in metres (projected CRSs).
+    #[arg(long, value_name = "M", default_value_t = 10.0_f64)]
+    pixel_spacing_m: f64,
+
+    /// Write Cloud-Optimised GeoTIFFs (tiled, with overview pyramid).
+    #[arg(long)]
+    cog: bool,
+
+    /// Number of processing threads.  0 = use all available CPU cores.
+    #[arg(long, value_name = "N", default_value_t = 0_usize)]
+    threads: usize,
+
+    /// Suppress provenance and STAC sidecars.
+    #[arg(long)]
+    no_provenance: bool,
+
+    /// Sub-swaths to process (comma-separated: `IW1`, `IW2`, `IW3`).
+    #[arg(long, value_name = "LIST", default_value = "")]
+    iw: String,
+
+    /// Burst range within each sub-swath (0-based inclusive, `START-END`).
+    #[arg(long, value_name = "START-END")]
+    burst_range: Option<String>,
+
+    /// Resampling kernel: `bilinear` (default), `bicubic`, `lanczos3`.
+    #[arg(long, value_name = "KERNEL", default_value = "bilinear")]
+    resampling: String,
+}
+
+fn cmd_polsar(mut args: PolsarArgs) -> Result<()> {
+    use sardine::pipeline_options::OutputMode;
+
+    let extra_safe_paths = if args.safe.len() > 1 {
+        args.safe.split_off(1)
+    } else {
+        vec![]
+    };
+    let primary_safe = args.safe.into_iter().next()
+        .expect("clap num_args=1.. guarantees at least one --safe path"); // SAFETY-OK: clap enforces at least one element
+
+    let iw_selection = parse_iw_selection(&args.iw, args.burst_range.as_deref())?;
+    let resampling = parse_resampling(&args.resampling)
+        .with_context(|| "--resampling")?;
+    let speckle_order = sardine::run::parse_speckle_order("after")
+        .expect("'after' is always a valid speckle order"); // SAFETY-OK: literal "after" is always valid
+
+    let opts = sardine::run::ProcessOptions {
+        safe: primary_safe,
+        extra_safe_paths,
+        dem: args.dem,
+        dem_source: args.dem_source,
+        output: args.output,
+        orbit: args.orbit,
+        polarization: args.polarization,
+        no_flatten: true,
+        noise_floor_db: 0.0,
+        pixel_spacing_deg: args.pixel_spacing_deg,
+        pixel_spacing_m: args.pixel_spacing_m,
+        crs: args.crs,
+        write_mask: false,
+        write_lia: false,
+        no_provenance: args.no_provenance,
+        cog: args.cog,
+        threads: args.threads,
+        speckle: "none".to_string(),
+        speckle_window: 7,
+        enl: 1.0,
+        frost_damping: 1.0,
+        geoid: args.geoid,
+        multilook_range: args.multilook_range,
+        multilook_azimuth: args.multilook_azimuth,
+        iw_selection,
+        mode: OutputMode::Polsar,
+        speckle_order,
+        resampling,
+    };
+    sardine::run::run_process_multi(&opts)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // batch subcommand
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1278,6 +1438,7 @@ fn main() -> ExitCode {
         Commands::Inspect(args) => cmd_inspect(args),
         Commands::Grd(args) => cmd_grd(args),
         Commands::Insar(args) => cmd_insar(args),
+        Commands::Polsar(args) => cmd_polsar(args),
         Commands::Batch(args) => cmd_batch(args),
     };
     match result {

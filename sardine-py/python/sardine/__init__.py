@@ -40,6 +40,8 @@ from ._sardine import (
     fetch_geoid,
     fetch_orbit,
     grd,
+    insar,
+    polsar,
     process,
 )
 
@@ -50,5 +52,7 @@ __all__ = [
     "fetch_geoid",
     "fetch_orbit",
     "grd",
+    "insar",
+    "polsar",
     "process",
 ]

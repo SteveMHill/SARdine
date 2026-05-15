@@ -32,7 +32,8 @@ use pyo3::prelude::*;
 use sardine::run::
 {
     parse_iw_selection, parse_output_mode, parse_speckle_order,
-    run_grd_multi, run_insar_multi, run_process_multi, GrdOptions, InsarOptions, ProcessOptions, ResamplingKernel,
+    run_grd_multi, run_insar_multi, run_process_multi,
+    GrdOptions, InsarOptions, OutputMode, ProcessOptions, ResamplingKernel, SpeckleOrder,
 };
 
 /// Convert an `anyhow::Error` into a Python `RuntimeError` with the
@@ -83,6 +84,7 @@ fn py_err(e: anyhow::Error) -> PyErr {
     iw = "".to_owned(),
     burst_range = None,
     resampling = "bilinear".to_owned(),
+    cog = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn process(
@@ -114,6 +116,7 @@ fn process(
     iw: String,
     burst_range: Option<String>,
     resampling: String,
+    cog: bool,
 ) -> PyResult<()> {
     let iw_selection = parse_iw_selection(&iw, burst_range.as_deref()).map_err(py_err)?;
     let mode = parse_output_mode(&mode).map_err(py_err)?;
@@ -141,7 +144,7 @@ fn process(
         write_mask,
         write_lia,
         no_provenance,
-        cog: false,
+        cog,
         threads,
         speckle,
         speckle_window,
@@ -186,6 +189,11 @@ fn process(
     iw = "".to_owned(),
     burst_range = None,
     extra_safe_paths = vec![],
+    cog = false,
+    multilook_range = 1_usize,
+    multilook_azimuth = 1_usize,
+    crs = None,
+    output_unit = "linear".to_owned(),
 ))]
 #[allow(clippy::too_many_arguments)]
 fn grd(
@@ -205,8 +213,21 @@ fn grd(
     iw: String,
     burst_range: Option<String>,
     extra_safe_paths: Vec<PathBuf>,
+    cog: bool,
+    multilook_range: usize,
+    multilook_azimuth: usize,
+    crs: Option<String>,
+    output_unit: String,
 ) -> PyResult<()> {
+    use sardine::pipeline_options::OutputUnit;
     let iw_selection = parse_iw_selection(&iw, burst_range.as_deref()).map_err(py_err)?;
+    let output_unit = match output_unit.to_lowercase().as_str() {
+        "linear" => OutputUnit::Linear,
+        "db"     => OutputUnit::Db,
+        other => return Err(PyRuntimeError::new_err(format!(
+            "unknown output_unit '{other}'; valid values: linear, db"
+        ))),
+    };
     let opts = GrdOptions {
         safe,
         output,
@@ -214,7 +235,7 @@ fn grd(
         polarization,
         target_spacing_m,
         no_provenance,
-        cog: false,
+        cog,
         threads,
         speckle,
         speckle_window,
@@ -223,6 +244,10 @@ fn grd(
         noise_floor_db,
         extra_safe_paths,
         iw_selection,
+        multilook_range,
+        multilook_azimuth,
+        crs,
+        output_unit,
     };
     py.allow_threads(|| run_grd_multi(&opts)).map_err(py_err)
 }
@@ -304,6 +329,107 @@ fn insar(
         threads,
     };
     py.allow_threads(|| run_insar_multi(&opts)).map_err(py_err)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PolSAR pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the H/A/Alpha dual-pol PolSAR decomposition pipeline.
+///
+/// Equivalent to `sardine polsar …`.  Required positional arguments:
+///
+/// * ``safe``    — path to the Sentinel-1 IW SLC ``.SAFE`` directory.
+/// * ``output``  — output basename; three files are written:
+///               ``<output>_H.tif``, ``<output>_A.tif``, ``<output>_alpha.tif``.
+/// * ``geoid``   — ``"auto"``, ``"zero"``, or a path to an EGM96 grid file.
+///
+/// All other parameters are keyword-only.  ``dem`` defaults to ``None``
+/// (auto-download via the ``dem-fetch`` feature).  ``polarization`` defaults
+/// to ``"VV+VH"`` (dual-pol; use ``"HH+HV"`` for H/V mode scenes).
+/// ``multilook_range`` defaults to 3 (a typical polsar look count).
+#[pyfunction]
+#[pyo3(signature = (
+    safe,
+    output,
+    geoid,
+    *,
+    dem = None,
+    orbit = None,
+    polarization = "VV+VH".to_owned(),
+    multilook_range = 3_usize,
+    multilook_azimuth = 1_usize,
+    crs = "wgs84".to_owned(),
+    pixel_spacing_deg = 0.0001,
+    pixel_spacing_m = 10.0,
+    cog = false,
+    threads = 0,
+    no_provenance = false,
+    iw = "".to_owned(),
+    burst_range = None,
+    resampling = "bilinear".to_owned(),
+))]
+#[allow(clippy::too_many_arguments)]
+fn polsar(
+    py: Python<'_>,
+    safe: PathBuf,
+    output: PathBuf,
+    geoid: String,
+    dem: Option<PathBuf>,
+    orbit: Option<PathBuf>,
+    polarization: String,
+    multilook_range: usize,
+    multilook_azimuth: usize,
+    crs: String,
+    pixel_spacing_deg: f64,
+    pixel_spacing_m: f64,
+    cog: bool,
+    threads: usize,
+    no_provenance: bool,
+    iw: String,
+    burst_range: Option<String>,
+    resampling: String,
+) -> PyResult<()> {
+    let iw_selection = parse_iw_selection(&iw, burst_range.as_deref()).map_err(py_err)?;
+    let resampling = match resampling.trim().to_ascii_lowercase().as_str() {
+        "bilinear" => ResamplingKernel::Bilinear,
+        "bicubic"  => ResamplingKernel::Bicubic,
+        "lanczos3" => ResamplingKernel::Lanczos3,
+        other => return Err(PyRuntimeError::new_err(format!(
+            "unknown resampling kernel '{other}'; valid values: bilinear, bicubic, lanczos3"
+        ))),
+    };
+    let opts = ProcessOptions {
+        safe,
+        dem,
+        dem_source: "srtm1".to_string(),
+        output,
+        orbit,
+        polarization,
+        no_flatten: true,
+        noise_floor_db: 0.0,
+        pixel_spacing_deg,
+        pixel_spacing_m,
+        crs,
+        write_mask: false,
+        write_lia: false,
+        no_provenance,
+        cog,
+        threads,
+        speckle: "none".to_string(),
+        speckle_window: 7,
+        enl: 1.0,
+        frost_damping: 1.0,
+        geoid,
+        multilook_range,
+        multilook_azimuth,
+        extra_safe_paths: vec![],
+        iw_selection,
+        mode: OutputMode::Polsar,
+        speckle_order: SpeckleOrder::AfterTc,
+        resampling,
+    };
+    py.allow_threads(|| run_process_multi(&opts)).map_err(py_err)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -459,6 +585,7 @@ fn _sardine(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process, m)?)?;
     m.add_function(wrap_pyfunction!(grd, m)?)?;
     m.add_function(wrap_pyfunction!(insar, m)?)?;
+    m.add_function(wrap_pyfunction!(polsar, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_orbit, m)?)?;
     m.add_function(wrap_pyfunction!(download_slc, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_geoid, m)?)?;

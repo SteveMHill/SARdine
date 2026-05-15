@@ -14,10 +14,10 @@
 
 ## What is SARdine?
 
-SARdine reads a Sentinel-1 IW SLC product (`.SAFE` directory) and produces a
-calibrated, terrain-corrected, geocoded backscatter raster (σ⁰ or γ⁰) with no
-external dependencies beyond the Rust toolchain. There is no GDAL dependency;
-TIFF reading and writing are handled in pure Rust.
+SARdine reads a Sentinel-1 IW SLC product (`.SAFE` directory) and produces
+calibrated, terrain-corrected, geocoded output rasters with no external
+dependencies beyond the Rust toolchain. There is no GDAL dependency; TIFF
+reading and writing are handled in pure Rust.
 
 The pipeline implements:
 
@@ -37,14 +37,30 @@ The pipeline implements:
 8. **Speckle filtering** — boxcar, Lee (1981), Frost (1982), Gamma-MAP (Lopes
    1990), Refined Lee (Lopes–Touzi–Nezry 1990); all behind a `SpeckleKernel`
    trait for third-party extensions
-9. **Export** — Float32 GeoTIFF or Cloud-Optimised GeoTIFF (`--cog`),
-   BigTIFF auto-selected for outputs > 4 GiB; EPSG:4326, UTM, or `auto`
-10. **Provenance** — `.provenance.json` and `.stac.json` sidecars next to
+9. **PolSAR decomposition** — Cloude–Pottier H/A/Alpha from the dual-pol
+   covariance matrix C2; geocoded entropy, anisotropy, and mean scattering
+   angle bands (`sardine polsar`)
+10. **InSAR coherence** — per-IW boxcar coherence estimator and wrapped phase
+    for an SLC pair (`sardine insar`)
+11. **Export** — Float32 GeoTIFF or Cloud-Optimised GeoTIFF (`--cog`),
+    BigTIFF auto-selected for outputs > 4 GiB; EPSG:4326, UTM, or `auto`
+12. **Provenance** — `.provenance.json` and `.stac.json` sidecars next to
     every output
 
+**Output modes** (`sardine process --mode <MODE>` or dedicated subcommand):
+
+| Mode | Subcommand | Description |
+|------|-----------|-------------|
+| `rtc` | `process` | Terrain-corrected σ⁰/γ⁰ — default |
+| `nrb` | `process --mode nrb` | RTC + mandatory LIA, quality mask, STAC (NRB profile) |
+| `grd` | `grd` | Ground-range radar geometry (no geocoding) |
+| `polsar` | `polsar` | H/A/Alpha Cloude–Pottier decomposition (dual-pol) |
+| — | `insar` | InSAR coherence + wrapped phase for an SLC pair |
+
 **Python bindings** (PyO3, `sardine` wheel, `sardine-py/`):
-`sardine.process()`, `sardine.grd()`, `sardine.fetch_orbit()`,
-`sardine.download_slc()`, `sardine.fetch_geoid()`, `sardine.features()`.
+`sardine.process()`, `sardine.grd()`, `sardine.insar()`, `sardine.polsar()`,
+`sardine.fetch_orbit()`, `sardine.download_slc()`, `sardine.fetch_geoid()`,
+`sardine.features()`.
 
 ---
 
@@ -60,8 +76,7 @@ The pipeline implements:
 ### Build and test
 
 ```sh
-cd sardine
-cargo test          # 372 unit + 1 guard test must pass
+cargo test -p sardine --lib   # 399 unit tests must pass
 cargo build --release
 ```
 
@@ -100,6 +115,33 @@ Key flags:
 | `--write-mask` | off | Write shadow/layover mask sidecar |
 | `--noise-floor-margin-db` | off | Mask pixels within N dB of NESZ |
 
+### PolSAR decomposition (H/A/Alpha)
+
+```sh
+cargo run --release --features orbit-fetch,dem-fetch,geoid-fetch -- polsar \
+    --safe              /path/to/S1B_IW_SLC__1SDV_....SAFE \
+    --output            output_polsar \
+    --geoid             auto \
+    --polarization      VV+VH \
+    --multilook-range   3 \
+    --crs               auto
+# writes output_polsar_H.tif, output_polsar_A.tif, output_polsar_alpha.tif
+# plus .polsar.provenance.json and .polsar.stac.json sidecars
+```
+
+### InSAR coherence
+
+```sh
+cargo run --release --features orbit-fetch,dem-fetch,geoid-fetch -- insar \
+    --reference  /path/to/S1B_reference.SAFE \
+    --secondary  /path/to/S1B_secondary.SAFE \
+    --output     coherence_out \
+    --geoid      auto \
+    --az-looks   10 \
+    --rg-looks   2
+# writes coherence_out_iw{1,2,3}_coherence.tif + sidecars
+```
+
 Auto-fetch behaviour (requires the corresponding feature flag at compile time):
 
 - **`--features orbit-fetch`** — `--orbit` can be omitted; POEORB fetched from
@@ -117,21 +159,45 @@ Set `RUST_LOG=sardine=info` for a progress log.
 cd sardine-py
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
-maturin develop --release --features slc-fetch
+maturin develop --release --features orbit-fetch,dem-fetch,geoid-fetch,slc-fetch
 ```
 
 ```python
 import sardine
 
-result = sardine.process(
-    safe_path="/path/to/S1B.SAFE",
-    output_path="output.tif",
-    polarization="VV",
+# Terrain-corrected backscatter
+sardine.process(
+    safe="/path/to/S1B.SAFE",
+    dem="/path/to/dem_tiles/",
+    output="sigma0.tif",
     geoid="auto",
     crs="auto",
     cog=True,
 )
-print(result)
+
+# H/A/Alpha PolSAR decomposition (writes _H.tif, _A.tif, _alpha.tif)
+sardine.polsar(
+    safe="/path/to/S1B_IW_SLC__1SDV_....SAFE",
+    output="polsar_out",
+    geoid="auto",
+    polarization="VV+VH",
+    multilook_range=3,
+    crs="auto",
+)
+
+# InSAR coherence
+sardine.insar(
+    reference="/path/to/S1B_ref.SAFE",
+    secondary="/path/to/S1B_sec.SAFE",
+    output="coherence_out",
+    geoid="auto",
+    az_looks=10,
+    rg_looks=2,
+)
+
+# Check which auto-fetch features are compiled in
+print(sardine.features())
+# {'geoid_fetch': True, 'orbit_fetch': True, 'slc_fetch': True}
 ```
 
 ---
@@ -154,8 +220,9 @@ data/               Test data (not committed — see .gitignore)
 - **Prototype only** — outputs have not been independently validated beyond the
   single S1B scene referenced above
 - IW acquisition mode only (EW, StripMap not supported)
-- No coherence or polarimetric decomposition (intensity-only deburst)
-- No batch/multi-scene mosaic driver
+- InSAR phase correctness requires validated flat-earth deramping (coherence
+  is reliable; treat wrapped phase as experimental)
+- No multi-scene mosaic / burst-stitch driver
 
 ---
 
