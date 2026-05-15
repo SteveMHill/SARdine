@@ -186,6 +186,17 @@ pub fn compute_overlap_lines(
         .num_microseconds()
         .unwrap_or(0); // SAFETY-OK: chrono microseconds cannot overflow for inter-burst deltas (≈3 s)
     let dt_s = dt_us as f64 * 1e-6;
+
+    // Guard against a zero or non-finite ATI, which would turn the step_lines
+    // division into infinity or NaN and produce a nonsensical overlap value.
+    if !ati_s.is_finite() || ati_s <= 0.0 {
+        return Err(DeburstError::InvalidOverlap {
+            k: burst_k.burst_index,
+            k1: burst_k1.burst_index,
+            overlap_lines: 0,
+        });
+    }
+
     let step_lines = (dt_s / ati_s).round() as i64;
     let overlap = lines_per_burst as i64 - step_lines;
 

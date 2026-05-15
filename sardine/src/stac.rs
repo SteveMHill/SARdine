@@ -88,25 +88,46 @@ struct StacProperties {
     instruments: Vec<&'static str>,
 
     #[serde(rename = "sar:instrument_mode")]
-    sar_instrument_mode: &'static str,
+    sar_instrument_mode: String,
     #[serde(rename = "sar:frequency_band")]
     sar_frequency_band: &'static str,
+    /// Radar centre frequency in GHz, derived from the annotation `radar_frequency_hz`.
+    #[serde(rename = "sar:center_frequency")]
+    sar_center_frequency: f64,
+    /// SAR look direction; `"right"` for all Sentinel-1 acquisitions.
+    #[serde(rename = "sar:observation_direction")]
+    sar_observation_direction: &'static str,
     /// One or both of `"VV"`, `"VH"`.
     #[serde(rename = "sar:polarizations")]
     sar_polarizations: Vec<String>,
     /// `"RTC"` (terrain-corrected) or `"GRD"` (ground range).
     #[serde(rename = "sar:product_type")]
     sar_product_type: String,
-    /// Range multilook factor; omitted when equal to 1.
-    #[serde(rename = "sar:looks_range", skip_serializing_if = "Option::is_none")]
-    sar_looks_range: Option<usize>,
-    /// Azimuth multilook factor; omitted when equal to 1.
-    #[serde(rename = "sar:looks_azimuth", skip_serializing_if = "Option::is_none")]
-    sar_looks_azimuth: Option<usize>,
+    /// Range multilook factor.
+    #[serde(rename = "sar:looks_range")]
+    sar_looks_range: usize,
+    /// Azimuth multilook factor.
+    #[serde(rename = "sar:looks_azimuth")]
+    sar_looks_azimuth: usize,
+    /// Output pixel spacing in range direction, metres; omitted for TC (use proj:transform).
+    #[serde(rename = "sar:pixel_spacing_range", skip_serializing_if = "Option::is_none")]
+    sar_pixel_spacing_range: Option<f64>,
+    /// Output pixel spacing in azimuth direction, metres; omitted for TC.
+    #[serde(rename = "sar:pixel_spacing_azimuth", skip_serializing_if = "Option::is_none")]
+    sar_pixel_spacing_azimuth: Option<f64>,
 
     /// Output CRS EPSG code (projection extension).
     #[serde(rename = "proj:epsg", skip_serializing_if = "Option::is_none")]
     proj_epsg: Option<u32>,
+
+    /// Orbit pass direction per SAT extension v1.0.0: `"ascending"` or `"descending"`.
+    /// Omitted for InSAR items (no provenance struct available in that path).
+    #[serde(rename = "sat:orbit_state", skip_serializing_if = "Option::is_none")]
+    sat_orbit_state: Option<String>,
+    /// Absolute orbit counter per SAT extension v1.0.0.
+    /// Omitted for InSAR items.
+    #[serde(rename = "sat:absolute_orbit", skip_serializing_if = "Option::is_none")]
+    sat_absolute_orbit: Option<u32>,
 
     /// sardine crate version (e.g. `"0.1.0"`).
     #[serde(rename = "sardine:version")]
@@ -114,6 +135,30 @@ struct StacProperties {
     /// Orbit source: `"poeorb"` or `"annotation"`.
     #[serde(rename = "sardine:orbit_source")]
     sardine_orbit_source: String,
+
+    // ── CARD4L NRB / processing extension fields ──────────────────────────
+
+    /// Processing software identifier (CARD4L NRB §3.5, processing extension).
+    /// Value: `"sardine v{version}"`.
+    #[serde(rename = "processing:software")]
+    processing_software: serde_json::Value,
+    /// Processing level (CARD4L NRB §3.5, processing extension). Always `"L2"`.
+    #[serde(rename = "processing:level")]
+    processing_level: &'static str,
+    /// DEM source identifier, e.g. `"SRTM-1"` or `"GLO-30"` (CARD4L NRB §3.6).
+    #[serde(rename = "sardine:dem_source")]
+    sardine_dem_source: String,
+    /// Geoid model identifier, e.g. `"EGM96"` or `"none"` (CARD4L NRB §3.6).
+    #[serde(rename = "sardine:geoid")]
+    sardine_geoid: String,
+    /// Whether terrain flattening (σ⁰ → γ⁰, Small 2011) was applied (CARD4L NRB §3.3).
+    /// `null` for GRD mode (no terrain correction).
+    #[serde(rename = "sardine:terrain_flattening", skip_serializing_if = "Option::is_none")]
+    sardine_terrain_flattening: Option<bool>,
+    /// Noise floor threshold in dB used for masking sub-noise-floor pixels.
+    /// `0.0` means no noise-floor masking was applied (CARD4L NRB §3.4).
+    #[serde(rename = "sardine:noise_floor_db")]
+    sardine_noise_floor_db: f32,
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -162,18 +207,30 @@ pub fn write_stac_item(prov: &Provenance, path: &Path) -> Result<(), StacError> 
         end_datetime: prov.input.scene_stop_utc.clone(),
         platform,
         instruments: vec!["c-sar"],
-        sar_instrument_mode: "IW",
+        sar_instrument_mode: prov.input.acquisition_mode.to_uppercase(),
         sar_frequency_band: "C",
+        sar_center_frequency: prov.input.radar_frequency_hz / 1e9,
+        sar_observation_direction: "right",
         sar_polarizations: vec![prov.input.polarization.clone()],
         sar_product_type,
-        sar_looks_range: prov.output.range_looks,
-        sar_looks_azimuth: prov.output.azimuth_looks,
+        sar_looks_range: prov.output.range_looks.unwrap_or(1),
+        sar_looks_azimuth: prov.output.azimuth_looks.unwrap_or(1),
+        sar_pixel_spacing_range: prov.output.range_pixel_spacing_m,
+        sar_pixel_spacing_azimuth: prov.output.azimuth_pixel_spacing_m,
         proj_epsg: prov.output.crs_epsg,
+        sat_orbit_state: Some(prov.input.orbit_pass_direction.clone()),
+        sat_absolute_orbit: Some(prov.input.absolute_orbit_number),
         sardine_version: prov.sardine.version.clone(),
         sardine_orbit_source: match prov.orbit.source {
             crate::provenance::OrbitSource::Poeorb => "poeorb".to_owned(),
             crate::provenance::OrbitSource::Annotation => "annotation".to_owned(),
         },
+        processing_software: serde_json::json!({ "sardine": prov.sardine.version.clone() }),
+        processing_level: "L2",
+        sardine_dem_source: infer_dem_source(&prov.dem.directory),
+        sardine_geoid: infer_geoid_name(&prov.geoid.spec),
+        sardine_terrain_flattening: prov.processing.flatten,
+        sardine_noise_floor_db: prov.processing.noise_floor_db,
     };
 
     let mut assets: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -182,10 +239,9 @@ pub fn write_stac_item(prov: &Provenance, path: &Path) -> Result<(), StacError> 
         stac_asset(
             &prov.output.raster_path,
             "image/tiff; application=geotiff",
-            if prov.processing.mode.as_deref() == Some("grd") {
-                "Backscatter (linear σ⁰)"
-            } else {
-                "Backscatter (dB)"
+            match prov.output.units.as_str() {
+                "dB" => "Backscatter (dB)",
+                _ => "Backscatter (linear σ⁰)",
             },
             &["data"],
         ),
@@ -209,6 +265,8 @@ pub fn write_stac_item(prov: &Provenance, path: &Path) -> Result<(), StacError> 
         stac_extensions: vec![
             "https://stac-extensions.github.io/sar/v1.0.0/schema.json",
             "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+            "https://stac-extensions.github.io/processing/v1.2.0/schema.json",
+            "https://stac-extensions.github.io/sat/v1.0.0/schema.json",
         ],
         id: item_id,
         geometry: GeoJsonPolygon {
@@ -262,6 +320,16 @@ pub struct InsarStacInput<'a> {
     pub rows: usize,
     /// `true` when a POEORB file was supplied for the reference scene.
     pub ref_orbit_is_poeorb: bool,
+    /// Acquisition mode of the reference scene (e.g. `"iw"`, `"ew"`).
+    pub acquisition_mode: &'a str,
+    /// DEM source identifier (e.g. `"srtm1"`).
+    pub dem_source: &'a str,
+    /// Geoid model spec (e.g. `"auto"`, `"zero"`, or a file path).
+    pub geoid_spec: &'a str,
+    /// Orbit pass direction of the reference scene (`"ascending"` or `"descending"`).
+    pub orbit_pass_direction: &'a str,
+    /// Absolute orbit number of the reference scene.
+    pub absolute_orbit_number: u32,
     /// Filesystem path of the coherence GeoTIFF (for the `coherence` asset).
     pub coherence_path: &'a str,
     /// Filesystem path of the phase GeoTIFF, if it was written.
@@ -308,13 +376,20 @@ pub fn write_insar_stac_item(input: &InsarStacInput<'_>, path: &Path) -> Result<
         end_datetime: input.ref_stop_utc.to_owned(),
         platform: input.platform.to_owned(),
         instruments: vec!["c-sar"],
-        sar_instrument_mode: "IW",
+        sar_instrument_mode: input.acquisition_mode.to_uppercase(),
         sar_frequency_band: "C",
+        // S-1 C-band centre frequency; InSAR path does not carry radar_frequency_hz.
+        sar_center_frequency: 5.405,
+        sar_observation_direction: "right", // Sentinel-1 is always right-looking
         sar_polarizations: vec![input.polarization.to_owned()],
         sar_product_type: "InSAR".to_owned(),
-        sar_looks_range: Some(input.rg_looks),
-        sar_looks_azimuth: Some(input.az_looks),
+        sar_looks_range: input.rg_looks,
+        sar_looks_azimuth: input.az_looks,
+        sar_pixel_spacing_range: None,
+        sar_pixel_spacing_azimuth: None,
         proj_epsg: Some(input.crs_epsg),
+        sat_orbit_state: Some(input.orbit_pass_direction.to_owned()),
+        sat_absolute_orbit: Some(input.absolute_orbit_number),
         sardine_version: env!("CARGO_PKG_VERSION").to_owned(),
         sardine_orbit_source: if input.ref_orbit_is_poeorb {
             "poeorb"
@@ -322,6 +397,12 @@ pub fn write_insar_stac_item(input: &InsarStacInput<'_>, path: &Path) -> Result<
             "annotation"
         }
         .to_owned(),
+        processing_software: serde_json::json!({ "sardine": env!("CARGO_PKG_VERSION") }),
+        processing_level: "L2",
+        sardine_dem_source: input.dem_source.to_owned(),
+        sardine_geoid: infer_geoid_name(input.geoid_spec),
+        sardine_terrain_flattening: None,
+        sardine_noise_floor_db: 0.0,
     };
 
     let mut assets: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -374,10 +455,61 @@ pub fn write_insar_stac_item(input: &InsarStacInput<'_>, path: &Path) -> Result<
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Infer a human-readable DEM source identifier from the DEM directory path.
+///
+/// Checks the directory path for well-known substrings; falls back to the
+/// directory's base name when none match.
+fn infer_dem_source(dem_dir: &str) -> String {
+    let lower = dem_dir.to_lowercase();
+    if lower.contains("srtm1") || lower.contains("srtm_1") {
+        return "SRTM-1".to_owned();
+    }
+    if lower.contains("srtm3") || lower.contains("srtm_3") {
+        return "SRTM-3".to_owned();
+    }
+    if lower.contains("glo30") || lower.contains("cop30") || lower.contains("copernicus30") {
+        return "GLO-30".to_owned();
+    }
+    if lower.contains("glo90") || lower.contains("cop90") {
+        return "GLO-90".to_owned();
+    }
+    // Fall back to the last path component.
+    std::path::Path::new(dem_dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(dem_dir)
+        .to_owned()
+}
+
+/// Infer a human-readable geoid model name from the `--geoid` spec string.
+///
+/// `"auto"` and paths containing `"egm96"` map to `"EGM96"`.
+/// `"zero"` maps to `"none"` (no geoid correction).
+fn infer_geoid_name(spec: &str) -> String {
+    let lower = spec.to_lowercase();
+    if lower == "auto" || lower.contains("egm96") {
+        return "EGM96".to_owned();
+    }
+    if lower.contains("egm2008") {
+        return "EGM2008".to_owned();
+    }
+    if lower == "zero" {
+        return "none".to_owned();
+    }
+    // Unknown spec — return verbatim so nothing is silently dropped.
+    spec.to_owned()
+}
+
 /// Build a STAC asset JSON object.
 fn stac_asset(href: &str, media_type: &str, title: &str, roles: &[&str]) -> serde_json::Value {
+    // Use the filename only (relative href) so the STAC item is portable:
+    // an absolute path embeds the processing machine's filesystem layout.
+    let relative_href = Path::new(href)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(href);
     serde_json::json!({
-        "href": href,
+        "href": relative_href,
         "type": media_type,
         "title": title,
         "roles": roles,
@@ -448,6 +580,19 @@ fn compute_wgs84_bbox_from_gt(
     let east = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let south = lats.iter().cloned().fold(f64::INFINITY, f64::min);
     let north = lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    // An anti-meridian crossing yields west > east in a simple min/max bbox.
+    // Warn loudly; the caller may need to split or clamp the bbox for
+    // downstream STAC consumers that do not support anti-meridian geometries.
+    if west > east {
+        tracing::warn!(
+            "STAC bbox anti-meridian crossing detected (west={:.4}°, east={:.4}°); \
+             bbox [west, south, east, north] = [{:.4}, {:.4}, {:.4}, {:.4}] may be \
+             invalid for consumers that do not handle anti-meridian splits",
+            west, east, west, south, east, north
+        );
+    }
+
     Ok([west, south, east, north])
 }
 
@@ -474,7 +619,10 @@ mod tests {
                 product_id: "S1B_IW_SLC__1SDV_20190123T053348_20190123T053415_014617_01B3D4_E833".to_owned(),
                 mission: "S1B".to_owned(),
                 acquisition_mode: "IW".to_owned(),
+                orbit_pass_direction: "descending".to_owned(),
+                absolute_orbit_number: 14617,
                 polarization: "VV".to_owned(),
+                radar_frequency_hz: 5_405_000_450.0,
                 scene_start_utc: "2019-01-23T05:33:48Z".to_owned(),
                 scene_stop_utc: "2019-01-23T05:34:15Z".to_owned(),
                 scene_bbox_deg: BoundingBoxJson {
@@ -518,6 +666,7 @@ mod tests {
                 azimuth_pixel_spacing_m: None,
                 range_looks: Some(4),
                 azimuth_looks: None,
+                gcps_count: None,
                 units: "dB".to_owned(),
                 nodata: "NaN".to_owned(),
             },
@@ -674,6 +823,11 @@ mod tests {
             cols: 100,
             rows: 50,
             ref_orbit_is_poeorb: true,
+            acquisition_mode: "iw",
+            dem_source: "srtm1",
+            geoid_spec: "auto",
+            orbit_pass_direction: "descending",
+            absolute_orbit_number: 14617,
             coherence_path: "out_iw1_coh.tif",
             phase_path: None,
         }

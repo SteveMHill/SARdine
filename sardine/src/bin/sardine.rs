@@ -828,6 +828,33 @@ struct GrdArgs {
     #[arg(long, value_name = "DB", default_value_t = 0.0_f32)]
     noise_floor_db: f32,
 
+    /// Range multilook factor: average N consecutive range samples before
+    /// ground-range projection.  1 = single-look (default, preserves full
+    /// resolution).  5 matches the ESA GRDH 5×1 look count.
+    #[arg(long, value_name = "N", default_value_t = 1_usize)]
+    multilook_range: usize,
+
+    /// Azimuth multilook factor: average N consecutive azimuth lines before
+    /// ground-range projection.  1 = single-look (default).
+    #[arg(long, value_name = "N", default_value_t = 1_usize)]
+    multilook_azimuth: usize,
+
+    /// Output coordinate reference system.  When set, the GCP-tagged radar-geometry
+    /// TIFF is geocoded via `gdalwarp -tps` and replaced in-place by the geocoded
+    /// result in the requested CRS.  Accepts the same spec strings as the `process`
+    /// command: `"EPSG:NNNN"`, `"UTM"` (auto-UTM), `"laea"`, `"webmercator"`.
+    /// Requires GDAL (`gdalwarp`) in PATH.  Example: `--crs EPSG:32632`.
+    #[arg(long, value_name = "CRS")]
+    crs: Option<String>,
+
+    /// Output pixel unit.
+    ///
+    /// - `linear` (default): write raw σ⁰ power values (dimensionless Float32).
+    /// - `db`: convert to 10 × log₁₀(σ⁰) before writing; pixels below the
+    ///   noise floor (see `--noise-floor-db`) become NaN.
+    #[arg(long, value_name = "UNIT", default_value = "linear")]
+    output_unit: String,
+
     /// Sub-swaths to process (comma-separated).  Accepted values: `IW1`, `IW2`, `IW3`.
     /// Default: all three.  Example: `--iw IW2` or `--iw IW1,IW2`.
     #[arg(long, value_name = "LIST", default_value = "")]
@@ -842,6 +869,7 @@ struct GrdArgs {
 
 impl GrdArgs {
     fn into_options(mut self) -> Result<GrdOptions> {
+        use sardine::pipeline_options::OutputUnit;
         let extra_safe_paths = if self.safe.len() > 1 {
             self.safe.split_off(1)
         } else {
@@ -850,6 +878,13 @@ impl GrdArgs {
         let primary_safe = self.safe.into_iter().next()
             .expect("clap num_args=1.. guarantees at least one --safe path"); // SAFETY-OK: clap enforces num_args=1..
         let iw_selection = parse_iw_selection(&self.iw, self.burst_range.as_deref())?;
+        let output_unit = match self.output_unit.to_lowercase().as_str() {
+            "linear" => OutputUnit::Linear,
+            "db" => OutputUnit::Db,
+            other => anyhow::bail!(
+                "unknown --output-unit '{}'; accepted values: linear, db", other
+            ),
+        };
         Ok(GrdOptions {
             safe: primary_safe,
             extra_safe_paths,
@@ -865,7 +900,11 @@ impl GrdArgs {
             enl: self.enl,
             frost_damping: self.frost_damping,
             noise_floor_db: self.noise_floor_db,
+            multilook_range: self.multilook_range,
+            multilook_azimuth: self.multilook_azimuth,
             iw_selection,
+            crs: self.crs,
+            output_unit,
         })
     }
 }

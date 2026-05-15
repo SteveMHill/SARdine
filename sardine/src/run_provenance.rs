@@ -137,6 +137,7 @@ pub(crate) fn build_provenance(
     multilook_azimuth: usize,
     speckle_order: SpeckleOrder,
     output_mode: OutputMode,
+    output_unit: crate::pipeline_options::OutputUnit,
 ) -> Result<crate::provenance::Provenance> {
     use crate::pipeline_options::resolve_speckle;
     use crate::provenance::{
@@ -171,9 +172,8 @@ pub(crate) fn build_provenance(
         crate::provenance::OrbitSource::Poeorb => Some(
             opts.orbit
                 .as_ref()
-                .expect("orbit_source=Poeorb implies opts.orbit is Some")
-                .to_str()
-                .ok_or_else(|| anyhow!("--orbit path contains non-UTF-8 characters"))?
+                .and_then(|p| p.to_str())
+                .unwrap_or("auto") // auto-fetched POEORB — exact cache path not retained
                 .to_owned(),
         ),
         crate::provenance::OrbitSource::Annotation => None,
@@ -188,7 +188,10 @@ pub(crate) fn build_provenance(
             product_id: scene.product_id.clone(),
             mission: scene.mission.to_string(),
             acquisition_mode: scene.acquisition_mode.to_string(),
+            orbit_pass_direction: scene.orbit_pass_direction.clone(),
+            absolute_orbit_number: scene.absolute_orbit_number,
             polarization: pol.to_string(),
+            radar_frequency_hz: scene.radar_frequency_hz,
             scene_start_utc: scene.start_time.to_rfc3339(),
             scene_stop_utc: scene.stop_time.to_rfc3339(),
             scene_bbox_deg: BoundingBoxJson {
@@ -251,11 +254,24 @@ pub(crate) fn build_provenance(
             rows: geocoded.rows,
             geotransform: Some(geocoded.geotransform),
             crs_epsg: Some(geocoded.crs.epsg()),
-            range_pixel_spacing_m: None,
-            azimuth_pixel_spacing_m: None,
+            range_pixel_spacing_m: if geocoded.crs.is_metric() {
+                // For metric CRS (UTM etc.) the geotransform is in metres.
+                Some(geocoded.geotransform[1])
+            } else {
+                None // WGS84: spacing in degrees; not meaningful as "metres"
+            },
+            azimuth_pixel_spacing_m: if geocoded.crs.is_metric() {
+                Some(-geocoded.geotransform[5]) // geotransform[5] is negative (north-up)
+            } else {
+                None
+            },
             range_looks: if multilook_range > 1 { Some(multilook_range) } else { None },
             azimuth_looks: if multilook_azimuth > 1 { Some(multilook_azimuth) } else { None },
-            units: "dB".to_owned(),
+            gcps_count: None,
+            units: match output_unit {
+                crate::pipeline_options::OutputUnit::Db => "dB".to_owned(),
+                crate::pipeline_options::OutputUnit::Linear => "linear".to_owned(),
+            },
             nodata: "NaN".to_owned(),
         },
         stats: StatsInfo {
@@ -298,6 +314,7 @@ pub(crate) fn build_grd_provenance(
     enl: f32,
     frost_damping: f32,
     threads: usize,
+    output_unit: crate::pipeline_options::OutputUnit,
 ) -> Result<crate::provenance::Provenance> {
     use crate::pipeline_options::resolve_speckle;
     use crate::provenance::{
@@ -328,7 +345,10 @@ pub(crate) fn build_grd_provenance(
             product_id: scene.product_id.clone(),
             mission: scene.mission.to_string(),
             acquisition_mode: scene.acquisition_mode.to_string(),
+            orbit_pass_direction: scene.orbit_pass_direction.clone(),
+            absolute_orbit_number: scene.absolute_orbit_number,
             polarization: pol.to_string(),
+            radar_frequency_hz: scene.radar_frequency_hz,
             scene_start_utc: scene.start_time.to_rfc3339(),
             scene_stop_utc: scene.stop_time.to_rfc3339(),
             scene_bbox_deg: BoundingBoxJson {
@@ -378,7 +398,11 @@ pub(crate) fn build_grd_provenance(
             azimuth_pixel_spacing_m: Some(grd.azimuth_pixel_spacing_m),
             range_looks: Some(grd.range_looks),
             azimuth_looks: Some(grd.azimuth_looks),
-            units: "linear".to_owned(),
+            gcps_count: if grd.gcps.is_empty() { None } else { Some(grd.gcps.len()) },
+            units: match output_unit {
+                crate::pipeline_options::OutputUnit::Db => "dB".to_owned(),
+                crate::pipeline_options::OutputUnit::Linear => "linear".to_owned(),
+            },
             nodata: "NaN".to_owned(),
         },
         stats: StatsInfo {

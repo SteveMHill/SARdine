@@ -38,7 +38,7 @@ use thiserror::Error;
 /// Increment when adding a required field, removing a field, or changing
 /// the meaning of an existing field.  Adding a new optional field does
 /// not require a version bump.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Errors writing a provenance sidecar.
 #[derive(Debug, Error)]
@@ -155,8 +155,15 @@ pub struct InputInfo {
     pub mission: String,
     /// Acquisition mode (e.g. `"IW"`).
     pub acquisition_mode: String,
+    /// Orbit pass direction: `"ascending"` or `"descending"`.
+    pub orbit_pass_direction: String,
+    /// Absolute orbit counter from the annotation `<adsHeader>`.
+    pub absolute_orbit_number: u32,
     /// Polarization channel processed (e.g. `"VV"`).
     pub polarization: String,
+    /// Radar centre frequency in Hz, from the annotation XML.
+    /// For Sentinel-1 C-band this is 5_405_000_450 Hz (5.405 GHz).
+    pub radar_frequency_hz: f64,
     /// Scene first-line UTC time (RFC 3339).
     pub scene_start_utc: String,
     /// Scene last-line UTC time (RFC 3339).
@@ -305,6 +312,10 @@ pub struct OutputInfo {
     /// populated for `mode=grd`.  `null` for `mode=tc`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azimuth_looks: Option<usize>,
+    /// Number of ground control points embedded in the output TIFF via
+    /// ModelTiepointTag, populated for `mode=grd`.  `null` for `mode=tc`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gcps_count: Option<usize>,
     /// Units of the main output raster (`"dB"` for `mode=tc`,
     /// `"linear"` for `mode=grd`).
     pub units: String,
@@ -404,7 +415,10 @@ mod tests {
                 product_id: "X".to_owned(),
                 mission: "S1B".to_owned(),
                 acquisition_mode: "IW".to_owned(),
+                orbit_pass_direction: "descending".to_owned(),
+                absolute_orbit_number: 14617,
                 polarization: "VV".to_owned(),
+                radar_frequency_hz: 5_405_000_450.0,
                 scene_start_utc: "2019-01-23T05:33:48Z".to_owned(),
                 scene_stop_utc: "2019-01-23T05:34:15Z".to_owned(),
                 scene_bbox_deg: BoundingBoxJson {
@@ -454,6 +468,7 @@ mod tests {
                 azimuth_pixel_spacing_m: None,
                 range_looks: None,
                 azimuth_looks: None,
+                gcps_count: None,
                 units: "dB".to_owned(),
                 nodata: "NaN".to_owned(),
             },
@@ -636,6 +651,7 @@ mod tests {
             azimuth_pixel_spacing_m: Some(13.95),
             range_looks: Some(1),
             azimuth_looks: Some(1),
+            gcps_count: None,
             units: "linear".to_owned(),
             nodata: "NaN".to_owned(),
         };

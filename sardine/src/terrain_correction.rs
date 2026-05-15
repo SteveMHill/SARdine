@@ -768,6 +768,9 @@ impl RadarGeometry {
 ///
 /// Returns NaN if any of the four corner values is NaN.
 fn bilinear_sample_slice(data: &[f32], n_lines: usize, n_samples: usize, line: f64, sample: f64) -> f32 {
+    if !line.is_finite() || !sample.is_finite() {
+        return f32::NAN;
+    }
     let max_line = n_lines.saturating_sub(1);
     let max_sample = n_samples.saturating_sub(1);
 
@@ -846,6 +849,9 @@ fn bicubic_sample_slice(
     line: f64,
     sample: f64,
 ) -> f32 {
+    if !line.is_finite() || !sample.is_finite() {
+        return f32::NAN;
+    }
     let max_l = (n_lines as isize) - 1;
     let max_s = (n_samples as isize) - 1;
 
@@ -962,6 +968,9 @@ fn lanczos_sample_slice(
     line: f64,
     sample: f64,
 ) -> f32 {
+    if !line.is_finite() || !sample.is_finite() {
+        return f32::NAN;
+    }
     let max_l = (n_lines as isize) - 1;
     let max_s = (n_samples as isize) - 1;
     let l_floor = line.floor() as isize;
@@ -1364,7 +1373,7 @@ pub fn terrain_correction(
                 "SARDINE_TC_ROW_CHUNK={s:?} is not a non-negative integer: {e}"
             ))
         })?,
-        Err(std::env::VarError::NotPresent) => 64,
+        Err(std::env::VarError::NotPresent) => 256,
         Err(e) => {
             return Err(TerrainCorrectionError::Config(format!(
                 "reading SARDINE_TC_ROW_CHUNK: {e}"
@@ -1373,7 +1382,7 @@ pub fn terrain_correction(
     };
     if row_chunk_size == 0 {
         return Err(TerrainCorrectionError::Config(
-            "SARDINE_TC_ROW_CHUNK must be >= 1 (default 64)".into(),
+            "SARDINE_TC_ROW_CHUNK must be >= 1 (default 256)".into(),
         ));
     }
 
@@ -2336,6 +2345,7 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
 
         // Exact pixel
@@ -2368,6 +2378,7 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
 
         // Interpolation touching NaN should produce NaN
@@ -2390,6 +2401,7 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
         for (line, sample) in [(0.0, 0.0), (0.7, 1.3), (2.0, 2.0), (1.5, 0.5)] {
             let a = bilinear_sample(&merged, line, sample);
@@ -2823,6 +2835,7 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         }
     }
 

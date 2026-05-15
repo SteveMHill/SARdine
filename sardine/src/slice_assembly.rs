@@ -182,6 +182,9 @@ pub enum SliceAssemblyError {
 
     #[error("assembled scene failed internal validation: {0}")]
     AssembledSceneInvalid(#[from] crate::validate::ValidationErrors),
+
+    #[error("arithmetic overflow: {0}")]
+    ArithmeticOverflow(String),
 }
 
 // ── Output type ─────────────────────────────────────────────────────────────
@@ -480,12 +483,14 @@ fn merge_scenes(scenes: &[SceneMetadata]) -> Result<SceneMetadata, SliceAssembly
 
     let orbit = merge_orbits(scenes);
     let sub_swaths = merge_subswaths_meta(scenes);
-    let bursts = merge_bursts(scenes);
+    let bursts = merge_bursts(scenes)?;
 
     let scene = SceneMetadata {
         product_id,
         mission: ref0.mission,
         acquisition_mode: ref0.acquisition_mode,
+        orbit_pass_direction: ref0.orbit_pass_direction.clone(),
+        absolute_orbit_number: ref0.absolute_orbit_number,
         polarizations,
         start_time,
         stop_time,
@@ -592,7 +597,7 @@ fn merge_subswaths_meta(scenes: &[SceneMetadata]) -> Vec<SubSwathMetadata> {
 /// - `first_line` / `last_line`: logical offset = cumulative azimuth lines from
 ///   earlier slices + local offset within the current slice's TIFF
 /// - `slice_index`: the owning slice (for Phase 2 multi-TIFF dispatch)
-fn merge_bursts(scenes: &[SceneMetadata]) -> Vec<BurstEntry> {
+fn merge_bursts(scenes: &[SceneMetadata]) -> Result<Vec<BurstEntry>, SliceAssemblyError> {
     let subswath_ids: Vec<SubSwathId> = scenes[0].sub_swaths.iter().map(|s| s.id).collect();
     let mut all_bursts: Vec<BurstEntry> = Vec::new();
 
@@ -616,7 +621,11 @@ fn merge_bursts(scenes: &[SceneMetadata]) -> Vec<BurstEntry> {
             for burst in &slice_bursts {
                 // burst.first_line within the slice's TIFF equals
                 // burst.burst_index * lines_per_burst (set by the parser).
-                let local_first = burst.burst_index * sw.lines_per_burst;
+                let local_first = burst.burst_index.checked_mul(sw.lines_per_burst)
+                    .ok_or_else(|| SliceAssemblyError::ArithmeticOverflow(format!(
+                        "burst_index {} × lines_per_burst {} overflows usize",
+                        burst.burst_index, sw.lines_per_burst
+                    )))?;
 
                 all_bursts.push(BurstEntry {
                     subswath_id: sw_id,
@@ -636,13 +645,14 @@ fn merge_bursts(scenes: &[SceneMetadata]) -> Vec<BurstEntry> {
     }
 
     // Sort by (subswath, burst_index): matches the convention in parse/mod.rs.
-    all_bursts.sort_by(|a, b| {
-        a.subswath_id
-            .cmp(&b.subswath_id)
-            .then(a.burst_index.cmp(&b.burst_index))
-    });
-
     all_bursts
+        .sort_by(|a, b| {
+            a.subswath_id
+                .cmp(&b.subswath_id)
+                .then(a.burst_index.cmp(&b.burst_index))
+        });
+
+    Ok(all_bursts)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -725,6 +735,8 @@ mod tests {
             product_id: format!("SYNTHETIC_T{t0_ms}_N{n_bursts}"),
             mission: crate::types::Mission::S1A,
             acquisition_mode: crate::types::AcquisitionMode::IW,
+            orbit_pass_direction: "descending".to_owned(),
+            absolute_orbit_number: 0,
             polarizations: vec![crate::types::Polarization::VV],
             start_time,
             stop_time,

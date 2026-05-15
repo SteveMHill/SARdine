@@ -98,6 +98,11 @@ pub(crate) struct AdsHeaderXml {
 
     #[serde(rename = "stopTime")]
     pub stop_time: String,
+
+    /// Absolute orbit counter, from `<absoluteOrbitNumber>` in `<adsHeader>`.
+    #[serde(rename = "absoluteOrbitNumber")]
+    #[serde(deserialize_with = "de_u32")]
+    pub absolute_orbit_number: u32,
 }
 
 // ── General Annotation ───────────────────────────────────────────────
@@ -121,6 +126,9 @@ pub(crate) struct GeneralAnnotationXml {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProductInformationXml {
+    /// Satellite pass direction: `"Ascending"` or `"Descending"`.
+    pub pass: String,
+
     #[serde(rename = "radarFrequency")]
     #[serde(deserialize_with = "de_f64")]
     pub radar_frequency: f64,

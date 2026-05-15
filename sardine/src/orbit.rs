@@ -82,7 +82,8 @@ pub enum OrbitError {
 const CLIP_MARGIN_S: f64 = 120.0;
 
 /// Minimum number of precise state vectors required after clipping.
-const MIN_PRECISE_VECTORS: usize = 10;
+/// Must exceed LAGRANGE_DEGREE so the Lagrange window is always fully populated.
+const MIN_PRECISE_VECTORS: usize = LAGRANGE_DEGREE + 1;
 
 /// Expected LEO orbital altitude range for Sentinel-1 (meters).
 const MIN_ALTITUDE_M: f64 = 670_000.0;
@@ -117,6 +118,7 @@ pub fn parse_eof_content(content: &str) -> Result<OrbitData, OrbitError> {
     }
 
     let mut state_vectors = Vec::with_capacity(osv_list.len());
+    let mut zero_pos_skipped = 0usize;
     for osv in osv_list {
         let sv = parse_osv(osv)?;
 
@@ -126,10 +128,25 @@ pub fn parse_eof_content(content: &str) -> Result<OrbitData, OrbitError> {
             + sv.position_m[2].powi(2))
         .sqrt();
         if pos_mag == 0.0 {
+            zero_pos_skipped += 1;
+            tracing::warn!(
+                "orbit: skipping state vector at {} with zero position magnitude",
+                sv.time
+            );
             continue;
         }
 
         state_vectors.push(sv);
+    }
+
+    if zero_pos_skipped > 1 {
+        return Err(OrbitError::InsufficientCoverage {
+            detail: format!(
+                "{} state vectors had zero position and were skipped; \
+                 the orbit file may be corrupt",
+                zero_pos_skipped
+            ),
+        });
     }
 
     if state_vectors.is_empty() {

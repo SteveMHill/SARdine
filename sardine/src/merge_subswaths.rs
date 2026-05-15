@@ -78,6 +78,12 @@ pub enum MergeError {
     /// A Sigma0Array is empty (zero samples).
     #[error("subswath {idx} has zero range samples")]
     EmptySwath { idx: usize },
+
+    /// The computed output column count is non-positive (indicates swath ordering
+    /// or timing inconsistency — e.g. subswaths not sorted by ascending slant range
+    /// time, or a subswath with negative range offset).
+    #[error("computed output column count is non-positive ({value}); check subswath ordering and slant range times")]
+    NegativeOutputColumns { value: i64 },
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -159,6 +165,14 @@ pub struct MergedSigma0 {
     /// pixel zero-Doppler Newton solve downstream absorbs this sub-line
     /// offset.
     pub azimuth_start_time: DateTime<Utc>,
+
+    /// Azimuth time interval between consecutive lines, in seconds.
+    ///
+    /// Inherited from the representative subswath
+    /// (`SubSwathMetadata::azimuth_time_interval_s`).  All IW subswaths
+    /// share this value to within ≪ 1 µs.  Used to map geolocation-grid
+    /// azimuth times to output line indices (e.g. for GCP computation).
+    pub azimuth_time_interval_s: f64,
 }
 
 // ─── Main function ────────────────────────────────────────────────────────────
@@ -192,6 +206,7 @@ pub fn merge_single_subswath_owned(
         cal_lut_extrapolation_gap_px: sigma0.cal_lut_extrapolation_gap_px,
         noise_lut_extrapolation_gap_px: sigma0.noise_lut_extrapolation_gap_px,
         azimuth_start_time,
+        azimuth_time_interval_s: swath.azimuth_time_interval_s,
     })
 }
 
@@ -230,6 +245,7 @@ pub fn merge_subswaths(inputs: &[SwathInput<'_>]) -> Result<MergedSigma0, MergeE
             cal_lut_extrapolation_gap_px: inp.sigma0.cal_lut_extrapolation_gap_px,
             noise_lut_extrapolation_gap_px: inp.sigma0.noise_lut_extrapolation_gap_px,
             azimuth_start_time: inp.azimuth_start_time,
+            azimuth_time_interval_s: inp.swath.azimuth_time_interval_s,
         });
     }
 
@@ -292,7 +308,11 @@ pub fn merge_subswaths(inputs: &[SwathInput<'_>]) -> Result<MergedSigma0, MergeE
         .collect();
 
     // Total output column count.
-    let out_cols = *sw_out_ends.last().unwrap() as usize;
+    let out_cols_i64 = *sw_out_ends.last().unwrap();
+    if out_cols_i64 <= 0 {
+        return Err(MergeError::NegativeOutputColumns { value: out_cols_i64 });
+    }
+    let out_cols = out_cols_i64 as usize;
 
     // ── Seam positions (midpoint of overlap between adjacent swaths) ───────────
     //
@@ -446,6 +466,7 @@ pub fn merge_subswaths(inputs: &[SwathInput<'_>]) -> Result<MergedSigma0, MergeE
             .map(|s| s.azimuth_start_time)
             .min()
             .unwrap_or_else(|| inputs[0].azimuth_start_time), // SAFETY-OK: single-swath early return and EmptyInputs check guarantee inputs.len() >= 2 at this point; .min() always returns Some; this branch is unreachable at runtime
+        azimuth_time_interval_s: inputs[0].swath.azimuth_time_interval_s,
     })
 }
 

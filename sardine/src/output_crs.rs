@@ -150,10 +150,8 @@ impl OutputCrs {
             return Err(OutputCrsError::AutoUtmOutsideBand { lat_deg });
         }
         // UTM zone formula: floor((lon + 180) / 6) + 1, clamped to 1..=60.
-        // Wrap longitude into [-180, 180) first.
-        let mut lon = lon_deg;
-        while lon < -180.0 { lon += 360.0; }
-        while lon >= 180.0 { lon -= 360.0; }
+        // Wrap longitude into [-180, 180) using modular arithmetic (no loops).
+        let lon = (lon_deg + 180.0).rem_euclid(360.0) - 180.0;
         let zone_raw = ((lon + 180.0) / 6.0).floor() as i32 + 1;
         let zone = zone_raw.clamp(1, 60) as u8;
         if lat_deg >= 0.0 {
@@ -172,6 +170,13 @@ impl OutputCrs {
             OutputCrs::EtrsLaea => 3035,
             OutputCrs::WebMercator => 3857,
         }
+    }
+
+    /// SRS string suitable for passing to `gdalwarp -t_srs` or `gdal_translate -a_srs`.
+    ///
+    /// Returns the canonical `"EPSG:NNNN"` string for this CRS.
+    pub fn to_srs_string(&self) -> String {
+        format!("EPSG:{}", self.epsg())
     }
 
     /// `true` for projected (metric) CRSs, `false` for geographic.

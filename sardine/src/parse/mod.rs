@@ -134,6 +134,17 @@ fn extract_scene_metadata(
     // Acquisition mode
     let mode = parse_mode(&first.ads_header.mode)?;
 
+    // Absolute orbit number (same across all annotations in the scene)
+    let absolute_orbit_number = first.ads_header.absolute_orbit_number;
+
+    // Orbit pass direction — normalize to lowercase ("ascending"/"descending")
+    let orbit_pass_direction = first
+        .general_annotation
+        .product_information
+        .pass
+        .trim()
+        .to_ascii_lowercase();
+
     // Radar parameters (identical across all annotations in a scene)
     let radar_frequency_hz = first.general_annotation.product_information.radar_frequency;
     let range_sampling_rate_hz = first.general_annotation.product_information.range_sampling_rate;
@@ -183,7 +194,7 @@ fn extract_scene_metadata(
     let mut all_lons = Vec::new();
 
     for (_swath_name, swath_anns) in &by_swath {
-        let ann = swath_anns[0]; // First annotation per swath (all pols share geometry)
+        let ann = swath_anns.first().ok_or(ParseError::MissingField("annotation for swath"))?; // First annotation per swath (all pols share geometry)
         let swath_id = parse_subswath_id(&ann.ads_header.swath)?;
         let img = &ann.image_annotation.image_information;
         let timing = &ann.swath_timing;
@@ -218,7 +229,7 @@ fn extract_scene_metadata(
                 .windows(2)
                 .map(|w| (w[1] - w[0]).num_microseconds().unwrap_or(0) as f64 / 1e6) // SAFETY-OK: chrono microseconds cannot overflow for burst-cycle deltas
                 .collect();
-            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             deltas[deltas.len() / 2] // median
         } else {
             lines_per_burst as f64 * img.azimuth_time_interval
@@ -391,6 +402,8 @@ fn extract_scene_metadata(
         product_id,
         mission,
         acquisition_mode: mode,
+        orbit_pass_direction,
+        absolute_orbit_number,
         polarizations,
         start_time,
         stop_time,

@@ -282,6 +282,213 @@ pub fn write_tiff_no_crs(
     .map_err(ExportError::Io)
 }
 
+// ── GCP TIFF writer ───────────────────────────────────────────────────────────
+
+/// Write a single-band Float32 TIFF with embedded ground control points (GCPs).
+///
+/// The output carries EPSG:4326 geographic reference via the GeoTIFF
+/// ModelTiepointTag (TIFF tag 33922) and GeoKeyDirectoryTag (34735).
+/// Unlike a geocoded (projected) raster, no ModelPixelScaleTag is written:
+/// the absence of that tag signals to GDAL/QGIS that the image is in radar
+/// geometry and the GCPs provide the WGS84 tie-points for warping.
+///
+/// This is the same tagging convention used by ESA GRDH products.
+///
+/// If `gcps` is empty the file is written without any georeference (identical
+/// to [`write_tiff_no_crs`]).
+///
+/// BigTIFF is written automatically when the estimated file size exceeds 4 GiB.
+/// In that case the GCPs are embedded via an external `gdal_translate -gcp`
+/// call (requires GDAL in `PATH`; same dependency as `--cog`).
+pub fn write_tiff_with_gcps(
+    path: &str,
+    data: &[f32],
+    cols: usize,
+    rows: usize,
+    gcps: &[crate::ground_range::Gcp],
+) -> Result<(), ExportError> {
+    // SAFETY-OK: same rationale as write_tiff_no_crs.
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    };
+
+    if gcps.is_empty() {
+        return write_tiff_no_crs(path, data, cols, rows);
+    }
+
+    // BigTIFF path: write no-CRS first, then embed GCPs via gdal_translate.
+    if needs_bigtiff(rows, cols, 4, 0) {
+        write_tiff_no_crs(path, data, cols, rows)?;
+        crate::cog::embed_gcps_via_gdal_translate(
+            std::path::Path::new(path),
+            gcps,
+        )
+        .map_err(|e| ExportError::Io(std::io::Error::other(e.to_string())))?;
+        return Ok(());
+    }
+
+    write_geotiff_with_gcps_inner(path, bytes, cols, rows, gcps)
+        .map_err(ExportError::Io)
+}
+
+// GeoKey directory for EPSG:4326 GCP-style reference (GTModelType=Geographic).
+// 16 u16 values = 32 bytes:
+//   header: [KeyDirVersion=1, KeyRevision=1, MinorRevision=0, NumberOfKeys=3]
+//   key 1:  GTModelTypeGeoKey (1024) = ModelTypeGeographic (2)
+//   key 2:  GTRasterTypeGeoKey (1025) = RasterPixelIsArea (1)
+//   key 3:  GeographicTypeGeoKey (2048) = GCS_WGS_84 (4326)
+// No ModelPixelScaleTag — that is intentionally absent for GCP-only reference.
+const GCP_GEO_KEYS: [u16; 16] = [
+    1, 1, 0, 3,        // header: version=1, rev=1.0, nkeys=3
+    1024, 0, 1, 2,     // GTModelTypeGeoKey = ModelTypeGeographic
+    1025, 0, 1, 1,     // GTRasterTypeGeoKey = RasterPixelIsArea
+    2048, 0, 1, 4326,  // GeographicTypeGeoKey = GCS_WGS_84
+];
+
+/// Classic TIFF writer for GCP-tagged rasters.
+///
+/// File layout (little-endian, strip-based):
+///
+///   offset 0         : 8-byte header (II + 42 + IFD offset)
+///   offset 8         : IFD (2 + 15×12 + 4 = 186 bytes)
+///                      Tags: 13 base + ModelTiepointTag + GeoKeyDir
+///   offset 194       : strip offsets  (n_strips × 4 bytes)
+///   offset 194+S×4   : strip bytecounts (n_strips × 4 bytes)
+///   offset 194+S×8   : XResolution rational (8 bytes)
+///   offset 202+S×8   : YResolution rational (8 bytes)
+///   offset 210+S×8   : ModelTiepointTag data  (N_gcp × 6 × 8 bytes)
+///   offset 210+S×8+T : GeoKeyDirectoryTag data (32 bytes)
+///   offset 210+S×8+T+32 : image data
+///
+/// where S = n_strips, T = N_gcp × 48.
+fn write_geotiff_with_gcps_inner(
+    path: &str,
+    bytes: &[u8],
+    cols: usize,
+    rows: usize,
+    gcps: &[crate::ground_range::Gcp],
+) -> std::io::Result<()> {
+    use std::io::{BufWriter, Write};
+
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("write_geotiff_with_gcps_inner assumes a little-endian host");
+
+    const ROWS_PER_STRIP: u32 = 64;
+    let n_strips = (rows as u32 + ROWS_PER_STRIP - 1) / ROWS_PER_STRIP;
+    let bytes_per_row = cols as u32 * 4; // f32 = 4 bytes
+    let full_strip_bytes = ROWS_PER_STRIP * bytes_per_row;
+    let last_strip_rows = rows as u32 - (n_strips - 1) * ROWS_PER_STRIP;
+    let last_strip_bytes = last_strip_rows * bytes_per_row;
+
+    let n_gcp = gcps.len() as u32;
+    let tiepoint_data_bytes: u32 = n_gcp * 6 * 8; // 6 f64 per GCP × 8 bytes each
+    let geo_keys_bytes: u32 = GCP_GEO_KEYS.len() as u32 * 2; // 16 u16 = 32 bytes
+
+    // n_ifd_entries = 13 base + ModelTiepointTag + GeoKeyDir = 15
+    let n_ifd_entries: u16 = 15;
+    // IFD size: 2 (count) + 15×12 (entries) + 4 (next-IFD) = 186 bytes
+    let ifd_bytes: u32 = 186;
+    // IFD starts at offset 8 (after 8-byte header).
+    let ifd_off: u32 = 8;
+
+    // Strip offset/bytecount arrays start after IFD.
+    let strip_off_arr: u32 = ifd_off + ifd_bytes;            // offset to TileOffsets data
+    let strip_bc_arr: u32 = strip_off_arr + n_strips * 4;    // offset to TileByteCounts data
+
+    // XRes/YRes RATIONAL data blocks (2 × 8 bytes).
+    let xres_off: u32 = strip_bc_arr + n_strips * 4;
+    let yres_off: u32 = xres_off + 8;
+
+    // ModelTiepointTag data.
+    let tiepoint_off: u32 = yres_off + 8;
+
+    // GeoKeyDirectoryTag data.
+    let geo_key_dir_off: u32 = tiepoint_off + tiepoint_data_bytes;
+
+    // Image data starts after all metadata.
+    let image_off: u32 = geo_key_dir_off + geo_keys_bytes;
+
+    let file = std::fs::File::create(path)?;
+    let mut w = BufWriter::with_capacity(1 << 23, file);
+
+    // ── TIFF header ───────────────────────────────────────────────────────────
+    w.write_all(b"II")?;
+    w.write_all(&42u16.to_le_bytes())?;
+    w.write_all(&ifd_off.to_le_bytes())?;
+
+    // ── IFD ───────────────────────────────────────────────────────────────────
+    w.write_all(&n_ifd_entries.to_le_bytes())?;
+
+    // Helper: write one 12-byte classic IFD entry.
+    let mut entry = |tag: u16, typ: u16, count: u32, val: u32| -> std::io::Result<()> {
+        w.write_all(&tag.to_le_bytes())?;
+        w.write_all(&typ.to_le_bytes())?;
+        w.write_all(&count.to_le_bytes())?;
+        w.write_all(&val.to_le_bytes())?;
+        Ok(())
+    };
+
+    entry(256, 4, 1, cols as u32)?;                       // ImageWidth  (LONG)
+    entry(257, 4, 1, rows as u32)?;                       // ImageLength (LONG)
+    entry(258, 3, 1, 32)?;                                 // BitsPerSample = 32
+    entry(259, 3, 1, 1)?;                                  // Compression = None
+    entry(262, 3, 1, 1)?;                                  // PhotometricInterpretation = MinIsBlack
+    entry(273, 4, n_strips, strip_off_arr)?;               // StripOffsets (array)
+    entry(277, 3, 1, 1)?;                                  // SamplesPerPixel = 1
+    entry(278, 4, 1, ROWS_PER_STRIP)?;                     // RowsPerStrip
+    entry(279, 4, n_strips, strip_bc_arr)?;                // StripByteCounts (array)
+    entry(282, 5, 1, xres_off)?;                           // XResolution (RATIONAL)
+    entry(283, 5, 1, yres_off)?;                           // YResolution (RATIONAL)
+    entry(296, 3, 1, 1)?;                                  // ResolutionUnit = No absolute unit
+    entry(339, 3, 1, 3)?;                                  // SampleFormat = IEEE floating point
+    // GeoTIFF: ModelTiepointTag (no PixelScale — GCP model, not affine).
+    entry(33922, 12, n_gcp as u32 * 6, tiepoint_off)?;    // ModelTiepointTag (DOUBLE[N*6])
+    entry(34735, 3, GCP_GEO_KEYS.len() as u32, geo_key_dir_off)?; // GeoKeyDirectoryTag
+    // Next IFD pointer (0 = no more IFDs).
+    w.write_all(&0u32.to_le_bytes())?;
+
+    // ── Strip offset array ────────────────────────────────────────────────────
+    let mut cur_off = image_off;
+    for i in 0..n_strips {
+        w.write_all(&cur_off.to_le_bytes())?;
+        let strip_bytes = if i == n_strips - 1 { last_strip_bytes } else { full_strip_bytes };
+        cur_off += strip_bytes;
+    }
+
+    // ── Strip bytecount array ─────────────────────────────────────────────────
+    for i in 0..n_strips {
+        let strip_bytes = if i == n_strips - 1 { last_strip_bytes } else { full_strip_bytes };
+        w.write_all(&strip_bytes.to_le_bytes())?;
+    }
+
+    // ── XResolution and YResolution (RATIONAL = two LONGs: numerator, denominator) ──
+    w.write_all(&72u32.to_le_bytes())?; w.write_all(&1u32.to_le_bytes())?; // XRes = 72/1
+    w.write_all(&72u32.to_le_bytes())?; w.write_all(&1u32.to_le_bytes())?; // YRes = 72/1
+
+    // ── ModelTiepointTag data: [I, J, K, X, Y, Z] per GCP ───────────────────
+    // I = column (range), J = row (azimuth), K = 0 (elevation, unused).
+    // X = longitude, Y = latitude, Z = 0.
+    for gcp in gcps {
+        w.write_all(&gcp.col.to_le_bytes())?;
+        w.write_all(&gcp.row.to_le_bytes())?;
+        w.write_all(&0f64.to_le_bytes())?;
+        w.write_all(&gcp.lon.to_le_bytes())?;
+        w.write_all(&gcp.lat.to_le_bytes())?;
+        w.write_all(&0f64.to_le_bytes())?;
+    }
+
+    // ── GeoKeyDirectoryTag data ───────────────────────────────────────────────
+    for &k in &GCP_GEO_KEYS {
+        w.write_all(&k.to_le_bytes())?;
+    }
+
+    // ── Image data (strips, top to bottom) ───────────────────────────────────
+    w.write_all(bytes)?;
+
+    w.flush()?;
+    Ok(())
+}
+
 // ── Cloud-Optimised GeoTIFF writer ───────────────────────────────────────────
 
 /// Write a single-band Float32 Cloud-Optimised GeoTIFF (COG) with embedded CRS.
@@ -436,7 +643,7 @@ fn write_cog_raw_inner(
     {
         let (mut ov_data, mut ov_cols, mut ov_rows) =
             downsample_2x(full_f32, cols, rows);
-        while ov_cols > ts || ov_rows > ts {
+        while ov_cols > ts && ov_rows > ts {
             overviews.push((ov_data.clone(), ov_cols, ov_rows));
             let next = downsample_2x(&ov_data, ov_cols, ov_rows);
             (ov_data, ov_cols, ov_rows) = next;
@@ -878,7 +1085,10 @@ fn write_geotiff_raw_inner(
     };
 
     // ── Open file ─────────────────────────────────────────────────────────────
-    let file = std::fs::File::create(path)?;
+    // Write to a temporary path first and atomically rename on success, so
+    // a partial write (crash, disk-full) never leaves a corrupt output file.
+    let tmp_path = format!("{}.tmp", path);
+    let file = std::fs::File::create(&tmp_path)?;
     let mut w = BufWriter::with_capacity(1 << 23, file); // 8 MiB write buffer
 
     // ── TIFF header ───────────────────────────────────────────────────────────
@@ -988,12 +1198,21 @@ fn write_geotiff_raw_inner(
     // endian, enforced by the compile_error above).  For f32 callers, the
     // public `write_geotiff` performs the f32 → bytes reinterpretation; for
     // u8 callers, the bytes are passed straight through.
-    w.write_all(bytes)?;
+    let write_result = w.write_all(bytes).and_then(|_| w.flush());
+    drop(w);
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    // Atomic commit: rename tmp file to final path.
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        // Best-effort cleanup of the tmp file on rename failure.
+        let _ = std::fs::remove_file(&tmp_path);
+        e
+    })?;
 
     Ok(())
 }
-
-/// BigTIFF writer: same contract as [`write_geotiff_raw_inner`] but emits a
 /// BigTIFF (TIFF version 43) with 64-bit file offsets and IFD fields.
 ///
 /// # BigTIFF format differences from classic TIFF
@@ -1097,7 +1316,9 @@ fn write_bigtiff_raw_inner(
         };
 
     // ── Open file ─────────────────────────────────────────────────────────────
-    let file = std::fs::File::create(path)?;
+    // Write to a temporary path first and atomically rename on success.
+    let tmp_path = format!("{}.tmp", path);
+    let file = std::fs::File::create(&tmp_path)?;
     let mut w = BufWriter::with_capacity(1 << 23, file); // 8 MiB write buffer
 
     // ── BigTIFF header (16 bytes) ─────────────────────────────────────────────
@@ -1210,12 +1431,20 @@ fn write_bigtiff_raw_inner(
     }
 
     // ── Image data ────────────────────────────────────────────────────────────
-    w.write_all(bytes)?;
+    let write_result = w.write_all(bytes).and_then(|_| w.flush());
+    drop(w);
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    // Atomic commit: rename tmp file to final path.
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        e
+    })?;
 
     Ok(())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

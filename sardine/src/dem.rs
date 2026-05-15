@@ -694,7 +694,8 @@ impl DemMosaic {
     pub fn elevation_at(&self, lat_deg: f64, lon_deg: f64) -> Result<f32, DemError> {
         // Normalise longitude to [−180, 180) so that anti-meridian wrapped
         // bounding boxes (max_lon_deg > 180) resolve to standard tile coords.
-        let lon_norm = if lon_deg >= 180.0 { lon_deg - 360.0 } else { lon_deg };
+        // Use rem_euclid to also handle values < −180.
+        let lon_norm = ((lon_deg + 180.0).rem_euclid(360.0)) - 180.0;
 
         // Warm path: try the last tile that satisfied this worker.
         // `tiles[i]` indexing is provably in-bounds because `index` is
@@ -728,7 +729,7 @@ impl DemMosaic {
     /// use; quadratic in the number of tiles per pixel.
     #[doc(hidden)]
     pub fn elevation_at_linear(&self, lat_deg: f64, lon_deg: f64) -> Result<f32, DemError> {
-        let lon_norm = if lon_deg >= 180.0 { lon_deg - 360.0 } else { lon_deg };
+        let lon_norm = ((lon_deg + 180.0).rem_euclid(360.0)) - 180.0;
         for tile in &self.tiles {
             if let Some(h) = tile.elevation_at(lat_deg, lon_norm) {
                 return Ok(h);

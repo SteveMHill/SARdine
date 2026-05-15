@@ -477,6 +477,18 @@ pub fn apply_calibration(
         noise.azimuth_vectors.len()
     );
     let az_noise_available = !noise.azimuth_vectors.is_empty();
+    if !az_noise_available {
+        // Azimuth noise is present in all IPF ≥ 2.9 products (all S-1A/B from ~2017 onwards).
+        // Its absence likely means an older product or a parsing gap — log so the user can
+        // verify.  Calibration continues using N_azimuth = 1.0 (range-only noise model).
+        tracing::warn!(
+            "subswath {:?} pol {:?}: azimuth noise LUT absent — \
+             falling back to range-only noise model (N_az = 1.0). \
+             Expected for IPF < 2.9 products; unexpected for modern S-1A/B.",
+            cal.subswath_id,
+            cal.polarization,
+        );
+    }
     let az_lines: Vec<i64>;
     let az_values: &[f32];
     if az_noise_available {
@@ -509,55 +521,67 @@ pub fn apply_calibration(
 
     // ── Main loop (parallel across lines) ─────────────────────────────────────
     //
-    // Each Rayon task owns one output line.  Read-only inputs (`deburst.data`,
-    // LUT refs) are shared across threads; each task allocates its own scratch
-    // buffers (k_row, nr_row, power_row) so there is no contention.
-    // The closure is `Send` because all captured refs point to `Sync` data
-    // and the mutable output chunks are disjoint.
+    // Scratch buffers (k_row, nr_row, power_row) are kept in thread-local
+    // storage so each Rayon worker thread initialises them once and reuses
+    // them for every row it processes.  This eliminates ~3 × out_cols × 4 bytes
+    // of malloc/free per row — on an 80-core machine processing 3 IWs
+    // simultaneously that is ~3.2 GB of allocator traffic that would otherwise
+    // hammer the system allocator's arena locks.
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<[Vec<f32>; 3]> = RefCell::new(
+            [Vec::new(), Vec::new(), Vec::new()]
+        );
+    }
+
     out.par_chunks_mut(out_cols)
         .zip(nesz_out.par_chunks_mut(out_cols))
         .enumerate()
         .for_each(|(out_line, (out_row, nesz_row))| {
             let tiff_line = (tiff_line_origin + out_line) as i64;
 
-            // Per-task scratch (heap-allocated once per Rayon task; the
-            // allocator reuses freed blocks across tasks on the same thread).
-            let mut k_row = vec![0.0f32; out_cols];
-            let mut nr_row = vec![0.0f32; out_cols];
-            let mut power_row = vec![0.0f32; out_cols];
+            SCRATCH.with(|cell| {
+                let mut bufs = cell.borrow_mut();
+                let [k_row, nr_row, power_row] = &mut *bufs;
 
-            // Interpolated calibration K values for this line.
-            bilinear_row_into(
-                &cal_lines, &cal_pixels, &cal_values,
-                tiff_line, col_offset, &mut k_row,
-            );
+                // Resize once on first use by this thread; no-op thereafter.
+                k_row.resize(out_cols, 0.0f32);
+                nr_row.resize(out_cols, 0.0f32);
+                power_row.resize(out_cols, 0.0f32);
 
-            // Interpolated range noise for this line.
-            bilinear_row_into(
-                &nr_lines, &nr_pixels, &nr_values,
-                tiff_line, col_offset, &mut nr_row,
-            );
+                // Interpolated calibration K values for this line.
+                bilinear_row_into(
+                    &cal_lines, &cal_pixels, &cal_values,
+                    tiff_line, col_offset, k_row,
+                );
 
-            // Azimuth noise factor for this line (scalar; defaults to 1.0).
-            let az_factor = if az_noise_available && !az_lines.is_empty() {
-                let (lo, hi) = bracket_azimuth(&az_lines, tiff_line);
-                interp_azimuth(
-                    az_lines[lo],
-                    az_lines[hi],
-                    az_values[lo],
-                    az_values[hi],
-                    tiff_line,
-                )
-            } else {
-                1.0
-            };
+                // Interpolated range noise for this line.
+                bilinear_row_into(
+                    &nr_lines, &nr_pixels, &nr_values,
+                    tiff_line, col_offset, nr_row,
+                );
 
-            // Pass 1: i16 DN → f32 power  (enables i16→i32 widening SIMD).
-            let in_row = &deburst.data[out_line * out_cols..(out_line + 1) * out_cols];
-            dn_to_power_row(in_row, &mut power_row);
+                // Azimuth noise factor for this line (scalar; defaults to 1.0).
+                let az_factor = if az_noise_available && !az_lines.is_empty() {
+                    let (lo, hi) = bracket_azimuth(&az_lines, tiff_line);
+                    interp_azimuth(
+                        az_lines[lo],
+                        az_lines[hi],
+                        az_values[lo],
+                        az_values[hi],
+                        tiff_line,
+                    )
+                } else {
+                    1.0
+                };
 
-            // Pass 2: branchless σ⁰ and NESZ  (pure f32, no data-dependent branches).
-            apply_cal_row(&power_row, &nr_row, &k_row, az_factor, out_row, nesz_row);
+                // Pass 1: i16 DN → f32 power  (enables i16→i32 widening SIMD).
+                let in_row = &deburst.data[out_line * out_cols..(out_line + 1) * out_cols];
+                dn_to_power_row(in_row, power_row);
+
+                // Pass 2: branchless σ⁰ and NESZ  (pure f32, no data-dependent branches).
+                apply_cal_row(power_row, nr_row, k_row, az_factor, out_row, nesz_row);
+            });
         });
 
     Ok(Sigma0Array {

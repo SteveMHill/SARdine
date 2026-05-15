@@ -7,6 +7,21 @@ use chrono::{DateTime, Utc};
 
 use crate::types::*;
 
+// ─── Constants ───────────────────────────────────────────────────────
+
+/// Tolerance for burst azimuth time vs scene acquisition window (seconds).
+/// Allows for timing quantization at scene edges.
+const BURST_TIMING_TOLERANCE_S: i64 = 1;
+
+/// Plausible PRF range for Sentinel-1 IW/EW/SM modes (Hz).
+const MIN_PRF_HZ: f64 = 100.0;
+const MAX_PRF_HZ: f64 = 5_000.0;
+
+/// Plausible slant-range pixel spacing for Sentinel-1 (metres).
+/// IW SLC is ~2.3 m; GRD 10 m; EW SLC ~3.8 m.
+const MIN_RANGE_PIXEL_SPACING_M: f64 = 0.5;
+const MAX_RANGE_PIXEL_SPACING_M: f64 = 100.0;
+
 // ─── Error Types ─────────────────────────────────────────────────────
 
 /// Individual validation violation.
@@ -178,6 +193,26 @@ pub fn check(m: &SceneMetadata) -> Vec<ValidationError> {
         }
     }
 
+    // Burst index continuity: within each subswath, burst_index values must be
+    // strictly sequential starting from 0 (0, 1, 2, ..., N-1).
+    for sw in &m.sub_swaths {
+        let mut sw_bursts: Vec<_> = m.bursts.iter().filter(|b| b.subswath_id == sw.id).collect();
+        sw_bursts.sort_by_key(|b| b.burst_index);
+        for (i, burst) in sw_bursts.iter().enumerate() {
+            if burst.burst_index != i {
+                errors.push(ValidationError::InvalidBurst {
+                    subswath: sw.id,
+                    index: burst.burst_index,
+                    detail: format!(
+                        "burst_index {} at position {} breaks sequential continuity (expected {})",
+                        burst.burst_index, i, i
+                    ),
+                });
+                break; // one violation per subswath is enough
+            }
+        }
+    }
+
     // Orbit
     check_orbit(&m.orbit, &mut errors);
 
@@ -294,6 +329,54 @@ fn check_subswath(
     check_positive_finite(sw.azimuth_time_interval_s, "azimuth_time_interval_s", sw.id, errors);
     check_positive_finite(sw.prf_hz, "prf_hz", sw.id, errors);
     check_positive_finite(sw.burst_cycle_time_s, "burst_cycle_time_s", sw.id, errors);
+
+    // Plausible range checks for parameters with known physical bounds.
+    if sw.range_pixel_spacing_m.is_finite()
+        && sw.range_pixel_spacing_m > 0.0
+        && (sw.range_pixel_spacing_m < MIN_RANGE_PIXEL_SPACING_M
+            || sw.range_pixel_spacing_m > MAX_RANGE_PIXEL_SPACING_M)
+    {
+        errors.push(ValidationError::InvalidSubSwath {
+            id: sw.id,
+            detail: format!(
+                "range_pixel_spacing_m {:.4} is outside plausible range [{}, {}]",
+                sw.range_pixel_spacing_m, MIN_RANGE_PIXEL_SPACING_M, MAX_RANGE_PIXEL_SPACING_M
+            ),
+        });
+    }
+    if sw.prf_hz.is_finite()
+        && sw.prf_hz > 0.0
+        && (sw.prf_hz < MIN_PRF_HZ || sw.prf_hz > MAX_PRF_HZ)
+    {
+        errors.push(ValidationError::InvalidSubSwath {
+            id: sw.id,
+            detail: format!(
+                "prf_hz {:.2} is outside plausible range [{}, {}]",
+                sw.prf_hz, MIN_PRF_HZ, MAX_PRF_HZ
+            ),
+        });
+    }
+
+    // TOPS modes (IW/EW) require Doppler centroid and FM rate estimates for
+    // coherent InSAR and TOPS deramping.  NRB/RTC processing does not need
+    // them, so this is a warning rather than a hard error: the InSAR entry
+    // point checks for them explicitly and returns an error when absent.
+    if mode.is_tops() {
+        if sw.dc_estimates.is_empty() {
+            tracing::warn!(
+                "subswath {} has no dc_estimates (dopplerCentroid block absent from annotation); \
+                 InSAR processing will fail",
+                sw.id
+            );
+        }
+        if sw.fm_rates.is_empty() {
+            tracing::warn!(
+                "subswath {} has no fm_rates (azimuthFmRateList block absent from annotation); \
+                 InSAR processing will fail",
+                sw.id
+            );
+        }
+    }
 }
 
 fn check_positive_finite(
@@ -312,8 +395,8 @@ fn check_positive_finite(
 
 fn check_burst(burst: &BurstEntry, scene: &SceneMetadata, errors: &mut Vec<ValidationError>) {
     // Burst azimuth time must be within the scene acquisition window.
-    // A small tolerance (1 s) allows for timing quantization at scene edges.
-    let tolerance = chrono::Duration::seconds(1);
+    // A small tolerance allows for timing quantization at scene edges.
+    let tolerance = chrono::Duration::seconds(BURST_TIMING_TOLERANCE_S);
     if burst.azimuth_time_utc < scene.start_time - tolerance
         || burst.azimuth_time_utc > scene.stop_time + tolerance
     {
@@ -472,6 +555,8 @@ mod tests {
                 "S1A_IW_SLC__1SDV_20201005T170824_20201005T170851_034664_04098A_1E66".into(),
             mission: Mission::S1A,
             acquisition_mode: AcquisitionMode::IW,
+            orbit_pass_direction: "ascending".to_owned(),
+            absolute_orbit_number: 34664,
             polarizations: vec![Polarization::VV, Polarization::VH],
             start_time: Utc.with_ymd_and_hms(2020, 10, 5, 17, 8, 24).unwrap(),
             stop_time: Utc.with_ymd_and_hms(2020, 10, 5, 17, 8, 51).unwrap(),

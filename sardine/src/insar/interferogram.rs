@@ -205,6 +205,8 @@ pub fn form_interferogram(
     // SAFETY-OK: capacity == n; every element written by the parallel loop before the Vec is read
     unsafe { flat_earth_phase.set_len(n) };
 
+    let flat_earth_fallback_count = std::sync::atomic::AtomicUsize::new(0);
+
     flat_earth_phase
         .par_chunks_mut(samples)
         .enumerate()
@@ -216,6 +218,7 @@ pub fn form_interferogram(
             let (sv_sec, _) = interpolate_orbit_and_accel(sec_orbit, t_az)
                 .map_err(InsarError::Orbit)?;
 
+            let mut row_fallbacks = 0usize;
             for (ci, phi) in row.iter_mut().enumerate() {
                 let tau = ref_tau0 + (ci as f64 + ref_col_offset) * ref_delta_tau;
                 let r_ref = tau * SPEED_OF_LIGHT_M_S / 2.0;
@@ -232,6 +235,7 @@ pub fn form_interferogram(
                         // This can happen for pixels at the far image edge; coherence
                         // is unaffected (phi_flat = 0 ⟹ no phase rotation).
                         *phi = 0.0;
+                        row_fallbacks += 1;
                         continue;
                     }
                 };
@@ -244,8 +248,28 @@ pub fn form_interferogram(
 
                 *phi = (k * 2.0 * (r_ref - r_sec)) as f32;
             }
+            if row_fallbacks > 0 {
+                flat_earth_fallback_count.fetch_add(row_fallbacks, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(())
         })?;
+
+    let total_fallbacks = flat_earth_fallback_count.load(std::sync::atomic::Ordering::Relaxed);
+    if total_fallbacks > 0 {
+        let fallback_pct = total_fallbacks as f64 / n as f64 * 100.0;
+        if fallback_pct > 1.0 {
+            tracing::warn!(
+                "flat-earth phase: forward geocoding failed for {} / {} pixels ({:.1}%); \
+                 these pixels have phi_flat=0 which may degrade interferogram quality",
+                total_fallbacks, n, fallback_pct
+            );
+        } else {
+            tracing::debug!(
+                "flat-earth phase: {} pixels used phi_flat=0 fallback ({:.2}%)",
+                total_fallbacks, fallback_pct
+            );
+        }
+    }
 
     // ── Step 2: apply flat-earth removal to secondary, form cross-product ─
     //

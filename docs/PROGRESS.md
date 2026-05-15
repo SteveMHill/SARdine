@@ -1,12 +1,12 @@
 # SARdine Rebuild Progress
 
-*Last updated: April 26, 2026*
+*Last updated: May 15, 2026*
 
 ## Current state in one sentence
 
 End-to-end pipeline is complete and empirically validated against ASF RTC10
-GAMMA at +0.016 dB median linear bias (S1B, after 10×10 multilook). **362
-unit tests + 1 guard integration test** pass. The pipeline reads a full
+GAMMA at +0.016 dB median linear bias (S1B, after 10×10 multilook). **388
+unit tests** pass. The pipeline reads a full
 S1A/S1B IW SLC product, applies a precise POEORB orbit, debursts,
 calibrates (σ⁰ + per-pixel NESZ), merges all three IW subswaths, geocodes
 via backward Range-Doppler into a selectable output CRS (EPSG:4326 or UTM
@@ -58,7 +58,7 @@ See [HANDOVER.md §3](HANDOVER.md) for the full quick-start and last verified ru
 
 ## `sardine` crate — `sardine/`
 
-Rust crate. **362 unit tests + 1 guard integration test**, no GDAL dependency.
+Rust crate. **388 unit tests**, no GDAL dependency.
 
 **Cargo.toml deps:** `chrono 0.4`, `quick-xml 0.36`, `serde 1`, `thiserror 1`,
 `proj4rs 0.1`, `rayon 1`, `tempfile 3` (dev). Optional: `reqwest`, `zip`,
@@ -166,6 +166,17 @@ No Rust code change is required for this issue.
 4. **BoundingBox anti-meridian** — documented limitation
 5. **Missing burst-count cross-validation** — added check that burst entries match `SubSwathMetadata.burst_count`
 6. **Missing burst monotonicity** — added per-subswath time-ordering check
+7. *(Audit round 1, 2026-05-06)* 13 correctness and validation fixes across
+   `apply_calibration`, `calibration`, `deburst`, `output_crs`, `orbit`,
+   `stac`, `validate`, `insar/interferogram`, `scene_prep`, `merge_subswaths`,
+   `ground_range`, and `parse`. See `CHANGELOG.md` for details.
+8. *(Audit round 2, 2026-05-15)* 9 robustness fixes: NaN-input guards in
+   `terrain_correction` (3 sampling functions) and `geoid` (2 implementations);
+   3 fixes in `ground_range` (NaN bypass, NaN convergence return, t0==t1
+   divide-by-zero); `parse` sort panic on NaN burst delta; `scene_prep`
+   multilook `checked_mul`; `export` temp-file cleanup and COG overview logic;
+   `dem` longitude normalisation for values < −180°; `slice_assembly`
+   `checked_mul` for burst line offset. See `CHANGELOG.md` for details.
 
 ## End-to-end pipeline run (verified)
 
@@ -174,10 +185,12 @@ dB → GeoTIFF) is wired into the `process` subcommand of the `sardine` CLI
 (`bin/sardine.rs`) and into the two examples
 `examples/dump_merged_sigma0.rs` and `examples/dump_s1b_tc.rs`.
 
-Last verified end-to-end run (S1B, VV, 2019-01-23, 30 threads):
-- Output: `sardine_s1b_vv_30threads.tiff` (2.8 GiB Float32 EPSG:4326)
-- 522 600 024 valid pixels, 2 446 flat-masked, 0 DEM-missing, 0 non-converged
-- Wall-clock: ~30 min on 30 threads
+Last verified end-to-end run (S1B, VV, 2019-01-23, NRB mode, 10×10 multilook):
+- 388/388 unit tests pass
+- Release build clean
+- Terrain correction: 38 184 × 19 523 px geocoded — valid = 52 963 293,
+  dem_missing = 0, not_converged = 0, flat_masked = 484
+- Wall-clock: ~104 s total on development machine
 - Radiometric validation vs ASF RTC10 GAMMA: **+0.016 dB median linear bias**
   after 10×10 multilook (`scripts/multilook_compare.py`)
 - Seam continuity (`scripts/seam_continuity.py`): IW1/IW2 = −0.055 dB,

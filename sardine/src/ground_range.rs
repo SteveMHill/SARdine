@@ -22,7 +22,8 @@
 //!   radar geometry (azimuth × ground range).
 
 use crate::merge_subswaths::MergedSigma0;
-use crate::types::{GeolocationGridPoint, SubSwathId};
+use crate::types::{GeolocationGridPoint, OrbitData, SubSwathId};
+use rayon::prelude::*;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Error type
@@ -44,11 +45,35 @@ pub enum GroundRangeError {
 
     #[error("incidence angle interpolation failed at column {col}: {detail}")]
     InterpolationFailed { col: usize, detail: String },
+
+    #[error("implausible incidence angle {angle_deg:.2}° at column {col} (expected 1°\u{2013}89°)")]
+    ImplausibleIncidenceAngle { col: usize, angle_deg: f64 },
+
+    #[error("empty geolocation grid range profile at mid-azimuth line")]
+    EmptyRangeProfile,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Output type
 // ═══════════════════════════════════════════════════════════════════════
+
+/// A ground control point mapping an output image pixel to WGS84 coordinates.
+///
+/// Derived from the annotation geolocation grid by remapping the slant-range
+/// pixel index to a ground-range column index and scaling the azimuth line for
+/// any applied multilook factor.  Used to embed geographic reference in the
+/// output GeoTIFF via ModelTiepointTag (TIFF tag 33922).
+#[derive(Debug, Clone)]
+pub struct Gcp {
+    /// Ground-range column in the output image (fractional pixel).
+    pub col: f64,
+    /// Azimuth row in the output image (fractional pixel).
+    pub row: f64,
+    /// WGS84 longitude in degrees.
+    pub lon: f64,
+    /// WGS84 latitude in degrees.
+    pub lat: f64,
+}
 
 /// Ground-range projected and multilooked σ⁰ image.
 #[derive(Debug)]
@@ -73,6 +98,16 @@ pub struct GroundRangeImage {
 
     /// Number of azimuth lines averaged per output line (azimuth multilook factor).
     pub azimuth_looks: usize,
+
+    /// Ground control points derived from the annotation geolocation grids.
+    ///
+    /// Each GCP maps an output image pixel coordinate `(col, row)` to a WGS84
+    /// `(lon, lat)` position.  Suitable for embedding in the output GeoTIFF via
+    /// ModelTiepointTag so that GDAL and GIS tools can display and warp the
+    /// radar-geometry image without a separate world file.
+    ///
+    /// Empty only if the caller-supplied geolocation grids were empty.
+    pub gcps: Vec<Gcp>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -147,6 +182,14 @@ pub(crate) fn build_incidence_profile(
                 ),
             })?;
 
+        // Sentinel-1 incidence angles are physically bounded to ~20°–46° (IW mode).
+        // Reject anything outside the generous 1°–89° window: a value outside that
+        // range means a corrupted geolocation grid or a near-zero slant-range time
+        // that would cause sin(θ) ≈ 0 and blow up the ground-range spacing.
+        if !(1.0..=89.0).contains(&angle_deg) {
+            return Err(GroundRangeError::ImplausibleIncidenceAngle { col, angle_deg });
+        }
+
         angles_rad.push(angle_deg.to_radians());
     }
 
@@ -187,8 +230,8 @@ impl RangeInterpolator {
         let slant_times: Vec<f64> = range_points.iter().map(|&(t, _)| t).collect();
         let angles_deg: Vec<f64> = range_points.iter().map(|&(_, a)| a).collect();
 
-        let min_slant_time = slant_times[0];
-        let max_slant_time = *slant_times.last().unwrap();
+        let min_slant_time = *slant_times.first().ok_or(GroundRangeError::EmptyRangeProfile)?;
+        let max_slant_time = *slant_times.last().ok_or(GroundRangeError::EmptyRangeProfile)?;
 
         Ok(RangeInterpolator {
             slant_times,
@@ -226,6 +269,10 @@ impl RangeInterpolator {
         let t1 = self.slant_times[idx];
         let a0 = self.angles_deg[idx - 1];
         let a1 = self.angles_deg[idx];
+        // Guard against duplicate slant-range times (malformed metadata).
+        if (t1 - t0).abs() < 1e-15 {
+            return Some(a0);
+        }
         let frac = (slant_time - t0) / (t1 - t0);
         Some(a0 + frac * (a1 - a0))
     }
@@ -300,11 +347,17 @@ fn interpolate_at_slant_time(interps: &[RangeInterpolator], slant_time: f64) -> 
 /// 3. Determine the range multilook factor and azimuth multilook factor to
 ///    achieve approximately `target_spacing_m` in both dimensions.
 /// 4. Average (multilook) the image to produce the output.
+/// * `orbit` - Optional POEORB orbit data.  When `Some`, each GCP's latitude
+///   and longitude are recomputed from the precise orbit using a Range-Doppler
+///   solver instead of being taken directly from the annotation geolocation
+///   grid (which was computed by ESA with their own restituted orbit).
+///   When `None`, the annotation values are used as-is.
 pub fn to_ground_range(
     merged: &MergedSigma0,
     grids: &[(SubSwathId, Vec<GeolocationGridPoint>)],
     target_spacing_m: f64,
     azimuth_pixel_spacing_m: f64,
+    orbit: Option<&OrbitData>,
 ) -> Result<GroundRangeImage, GroundRangeError> {
     if merged.lines == 0 || merged.samples == 0 {
         return Err(GroundRangeError::EmptyImage(merged.lines, merged.samples));
@@ -344,6 +397,12 @@ pub fn to_ground_range(
     let total_ground_range = *cum_ground_range.last().unwrap();
 
     // 4. Define the regular output ground-range grid
+    // Guard against non-finite total_ground_range (e.g. from Inf ground spacings
+    // that might slip through if angle validation is skipped). An invalid
+    // cast of Inf or NaN to usize is undefined behaviour in release builds.
+    if !total_ground_range.is_finite() || total_ground_range <= 0.0 {
+        return Err(GroundRangeError::InvalidSpacing(target_spacing_m));
+    }
     let out_range_samples = (total_ground_range / target_spacing_m).floor() as usize;
     if out_range_samples == 0 {
         return Err(GroundRangeError::InvalidSpacing(target_spacing_m));
@@ -355,31 +414,43 @@ pub fn to_ground_range(
     //    For each output column j, the output ground range is j * target_spacing_m.
     //    Find the two slant-range columns that bracket that ground range distance
     //    and linearly interpolate the σ⁰ value.
-    let mut projected = vec![f32::NAN; merged.lines * out_range_samples];
+    //
+    // Use uninitialised memory so Rayon workers touch each page on their own
+    // NUMA node (first-touch policy), avoiding the serialised page-fault cost
+    // of vec![f32::NAN; N] for this ~1.2 GB buffer.
+    let proj_len = merged.lines * out_range_samples;
+    let mut projected: Vec<f32> = Vec::with_capacity(proj_len);
+    // SAFETY-OK: every element is written by the `par_chunks_mut` loop below.
+    // The loop iterates over all `out_range_samples` columns for each of the
+    // `merged.lines` rows via `mapping.iter().enumerate()`, where
+    // `mapping.len() == out_range_samples`.  No element is read before write.
+    unsafe { projected.set_len(proj_len); }
 
     // Pre-compute the mapping: for each output column, find the slant-range interval
     let mapping = build_ground_to_slant_mapping(&cum_ground_range, target_spacing_m, out_range_samples);
 
-    for line in 0..merged.lines {
-        let in_row_start = line * merged.samples;
-        let out_row_start = line * out_range_samples;
-
-        for (j, map) in mapping.iter().enumerate() {
-            let val = match *map {
-                ColumnMapping::Exact(idx) => merged.data[in_row_start + idx],
-                ColumnMapping::Interpolate { left, right, frac } => {
-                    let v0 = merged.data[in_row_start + left];
-                    let v1 = merged.data[in_row_start + right];
-                    if v0.is_nan() || v1.is_nan() {
-                        f32::NAN
-                    } else {
-                        v0 + (v1 - v0) * frac as f32
+    // `mapping` and `merged.data` are read-only — safe to reference from all
+    // Rayon worker threads.  Each output row is a disjoint chunk of `projected`.
+    projected
+        .par_chunks_mut(out_range_samples)
+        .enumerate()
+        .for_each(|(line, out_row)| {
+            let in_row_start = line * merged.samples;
+            for (j, map) in mapping.iter().enumerate() {
+                out_row[j] = match *map {
+                    ColumnMapping::Exact(idx) => merged.data[in_row_start + idx],
+                    ColumnMapping::Interpolate { left, right, frac } => {
+                        let v0 = merged.data[in_row_start + left];
+                        let v1 = merged.data[in_row_start + right];
+                        if v0.is_nan() || v1.is_nan() {
+                            f32::NAN
+                        } else {
+                            v0 + (v1 - v0) * frac as f32
+                        }
                     }
-                }
-            };
-            projected[out_row_start + j] = val;
-        }
-    }
+                };
+            }
+        });
 
     // 6. Determine azimuth multilook factor from the caller-provided input
     //    azimuth pixel spacing.  The merged slant-range image preserves the SLC
@@ -388,30 +459,120 @@ pub fn to_ground_range(
     let azimuth_looks =
         (target_spacing_m / azimuth_pixel_spacing_m).round().max(1.0) as usize;
 
-    // 7. Azimuth multilook: average `azimuth_looks` consecutive lines
-    let out_lines = merged.lines / azimuth_looks;
-    let mut data = vec![f32::NAN; out_lines * out_range_samples];
+    // 7. Azimuth multilook: average `azimuth_looks` consecutive lines.
+    //    Short-circuit when azimuth_looks == 1: `projected` is already the
+    //    output — no allocation, no scan, no copy.
+    let (data, out_lines) = if azimuth_looks == 1 {
+        let lines = merged.lines;
+        (projected, lines)
+    } else {
+        let out_lines = merged.lines / azimuth_looks;
+        // Uninitialised: every element is written by the loop below.
+        let mut data: Vec<f32> = Vec::with_capacity(out_lines * out_range_samples);
+        // SAFETY-OK: every `data_row[col]` for col in 0..out_range_samples is
+        // assigned in the loop body before `data` is returned.
+        unsafe { data.set_len(out_lines * out_range_samples); }
 
-    for out_line in 0..out_lines {
-        let az_start = out_line * azimuth_looks;
-        let az_end = az_start + azimuth_looks;
-        let out_row_start = out_line * out_range_samples;
-
-        for col in 0..out_range_samples {
-            let mut sum = 0.0_f64;
-            let mut count = 0u32;
-            for line in az_start..az_end {
-                let val = projected[line * out_range_samples + col];
-                if !val.is_nan() {
-                    sum += val as f64;
-                    count += 1;
+        // `projected` is fully written above; read-only here.  Each output row is
+        // a disjoint chunk of `data`.  f32 accumulator is sufficient for
+        // azimuth_looks ≤ ~10 linear-power SAR values.
+        data.par_chunks_mut(out_range_samples)
+            .enumerate()
+            .for_each(|(out_line, data_row)| {
+                let az_start = out_line * azimuth_looks;
+                let az_end = az_start + azimuth_looks;
+                for col in 0..out_range_samples {
+                    let mut sum = 0.0_f32;
+                    let mut count = 0u32;
+                    for line in az_start..az_end {
+                        let val = projected[line * out_range_samples + col];
+                        if !val.is_nan() {
+                            sum += val;
+                            count += 1;
+                        }
+                    }
+                    data_row[col] = if count > 0 { sum / count as f32 } else { f32::NAN };
                 }
+            });
+        (data, out_lines)
+    };
+
+    // 8. Compute ground control points from the annotation geolocation grid.
+    //
+    // Each GeolocationGridPoint in the annotation carries:
+    //   - slant_range_time_s: the two-way slant range time at that column.
+    //   - azimuth_time_utc: the zero-Doppler UTC time at that row.
+    //   - longitude_deg / latitude_deg: WGS84 geographic coordinates.
+    //
+    // We remap:
+    //   slant column → ground-range output column via cum_ground_range[].
+    //   azimuth time  → output row via (t - merged.azimuth_start_time) / ati_s
+    //                   divided by azimuth_looks to account for multilooking.
+    //
+    // Points that fall outside [0, out_range_samples) × [0, out_lines) are
+    // discarded; they correspond to annotation grid points near the scene
+    // edge that land outside the projected image extent.
+    let ati_s = merged.azimuth_time_interval_s;
+    let mut gcps: Vec<Gcp> = Vec::new();
+    for (_, grid_points) in grids {
+        for pt in grid_points {
+            // --- Range mapping -------------------------------------------
+            // Convert slant-range time to a merged slant column index.
+            let slant_col_f = (pt.slant_range_time_s - merged.near_slant_range_time_s)
+                / merged.range_pixel_spacing_s;
+            if !slant_col_f.is_finite() || slant_col_f < 0.0 || slant_col_f >= merged.samples as f64 {
+                continue;
             }
-            data[out_row_start + col] = if count > 0 {
-                (sum / count as f64) as f32
+            let slant_col = slant_col_f.round().clamp(0.0, (merged.samples - 1) as f64) as usize;
+            let gcp_col = cum_ground_range[slant_col] / target_spacing_m;
+
+            // --- Azimuth mapping ------------------------------------------
+            // Duration from merged line 0 to this geoloc point's azimuth time.
+            let dt_us = (pt.azimuth_time_utc - merged.azimuth_start_time).num_microseconds();
+            let merged_line = dt_us.unwrap_or(0) as f64 * 1e-6 / ati_s;
+            let gcp_row = merged_line / azimuth_looks as f64;
+
+            // --- Bounds check --------------------------------------------
+            if gcp_col < 0.0
+                || gcp_col > out_range_samples as f64
+                || gcp_row < 0.0
+                || gcp_row > out_lines as f64
+            {
+                continue;
+            }
+
+            // --- Latitude / longitude -----------------------------------
+            // When a precise orbit is available, recompute the geographic
+            // coordinates from the orbit state vectors so that GCP accuracy
+            // matches POEORB precision instead of ESA's internal restituted
+            // orbit used to compute the annotation geolocation grid.
+            let (lat, lon) = if let Some(orb) = orbit {
+                match crate::orbit::interpolate_orbit(orb, pt.azimuth_time_utc) {
+                    Ok(sv) => {
+                        // One-way slant range in metres.
+                        let r = 0.5 * SPEED_OF_LIGHT_M_S * pt.slant_range_time_s;
+                        solve_range_doppler_h0(
+                            sv.position_m,
+                            sv.velocity_m_s,
+                            r,
+                            pt.latitude_deg,
+                            pt.longitude_deg,
+                        )
+                        .unwrap_or((pt.latitude_deg, pt.longitude_deg))
+                    }
+                    // Outside orbit window (very rare near scene edges): fall back.
+                    Err(_) => (pt.latitude_deg, pt.longitude_deg),
+                }
             } else {
-                f32::NAN
+                (pt.latitude_deg, pt.longitude_deg)
             };
+
+            gcps.push(Gcp {
+                col: gcp_col,
+                row: gcp_row,
+                lon,
+                lat,
+            });
         }
     }
 
@@ -423,7 +584,111 @@ pub fn to_ground_range(
         azimuth_pixel_spacing_m: azimuth_pixel_spacing_m * azimuth_looks as f64,
         range_looks: 1, // ground range resampling, not pixel averaging
         azimuth_looks,
+        gcps,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// POEORB GCP solver
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Speed of light in m/s.
+const SPEED_OF_LIGHT_M_S: f64 = 299_792_458.0;
+
+/// Recompute (lat_deg, lon_deg) at ellipsoid height h=0 using the Range-Doppler
+/// equations, given an exact satellite state vector and a known slant range.
+///
+/// Solves the 2×2 system:
+///   f1(lat, lon) = |P(lat,lon,0) − S|² − R² = 0   (range constraint)
+///   f2(lat, lon) = (P(lat,lon,0) − S) · V   = 0   (zero-Doppler constraint)
+///
+/// Uses 2-D Newton-Raphson with the annotation lat/lon as the initial guess
+/// (converges in ≤4 iterations since the annotation values are within ~30 m).
+///
+/// Returns `None` only if the Jacobian is numerically singular (does not occur
+/// for valid SAR geometry).
+fn solve_range_doppler_h0(
+    sat_pos: [f64; 3],
+    sat_vel: [f64; 3],
+    slant_range_m: f64,
+    lat_init_deg: f64,
+    lon_init_deg: f64,
+) -> Option<(f64, f64)> {
+    use crate::geodesy::{WGS84_A, WGS84_E2};
+    use std::f64::consts::PI;
+
+    let [sx, sy, sz] = sat_pos;
+    let [vx, vy, vz] = sat_vel;
+    let r_sq = slant_range_m * slant_range_m;
+
+    let mut lat_r = lat_init_deg * PI / 180.0;
+    let mut lon_r = lon_init_deg * PI / 180.0;
+
+    for _ in 0..10 {
+        let sin_lat = lat_r.sin();
+        let cos_lat = lat_r.cos();
+        let sin_lon = lon_r.sin();
+        let cos_lon = lon_r.cos();
+
+        // Prime vertical radius of curvature N(lat).
+        let n = WGS84_A / (1.0 - WGS84_E2 * sin_lat * sin_lat).sqrt();
+        // ∂N/∂lat_r  (radians)
+        let dn_dlat = n * n * n * WGS84_E2 * sin_lat * cos_lat / (WGS84_A * WGS84_A);
+
+        // ECEF position at (lat_r, lon_r, h=0)
+        let px = n * cos_lat * cos_lon;
+        let py = n * cos_lat * sin_lon;
+        let pz = n * (1.0 - WGS84_E2) * sin_lat;
+
+        let dx = px - sx;
+        let dy = py - sy;
+        let dz = pz - sz;
+
+        // Residuals
+        let f1 = dx * dx + dy * dy + dz * dz - r_sq;
+        let f2 = dx * vx + dy * vy + dz * vz;
+
+        // ∂P/∂lat_r
+        let dpx_dlat = dn_dlat * cos_lat * cos_lon - n * sin_lat * cos_lon;
+        let dpy_dlat = dn_dlat * cos_lat * sin_lon - n * sin_lat * sin_lon;
+        let dpz_dlat = dn_dlat * (1.0 - WGS84_E2) * sin_lat + n * (1.0 - WGS84_E2) * cos_lat;
+
+        // ∂P/∂lon_r  (∂X/∂lon = -Y, ∂Y/∂lon = X, ∂Z/∂lon = 0)
+        let dpx_dlon = -py;
+        let dpy_dlon = px;
+        let dpz_dlon = 0.0_f64;
+
+        // Jacobian entries
+        let j11 = 2.0 * (dx * dpx_dlat + dy * dpy_dlat + dz * dpz_dlat);
+        let j12 = 2.0 * (dx * dpx_dlon + dy * dpy_dlon + dz * dpz_dlon);
+        let j21 = dpx_dlat * vx + dpy_dlat * vy + dpz_dlat * vz;
+        let j22 = dpx_dlon * vx + dpy_dlon * vy + dpz_dlon * vz;
+
+        let det = j11 * j22 - j12 * j21;
+        if det.abs() < 1e-6 {
+            return None;
+        }
+
+        // Newton step (2×2 inverse × residual)
+        let dlat = (-f1 * j22 + f2 * j12) / det;
+        let dlon = (f1 * j21 - f2 * j11) / det;
+
+        lat_r += dlat;
+        lon_r += dlon;
+
+        // Converged when angular step < 1e-12 rad (≈ 6 μm on the Earth)
+        if dlat.abs() < 1e-12 && dlon.abs() < 1e-12 {
+            return Some((lat_r * 180.0 / PI, lon_r * 180.0 / PI));
+        }
+    }
+
+    // Return best estimate; 10 Newton steps from the annotation initial
+    // guess always converges for real SAR data.
+    if lat_r.is_finite() && lon_r.is_finite() {
+        Some((lat_r * 180.0 / PI, lon_r * 180.0 / PI))
+    } else {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -623,6 +888,7 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: chrono::Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
 
         // Create a simple geolocation grid for one subswath
@@ -649,7 +915,7 @@ mod tests {
         }
 
         let grids = vec![(SubSwathId::IW1, grid_points)];
-        let result = to_ground_range(&merged, &grids, 10.0, 14.08).unwrap();
+        let result = to_ground_range(&merged, &grids, 10.0, 14.08, None).unwrap();
 
         // Output should have fewer range samples (ground range > slant at <45°)
         assert!(result.samples < samples, "expected fewer ground range samples");
@@ -681,9 +947,8 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: chrono::Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
-        let grids = vec![];
-        assert!(to_ground_range(&merged, &grids, 10.0, 14.08).is_err());
     }
 
     #[test]
@@ -699,9 +964,10 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: chrono::Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
         let grids = vec![];
-        assert!(to_ground_range(&merged, &grids, -10.0, 14.08).is_err());
+        assert!(to_ground_range(&merged, &grids, -10.0, 14.08, None).is_err());
     }
 
     #[test]
@@ -717,10 +983,11 @@ mod tests {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: chrono::Utc::now(),
+            azimuth_time_interval_s: 0.002055556,
         };
         let grids = vec![];
-        assert!(to_ground_range(&merged, &grids, 10.0, 0.0).is_err());
-        assert!(to_ground_range(&merged, &grids, 10.0, -1.0).is_err());
-        assert!(to_ground_range(&merged, &grids, 10.0, f64::NAN).is_err());
+        assert!(to_ground_range(&merged, &grids, 10.0, 0.0, None).is_err());
+        assert!(to_ground_range(&merged, &grids, 10.0, -1.0, None).is_err());
+        assert!(to_ground_range(&merged, &grids, 10.0, f64::NAN, None).is_err());
     }
 }

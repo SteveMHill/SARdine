@@ -144,6 +144,147 @@ fn which_gdal_translate() -> Result<(), CogError> {
     }
 }
 
+// ─── gdalwarp geocoding ───────────────────────────────────────────────────────
+
+/// Errors returned by [`geocode_with_gdalwarp`] and
+/// [`embed_gcps_via_gdal_translate`].
+#[derive(Debug, thiserror::Error)]
+pub enum WarpError {
+    /// `gdalwarp` binary is not present in `PATH`.
+    #[error("`gdalwarp` not found in PATH; install GDAL ≥ 3.1 to enable --crs geocoding")]
+    GdalWarpNotFound,
+
+    /// `gdalwarp` exited with a non-zero status.
+    #[error("`gdalwarp` failed (exit code {exit_code:?}):\n{stderr}")]
+    GdalWarpFailed {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+
+    /// `gdal_translate` binary is not present in `PATH`.
+    #[error("`gdal_translate` not found in PATH; install GDAL ≥ 3.1 to enable GCP embedding")]
+    GdalTranslateNotFound,
+
+    /// `gdal_translate` exited with a non-zero status.
+    #[error("`gdal_translate` failed (exit code {exit_code:?}):\n{stderr}")]
+    GdalTranslateFailed {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+
+    /// Temporary file management error.
+    #[error("temporary-file I/O during geocoding of `{path}`: {source}")]
+    TempFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Geocode `input` to `output` using `gdalwarp -tps`.
+///
+/// Uses Thin Plate Spline warping driven by the GCPs embedded in `input`
+/// (written by [`crate::export::write_tiff_with_gcps`]).  The output CRS is
+/// specified via `srs_string` (e.g. `"EPSG:32632"`).  Output pixel size is
+/// estimated automatically by GDAL from the GCP spacing.
+///
+/// `input` is left unchanged; the caller is responsible for renaming `output`
+/// over `input` if an in-place replacement is desired.
+pub fn geocode_with_gdalwarp(
+    input: &Path,
+    output: &Path,
+    srs_string: &str,
+) -> Result<(), WarpError> {
+    which_gdalwarp()?;
+
+    let result = std::process::Command::new("gdalwarp")
+        .args(["-tps", "-r", "bilinear", "-t_srs", srs_string])
+        .arg(input)
+        .arg(output)
+        .output()
+        .map_err(|_| WarpError::GdalWarpNotFound)?;
+
+    if !result.status.success() {
+        return Err(WarpError::GdalWarpFailed {
+            exit_code: result.status.code(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Embed GCPs into an existing TIFF (in-place) using `gdal_translate -gcp`.
+///
+/// Used for the BigTIFF path where the pure-Rust GCP writer cannot be used
+/// (classic TIFF 32-bit offsets would overflow).  After the call the file at
+/// `path` carries the same GCPs that would be embedded by
+/// [`crate::export::write_tiff_with_gcps`] on the classic-TIFF path.
+pub fn embed_gcps_via_gdal_translate(
+    path: &Path,
+    gcps: &[crate::ground_range::Gcp],
+) -> Result<(), WarpError> {
+    which_gdal_translate_for_warp()?;
+
+    let tmp_path = path.with_extension("gcptmp.tif");
+
+    let mut cmd = std::process::Command::new("gdal_translate");
+    cmd.arg("-a_srs").arg("EPSG:4326");
+    for gcp in gcps {
+        cmd.args([
+            "-gcp",
+            &gcp.col.to_string(),
+            &gcp.row.to_string(),
+            &gcp.lon.to_string(),
+            &gcp.lat.to_string(),
+        ]);
+    }
+    cmd.arg(path).arg(&tmp_path);
+
+    let result = cmd.output().map_err(|_| WarpError::GdalTranslateNotFound)?;
+
+    if !result.status.success() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(WarpError::GdalTranslateFailed {
+            exit_code: result.status.code(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+        });
+    }
+
+    std::fs::rename(&tmp_path, path).map_err(|source| WarpError::TempFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    Ok(())
+}
+
+/// Check that `gdalwarp` resolves in PATH.
+fn which_gdalwarp() -> Result<(), WarpError> {
+    match std::process::Command::new("gdalwarp")
+        .arg("--version")
+        .output()
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(WarpError::GdalWarpNotFound),
+        Err(_) => Err(WarpError::GdalWarpNotFound),
+    }
+}
+
+/// Check that `gdal_translate` resolves in PATH (for GCP embedding).
+fn which_gdal_translate_for_warp() -> Result<(), WarpError> {
+    match std::process::Command::new("gdal_translate")
+        .arg("--version")
+        .output()
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(WarpError::GdalTranslateNotFound)
+        }
+        Err(_) => Err(WarpError::GdalTranslateNotFound),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

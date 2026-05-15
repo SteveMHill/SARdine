@@ -379,6 +379,34 @@ fn parse_calibration_xml(xml_content: &str) -> Result<SwathCalibration, Calibrat
     // Sort by line for consistent ordering
     vectors.sort_by_key(|v| v.line);
 
+    // Validate pixel arrays: binary_search requires strictly ascending indices.
+    for v in &vectors {
+        if v.pixels.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(CalibrationParseError::InvalidValue {
+                field: "pixel",
+                detail: "pixel indices must be strictly ascending (required for interpolation)".into(),
+            });
+        }
+    }
+
+    // Validate LUT values: non-finite values would propagate silently into
+    // the calibrated output as NaN/Inf and produce corrupt rasters.
+    for v in &vectors {
+        let lut_ok = v.sigma_nought.iter().all(|x| x.is_finite())
+            && v.beta_nought.iter().all(|x| x.is_finite())
+            && v.gamma.iter().all(|x| x.is_finite())
+            && v.dn.iter().all(|x| x.is_finite());
+        if !lut_ok {
+            return Err(CalibrationParseError::InvalidValue {
+                field: "calibrationVector",
+                detail: format!(
+                    "non-finite LUT value in vector at line {}",
+                    v.line
+                ),
+            });
+        }
+    }
+
     Ok(SwathCalibration {
         subswath_id,
         polarization,

@@ -555,6 +555,19 @@ pub fn prepare_merged_scene(
     let scene = parse_safe_directory(safe)
         .with_context(|| format!("parsing SAFE: {}", safe.display()))?;
 
+    // Validate that the requested polarization is actually present in the product.
+    // This surfaces the error early with a helpful message rather than letting
+    // it fail deep inside calibration LUT lookup.
+    if !scene.polarizations.contains(&pol) {
+        let available: Vec<String> = scene.polarizations.iter().map(|p| p.to_string()).collect();
+        anyhow::bail!(
+            "polarization {:?} is not available in {}: available = [{}]",
+            pol,
+            safe.display(),
+            available.join(", ")
+        );
+    }
+
     let (scene, orbit_source) = resolve_orbit(scene, orbit_path, "scene")?;
 
     tracing::info!("parsing calibration/noise LUTs …");
@@ -874,14 +887,28 @@ pub fn prepare_merged_scene_assembled(
                 // Build TIFF-local burst list.
                 let local_bursts: Vec<crate::types::BurstEntry> = global_bursts
                     .iter()
-                    .map(|b| crate::types::BurstEntry {
-                        first_line: b.first_line - slice_line_offset,
-                        last_line: b.last_line - slice_line_offset,
-                        burst_index: b.burst_index - global_bursts[0].burst_index,
-                        slice_index: 0, // SAFETY-OK: local burst list is always single-slice context
-                        ..*b
+                    .map(|b| {
+                        let first_line = b.first_line.checked_sub(slice_line_offset)
+                            .with_context(|| format!(
+                                "burst {} first_line ({}) < slice_line_offset ({}) — \
+                                 burst ordering is inconsistent",
+                                b.burst_index, b.first_line, slice_line_offset
+                            ))?;
+                        let last_line = b.last_line.checked_sub(slice_line_offset)
+                            .with_context(|| format!(
+                                "burst {} last_line ({}) < slice_line_offset ({}) — \
+                                 burst ordering is inconsistent",
+                                b.burst_index, b.last_line, slice_line_offset
+                            ))?;
+                        Ok(crate::types::BurstEntry {
+                            first_line,
+                            last_line,
+                            burst_index: b.burst_index - global_bursts[0].burst_index,
+                            slice_index: 0, // SAFETY-OK: local burst list is always single-slice context
+                            ..*b
+                        })
                     })
-                    .collect();
+                    .collect::<anyhow::Result<Vec<_>>>()?;
 
                 let n_k = local_bursts.len();
                 let sw_k = crate::types::SubSwathMetadata {
@@ -1120,39 +1147,59 @@ pub(crate) fn apply_multilook(
         merged.azimuth_start_time
     };
 
-    // ── Boxcar average (NaN-aware) ───────────────────────────────────────────
-    let mut out_data = vec![0.0f32; out_lines * out_samples];
-    let mut out_nesz = vec![0.0f32; out_lines * out_samples];
+    // ── Boxcar average (NaN-aware, parallel over output rows) ─────────────────
+    //
+    // Use uninitialised memory: the parallel loop below writes every element
+    // before the buffers are returned, avoiding both the zero-initialisation
+    // cost of `vec![0.0f32; N]` and the NUMA first-touch serialisation on
+    // multi-socket machines (each Rayon worker touches its own rows on its
+    // own NUMA node).
+    let n = out_lines
+        .checked_mul(out_samples)
+        .ok_or_else(|| anyhow::anyhow!(
+            "multilook output dimensions overflow: {} lines × {} samples",
+            out_lines, out_samples
+        ))?;
+    let mut out_data: Vec<f32> = Vec::with_capacity(n);
+    let mut out_nesz: Vec<f32> = Vec::with_capacity(n);
+    // SAFETY-OK: every element of `out_data` and `out_nesz` is written
+    // unconditionally by the `par_chunks_mut` loop below (the inner loops
+    // always assign `data_row[os]` and `nesz_row[os]` for all `os in 0..out_samples`
+    // via the if/else branches).  No element is read before it is written.
+    unsafe {
+        out_data.set_len(n);
+        out_nesz.set_len(n);
+    }
 
-    for ol in 0..out_lines {
-        for os in 0..out_samples {
-            let mut sum = 0.0f64;
-            let mut sum_nesz = 0.0f64;
-            let mut count = 0u32;
-            for da in 0..azimuth_looks {
-                for dr in 0..range_looks {
-                    let il = ol * azimuth_looks + da;
-                    let is_ = os * range_looks + dr;
-                    let v = merged.data[il * in_samples + is_];
-                    if !v.is_nan() {
-                        sum += v as f64;
-                        sum_nesz += merged.nesz[il * in_samples + is_] as f64;
-                        count += 1;
+    // Each output row is independent: safe to zip par_chunks_mut.
+    // f32 accumulators are sufficient — SAR linear-power values lie in
+    // [~1e-6, ~100]; averaging ≤ range_looks*azimuth_looks ≤ ~1 000 of
+    // these incurs at most ~3 ULP error, far below measurement noise.
+    out_data
+        .par_chunks_mut(out_samples)
+        .zip(out_nesz.par_chunks_mut(out_samples))
+        .enumerate()
+        .for_each(|(ol, (data_row, nesz_row))| {
+            for os in 0..out_samples {
+                let mut sum = 0.0f32;
+                let mut sum_nesz = 0.0f32;
+                let mut count = 0u32;
+                for da in 0..azimuth_looks {
+                    for dr in 0..range_looks {
+                        let il = ol * azimuth_looks + da;
+                        let is_ = os * range_looks + dr;
+                        let v = merged.data[il * in_samples + is_];
+                        if !v.is_nan() {
+                            sum += v;
+                            sum_nesz += merged.nesz[il * in_samples + is_];
+                            count += 1;
+                        }
                     }
                 }
+                data_row[os] = if count == 0 { f32::NAN } else { sum / count as f32 };
+                nesz_row[os] = if count == 0 { f32::NAN } else { sum_nesz / count as f32 };
             }
-            out_data[ol * out_samples + os] = if count == 0 {
-                f32::NAN
-            } else {
-                (sum / count as f64) as f32
-            };
-            out_nesz[ol * out_samples + os] = if count == 0 {
-                f32::NAN
-            } else {
-                (sum_nesz / count as f64) as f32
-            };
-        }
-    }
+        });
 
     Ok(crate::merge_subswaths::MergedSigma0 {
         data: out_data,
@@ -1162,6 +1209,7 @@ pub(crate) fn apply_multilook(
         range_pixel_spacing_s: new_range_spacing_s,
         range_pixel_spacing_m: new_range_spacing_m,
         azimuth_start_time: new_azimuth_start_time,
+        azimuth_time_interval_s: merged.azimuth_time_interval_s * azimuth_looks as f64,
         // Propagate worst-case LUT gap flags unchanged — the multilook does
         // not affect LUT geometry.
         cal_lut_extrapolation_gap_px: merged.cal_lut_extrapolation_gap_px,

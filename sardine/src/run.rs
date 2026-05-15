@@ -158,6 +158,15 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
     use crate::export::{to_db_inplace, write_geotiff_with_crs};
     use crate::terrain_correction::{terrain_correction, TerrainCorrectionConfig};
 
+    // CARD4L NRB requires terrain flattening (γ⁰ output).
+    if opts.mode == OutputMode::Nrb && opts.no_flatten {
+        anyhow::bail!(
+            "--no-flatten is incompatible with --mode nrb: \
+             CARD4L NRB mandates terrain-flattened γ⁰ output. \
+             Remove --no-flatten or switch to --mode rtc."
+        );
+    }
+
     let t_total = Instant::now();
     let prepared = if !opts.extra_safe_paths.is_empty() {
         use crate::slice_assembly::assemble_slices;
@@ -235,6 +244,8 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
             &merged,
             &grids,
             pol,
+            Some(opts.crs.as_str()),
+            crate::pipeline_options::OutputUnit::Linear, // process --mode grd always linear
         )?;
         tracing::info!("done.");
         report_timing("total", t_total);
@@ -509,6 +520,7 @@ pub fn run_process(opts: &ProcessOptions) -> Result<()> {
             opts.multilook_azimuth,
             opts.speckle_order,
             opts.mode,
+            crate::pipeline_options::OutputUnit::Db, // TC/NRB/RTC always output in dB
         )?;
         let prov_path_str = sidecar_path(&opts.output, ".provenance.json")?;
         tracing::info!("writing provenance sidecar → {}", prov_path_str);
@@ -557,10 +569,32 @@ pub fn run_grd(opts: &GrdOptions) -> Result<()> {
     let PreparedScene {
         scene,
         orbit_source,
-        merged,
+        mut merged,
         grids,
         pol,
     } = prepared;
+
+    // ── Pre-GRD multilook ─────────────────────────────────────────────────────
+    if opts.multilook_range > 1 || opts.multilook_azimuth > 1 {
+        let t_ml = Instant::now();
+        let ati = scene
+            .sub_swaths
+            .first()
+            .ok_or_else(|| anyhow!("scene has no subswath metadata"))?
+            .azimuth_time_interval_s;
+        tracing::info!(
+            "multilook {}×{} (range×azimuth) on merged σ⁰ ({} × {} → {} × {}) …",
+            opts.multilook_range,
+            opts.multilook_azimuth,
+            merged.samples,
+            merged.lines,
+            merged.samples / opts.multilook_range,
+            merged.lines / opts.multilook_azimuth,
+        );
+        merged = apply_multilook(merged, opts.multilook_range, opts.multilook_azimuth, ati)
+            .with_context(|| "multilook")?;
+        report_timing("multilook", t_ml);
+    }
 
     run_grd_from_prepared(
         &opts.safe,
@@ -580,6 +614,8 @@ pub fn run_grd(opts: &GrdOptions) -> Result<()> {
         &merged,
         &grids,
         pol,
+        opts.crs.as_deref(),
+        opts.output_unit,
     )?;
     tracing::info!("done.");
     report_timing("total", t_total);
@@ -608,8 +644,10 @@ fn run_grd_from_prepared(
         Vec<crate::types::GeolocationGridPoint>,
     )],
     pol: Polarization,
+    crs: Option<&str>,
+    output_unit: crate::pipeline_options::OutputUnit,
 ) -> Result<()> {
-    use crate::export::write_tiff_no_crs;
+    use crate::export::write_tiff_with_gcps;
     use crate::ground_range::to_ground_range;
 
     let azimuth_pixel_spacing_m = scene
@@ -623,7 +661,11 @@ fn run_grd_from_prepared(
         target_spacing_m, azimuth_pixel_spacing_m,
     );
     let t_grd = Instant::now();
-    let grd = to_ground_range(merged, grids, target_spacing_m, azimuth_pixel_spacing_m)
+    // Pass the orbit for POEORB-derived GCP recomputation when a precise orbit
+    // was supplied; fall back to annotation lat/lon otherwise.
+    let poeorb_orbit = (orbit_source == crate::provenance::OrbitSource::Poeorb)
+        .then_some(&scene.orbit);
+    let grd = to_ground_range(merged, grids, target_spacing_m, azimuth_pixel_spacing_m, poeorb_orbit)
         .with_context(|| "ground-range projection")?;
     report_timing("ground_range_projection", t_grd);
 
@@ -660,14 +702,51 @@ fn run_grd_from_prepared(
         0
     };
 
+    // ── Optional dB conversion (--output-unit db) ────────────────────────────
+    if output_unit == crate::pipeline_options::OutputUnit::Db {
+        use crate::export::to_db_inplace;
+        let noise_floor_linear = if noise_floor_db > 0.0 {
+            10.0_f32.powf(noise_floor_db / 10.0)
+        } else {
+            0.0
+        };
+        let (converted, db_masked) = to_db_inplace(&mut grd.data, noise_floor_linear)
+            .with_context(|| "GRD dB conversion")?;
+        tracing::info!(
+            "dB conversion — converted={}, noise_masked={}", converted, db_masked
+        );
+    }
+
     let output_str = output_path
         .to_str()
         .ok_or_else(|| anyhow!("output path contains non-UTF-8 characters"))?;
-    tracing::info!("writing ground-range TIFF (no CRS) → {}", output_str);
+    tracing::info!(
+        "writing ground-range TIFF with GCPs ({} GCPs, radar geometry) → {}",
+        grd.gcps.len(),
+        output_str,
+    );
     let t_export = Instant::now();
-    write_tiff_no_crs(output_str, &grd.data, grd.samples, grd.lines)
+    write_tiff_with_gcps(output_str, &grd.data, grd.samples, grd.lines, &grd.gcps)
         .with_context(|| format!("writing ground-range TIFF: {}", output_str))?;
     report_timing("export_tiff", t_export);
+
+    // ── Optional geocoding via gdalwarp ───────────────────────────────────────
+    if let Some(crs_str) = crs {
+        let output_crs = crate::output_crs::OutputCrs::from_spec(crs_str)
+            .with_context(|| format!("invalid --crs spec '{}'", crs_str))?;
+        let srs = output_crs.to_srs_string();
+        // Write geocoded output to a temp file next to the GCP-tagged TIFF,
+        // then atomically rename it over the original.
+        let tmp_path = output_path.with_extension("warp_tmp.tif");
+        tracing::info!("geocoding to {} via gdalwarp -tps → {}", srs, output_str);
+        let t_warp = Instant::now();
+        crate::cog::geocode_with_gdalwarp(output_path, &tmp_path, &srs)
+            .with_context(|| format!("gdalwarp geocoding to {srs}"))?;
+        std::fs::rename(&tmp_path, output_path)
+            .with_context(|| "renaming warped output over radar-geometry TIFF")?;
+        report_timing("geocoding", t_warp);
+        tracing::info!("geocoding complete.");
+    }
 
     if cog {
         tracing::info!("converting to COG via gdal_translate ...");
@@ -697,9 +776,8 @@ fn run_grd_from_prepared(
         let orbit_str = match orbit_source {
             crate::provenance::OrbitSource::Poeorb => Some(
                 orbit_path
-                    .expect("orbit_source=Poeorb implies orbit_path is Some") // SAFETY-OK: Poeorb variant is only set when opts.orbit is Some (see prepare_merged_scene)
-                    .to_str()
-                    .ok_or_else(|| anyhow!("--orbit path contains non-UTF-8 characters"))?
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("auto") // auto-fetched POEORB — exact cache path not retained
                     .to_owned(),
             ),
             crate::provenance::OrbitSource::Annotation => None,
@@ -722,6 +800,7 @@ fn run_grd_from_prepared(
             enl,
             frost_damping,
             threads,
+            output_unit,
         )?;
         let prov_path_str = sidecar_path(output_path, ".provenance.json")?;
         tracing::info!("writing provenance sidecar → {}", prov_path_str);
@@ -1125,6 +1204,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: ml_az_start,
+            azimuth_time_interval_s: ref_ati_s * opts.az_looks as f64,
         };
 
         // Clone scene metadata and scale every subswath's ati_s by az_looks,
@@ -1206,6 +1286,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
                 cal_lut_extrapolation_gap_px: 0,
                 noise_lut_extrapolation_gap_px: 0,
                 azimuth_start_time: ml_az_start,
+                azimuth_time_interval_s: ref_ati_s * opts.az_looks as f64,
             };
             let phase_geocoded = terrain_correction(
                 &phase_merged, &ml_scene, &dem, &iw_grids, &tc_cfg,
@@ -1284,6 +1365,11 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
                 cols: coh_geocoded.cols,
                 rows: coh_geocoded.rows,
                 ref_orbit_is_poeorb: opts.reference_orbit.is_some(),
+                acquisition_mode: &ref_scene.acquisition_mode.to_string().to_lowercase(),
+                dem_source: &opts.dem_source,
+                geoid_spec: &opts.geoid,
+                orbit_pass_direction: &ref_scene.orbit_pass_direction,
+                absolute_orbit_number: ref_scene.absolute_orbit_number,
                 coherence_path: &coh_path,
                 phase_path: phase_path_str.as_deref(),
             },
@@ -1662,6 +1748,7 @@ mod multilook_tests {
             azimuth_start_time: chrono::DateTime::parse_from_rfc3339("2019-01-23T05:33:48Z")
                 .expect("static literal") // SAFETY-OK: constant literal cannot be invalid
                 .with_timezone(&chrono::Utc),
+            azimuth_time_interval_s: 0.002055556,
         }
     }
 

@@ -410,6 +410,10 @@ pub struct SceneMetadata {
     pub mission: Mission,
     /// Acquisition mode.
     pub acquisition_mode: AcquisitionMode,
+    /// Orbit pass direction: `"ascending"` or `"descending"` (lower-case).
+    pub orbit_pass_direction: String,
+    /// Absolute orbit counter from the annotation `<adsHeader>`.
+    pub absolute_orbit_number: u32,
     /// Polarization channels present in the product. Non-empty.
     pub polarizations: Vec<Polarization>,
 

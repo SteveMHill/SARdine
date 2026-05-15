@@ -89,6 +89,21 @@ pub enum ResamplingKernel {
     Lanczos3,
 }
 
+/// Output pixel unit for GRD (ground-range) mode.
+///
+/// Selects whether the GRD TIFF contains linear σ⁰ power values or
+/// 10 × log₁₀(σ⁰) in decibels.  The `process` command always outputs dB;
+/// `grd` defaults to linear for backward compatibility but can be switched
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputUnit {
+    /// Linear σ⁰ power (dimensionless).  Default.
+    #[default]
+    Linear,
+    /// 10 × log₁₀(σ⁰) in decibels.  Sub-noise-floor pixels become NaN.
+    Db,
+}
+
 /// A source raster that can be sampled at sub-pixel radar coordinates.
 ///
 /// Implement this trait to feed any radar image (σ⁰ intensity, coherence,
@@ -261,12 +276,28 @@ pub struct GrdOptions {
     /// Noise floor threshold in dB.  Pixels at or below this level (in σ⁰ linear power)
     /// are masked to NaN before writing.  Values ≤ 0.0 disable masking.  Default: 0.0.
     pub noise_floor_db: f32,
+    /// Range multilook factor applied on the merged σ⁰ buffer before ground-range
+    /// projection.  1 = single-look (default).  5 matches the ESA GRDH look count.
+    pub multilook_range: usize,
+    /// Azimuth multilook factor applied on the merged σ⁰ buffer before ground-range
+    /// projection.  1 = single-look (default).
+    pub multilook_azimuth: usize,
     /// Additional SAFE slice paths for multi-slice (assembled) processing.
     ///
     /// When non-empty, all paths `[safe] ++ extra_safe_paths` are assembled
     /// via [`crate::slice_assembly::assemble_slices`] before processing.
     /// Paths must be ordered ascending in time (earliest slice first).
     pub extra_safe_paths: Vec<PathBuf>,
+    /// Output CRS for geocoding.  `None` means no geocoding: the output is in
+    /// radar geometry with embedded GCPs (EPSG:4326 reference via
+    /// ModelTiepointTag).  When set, `gdalwarp -tps` is called after writing
+    /// the GCP-tagged TIFF and the geocoded result replaces it.
+    /// Accepts the same spec strings as `--crs` on the `process` command
+    /// (e.g. `"EPSG:32632"`, `"UTM"`, `"auto"`).
+    pub crs: Option<String>,
+    /// Output pixel unit.  `Linear` (default) writes raw σ⁰ power;
+    /// `Db` applies 10×log₁₀ and sets sub-noise-floor pixels to NaN.
+    pub output_unit: OutputUnit,
 }
 
 impl GrdOptions {
@@ -287,7 +318,11 @@ impl GrdOptions {
             frost_damping: 1.0,
             iw_selection: IwSelection::default(),
             noise_floor_db: 0.0,
+            multilook_range: 1,
+            multilook_azimuth: 1,
             extra_safe_paths: vec![],
+            crs: None,
+            output_unit: OutputUnit::Linear,
         }
     }
 }

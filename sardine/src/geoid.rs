@@ -218,6 +218,9 @@ impl Egm96Grid {
     /// Uses bilinear interpolation between the four surrounding 2.5° grid
     /// nodes.  Latitude is clamped to [−90, 90]; longitude wraps modulo 360°.
     pub fn undulation_m(&self, lat_deg: f64, lon_deg: f64) -> f64 {
+        if !lat_deg.is_finite() || !lon_deg.is_finite() {
+            return 0.0;
+        }
         // Normalise longitude to [0, 360).
         let lon = lon_deg.rem_euclid(360.0);
 
@@ -299,6 +302,9 @@ impl Egm2008Grid {
     /// Bilinear interpolation on the 2.5° grid.  Identical algorithm to
     /// [`Egm96Grid::undulation_m`].
     pub fn undulation_m(&self, lat_deg: f64, lon_deg: f64) -> f64 {
+        if !lat_deg.is_finite() || !lon_deg.is_finite() {
+            return 0.0;
+        }
         let lon = lon_deg.rem_euclid(360.0);
         let row_f = (90.0 - lat_deg.clamp(-90.0, 90.0)) / EGM96_STEP_DEG;
         let col_f = lon / EGM96_STEP_DEG;
