@@ -33,7 +33,7 @@
 //! provide.  The dual-pol H/A/Alpha here is a 2×2 restricted version; its
 //! physical interpretation is more limited than the quad-pol variant.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rayon::prelude::*;
 
 // ─── Output geometry type ─────────────────────────────────────────────────────
@@ -190,7 +190,10 @@ pub fn compute_haa(c11: f32, c22: f32, c12_re: f32, c12_im: f32) -> (f32, f32, f
 /// Updates the geometry fields accordingly:
 /// * `lines` → `lines / az_looks`
 /// * `samples` → `samples / rg_looks`
-/// * `azimuth_time_interval_s` → `azimuth_time_interval_s * az_looks`
+/// * `near_slant_range_time_s` → shifted to centre of first range block
+/// * `azimuth_start_time` → shifted to centre of first azimuth block
+/// * `range_pixel_spacing_s/m` → `× rg_looks`
+/// * `azimuth_time_interval_s` → `× az_looks`
 pub fn multilook_c2(c2: &MergedC2, rg_looks: usize, az_looks: usize) -> MergedC2 {
     assert!(rg_looks >= 1 && az_looks >= 1, "look counts must be ≥ 1");
 
@@ -252,6 +255,18 @@ pub fn multilook_c2(c2: &MergedC2, rg_looks: usize, az_looks: usize) -> MergedC2
             }
         });
 
+    // Centre-align: tag each output pixel at the centre of its averaging block,
+    // matching the convention in scene_prep::apply_multilook.
+    let new_near_slant_range_time_s = c2.near_slant_range_time_s
+        + (rg_looks - 1) as f64 / 2.0 * c2.range_pixel_spacing_s;
+    let new_azimuth_start_time = if az_looks > 1 {
+        let half_block_us =
+            ((az_looks - 1) as f64 / 2.0 * c2.azimuth_time_interval_s * 1e6) as i64;
+        c2.azimuth_start_time + Duration::microseconds(half_block_us)
+    } else {
+        c2.azimuth_start_time
+    };
+
     MergedC2 {
         c11: out_c11,
         c22: out_c22,
@@ -259,10 +274,10 @@ pub fn multilook_c2(c2: &MergedC2, rg_looks: usize, az_looks: usize) -> MergedC2
         c12_im: out_c12_im,
         lines: out_lines,
         samples: out_samples,
-        near_slant_range_time_s: c2.near_slant_range_time_s,
+        near_slant_range_time_s: new_near_slant_range_time_s,
         range_pixel_spacing_s: c2.range_pixel_spacing_s * rg_looks as f64,
         range_pixel_spacing_m: c2.range_pixel_spacing_m * rg_looks as f64,
-        azimuth_start_time: c2.azimuth_start_time,
+        azimuth_start_time: new_azimuth_start_time,
         azimuth_time_interval_s: c2.azimuth_time_interval_s * az_looks as f64,
     }
 }
