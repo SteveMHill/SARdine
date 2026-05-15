@@ -1151,46 +1151,29 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             iw_id, igram.lines, igram.samples
         );
 
-        // ── Build multi-looked MergedSigma0 for terrain correction ───────────
+        // ── Build MergedSigma0 for terrain correction ─────────────────────────
         //
-        // After boxcar coherence estimation, line l of igram corresponds to
-        // SLC lines [l·az_looks, (l+1)·az_looks).  The center of window l
-        // is at SLC line l·az_looks + (az_looks−1)/2, with azimuth time:
-        //
-        //   t_az(l) = ref_first_utc + (l·az_looks + (az_looks−1)/2) · ati_s
-        //           = az_start + l · (az_looks · ati_s)
-        //
-        // where az_start = ref_first_utc + (az_looks−1)/2 · ati_s.
-        // Analogously, the two-way slant-range time for column c is:
-        //
-        //   τ(c) = near_τ + (c·rg_looks + (rg_looks−1)/2) · Δτ_r
-        //        = near_τ_ml + c · (rg_looks · Δτ_r)
+        // form_interferogram uses a sliding (overlapping) boxcar: every output
+        // pixel (l, c) is centred on the same SLC pixel, so the coherence and
+        // phase arrays are at full SLC resolution (same dimensions as the input).
+        // The terrain correction geometry is therefore identical to that of the
+        // reference SLC — no timing or spacing scaling by az_looks/rg_looks.
         //
         // terrain_correction reads:
         //   - azimuth_time_interval_s  from scene.sub_swaths[0]  (NOT merged)
         //   - range_pixel_spacing_m    from merged
         //   - near_slant_range_time_s  from merged
         //   - azimuth_start_time       from merged
-        //
-        // So: build a synthetic MergedSigma0 with multi-looked spacing, and
-        // clone SceneMetadata with all subswath ati_s scaled by az_looks.
 
         let ref_ati_s = ref_sw.azimuth_time_interval_s;
         let rg_delta_tau = 2.0 * ref_sw.range_pixel_spacing_m / SPEED_OF_LIGHT_M_S;
 
-        // Center of the first azimuth window.
-        let az_center_offset_us = ((opts.az_looks - 1) as f64 * 0.5 * ref_ati_s * 1e6) as i64;
-        let ml_az_start = ref_first_utc
-            + chrono::Duration::microseconds(az_center_offset_us);
-
-        // Two-way slant-range time to the center of the first range window.
-        let rg_center_offset_tau = (opts.rg_looks - 1) as f64 * 0.5 * rg_delta_tau;
+        // Full-resolution timing: identical to the reference SLC.
+        let ml_az_start = ref_first_utc;
         let ml_near_tau = ref_sw.slant_range_time_s
-            + coreg.ref_data.valid_sample_offset as f64 * rg_delta_tau
-            + rg_center_offset_tau;
-
-        let ml_rps_m = ref_sw.range_pixel_spacing_m * opts.rg_looks as f64;
-        let ml_rps_s = rg_delta_tau * opts.rg_looks as f64;
+            + coreg.ref_data.valid_sample_offset as f64 * rg_delta_tau;
+        let ml_rps_m = ref_sw.range_pixel_spacing_m;
+        let ml_rps_s = rg_delta_tau;
 
         let n_coh = igram.lines * igram.samples;
         let coh_merged = MergedSigma0 {
@@ -1204,16 +1187,11 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
             cal_lut_extrapolation_gap_px: 0,
             noise_lut_extrapolation_gap_px: 0,
             azimuth_start_time: ml_az_start,
-            azimuth_time_interval_s: ref_ati_s * opts.az_looks as f64,
+            azimuth_time_interval_s: ref_ati_s,
         };
 
-        // Clone scene metadata and scale every subswath's ati_s by az_looks,
-        // so that terrain_correction maps multi-looked line indices to the
-        // correct azimuth times.
-        let mut ml_scene = ref_scene.clone();
-        for sw in &mut ml_scene.sub_swaths {
-            sw.azimuth_time_interval_s *= opts.az_looks as f64;
-        }
+        // Full-resolution sliding boxcar: no subswath ATI scaling needed.
+        let ml_scene = ref_scene.clone();
 
         // ── Terrain correction (coherence) ────────────────────────────────────
         tracing::info!("geocoding {:?} coherence …", iw_id);
@@ -1286,7 +1264,7 @@ pub fn run_insar(opts: &InsarOptions) -> Result<()> {
                 cal_lut_extrapolation_gap_px: 0,
                 noise_lut_extrapolation_gap_px: 0,
                 azimuth_start_time: ml_az_start,
-                azimuth_time_interval_s: ref_ati_s * opts.az_looks as f64,
+                azimuth_time_interval_s: ref_ati_s,
             };
             let phase_geocoded = terrain_correction(
                 &phase_merged, &ml_scene, &dem, &iw_grids, &tc_cfg,

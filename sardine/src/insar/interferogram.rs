@@ -361,11 +361,11 @@ pub fn form_interferogram(
         .enumerate()
         .for_each(|(li, coh_row)| {
             let l0 = li.saturating_sub(az_half);
-            let l1 = (li + az_half + 1).min(lines);
+            let l1 = (li + cfg.az_looks - az_half).min(lines);
 
             for ci in 0..samples {
                 let c0 = ci.saturating_sub(rg_half);
-                let c1 = (ci + rg_half + 1).min(samples);
+                let c1 = (ci + cfg.rg_looks - rg_half).min(samples);
 
                 let mut sum_ig_re = 0.0_f64;
                 let mut sum_ig_im = 0.0_f64;
@@ -377,7 +377,7 @@ pub fn form_interferogram(
                         let wi = wl * samples + wc;
                         // Skip non-finite pixels (e.g. from noise subtraction)
                         // rather than letting NaN contaminate the whole window.
-                        if !igram_re[wi].is_finite() {
+                        if !igram_re[wi].is_finite() || !igram_im[wi].is_finite() {
                             continue;
                         }
                         sum_ig_re += igram_re[wi] as f64;
@@ -405,23 +405,27 @@ pub fn form_interferogram(
             .enumerate()
             .for_each(|(li, phase_row)| {
                 let l0 = li.saturating_sub(az_half);
-                let l1 = (li + az_half + 1).min(lines);
+                let l1 = (li + cfg.az_looks - az_half).min(lines);
                 for ci in 0..samples {
                     let c0 = ci.saturating_sub(rg_half);
-                    let c1 = (ci + rg_half + 1).min(samples);
+                    let c1 = (ci + cfg.rg_looks - rg_half).min(samples);
                     let mut sum_ig_re = 0.0_f64;
                     let mut sum_ig_im = 0.0_f64;
                     for wl in l0..l1 {
                         for wc in c0..c1 {
                             let wi = wl * samples + wc;
-                            if !igram_re[wi].is_finite() {
+                            if !igram_re[wi].is_finite() || !igram_im[wi].is_finite() {
                                 continue;
                             }
                             sum_ig_re += igram_re[wi] as f64;
                             sum_ig_im += igram_im[wi] as f64;
                         }
                     }
-                    phase_row[ci] = sum_ig_im.atan2(sum_ig_re) as f32;
+                    phase_row[ci] = if sum_ig_re != 0.0 || sum_ig_im != 0.0 {
+                        sum_ig_im.atan2(sum_ig_re) as f32
+                    } else {
+                        f32::NAN  // zero-power window — flag as invalid
+                    };
                 }
             });
     }
