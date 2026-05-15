@@ -46,6 +46,8 @@
 //! outside all swath extents) are filled with `f32::NAN`.
 
 use crate::apply_calibration::Sigma0Array;
+use crate::apply_calibration::CalibratedComplexArray;
+use crate::polsar::MergedC2;
 use crate::types::SubSwathMetadata;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
@@ -466,6 +468,252 @@ pub fn merge_subswaths(inputs: &[SwathInput<'_>]) -> Result<MergedSigma0, MergeE
             .map(|s| s.azimuth_start_time)
             .min()
             .unwrap_or_else(|| inputs[0].azimuth_start_time), // SAFETY-OK: single-swath early return and EmptyInputs check guarantee inputs.len() >= 2 at this point; .min() always returns Some; this branch is unreachable at runtime
+        azimuth_time_interval_s: inputs[0].swath.azimuth_time_interval_s,
+    })
+}
+
+// ─── C2 types and merge ───────────────────────────────────────────────────────
+
+/// Per-subswath C2 data: the four independent real components of the Hermitian
+/// 2×2 covariance matrix at full SLC resolution (before multilooking).
+///
+/// Built from [`build_c2_from_complex`] and passed into [`merge_c2_subswaths`].
+pub struct C2SubswathData {
+    pub c11: Vec<f32>,
+    pub c22: Vec<f32>,
+    pub c12_re: Vec<f32>,
+    pub c12_im: Vec<f32>,
+    pub lines: usize,
+    pub samples: usize,
+    /// Column offset: these arrays start at TIFF column `valid_sample_offset`.
+    pub valid_sample_offset: usize,
+}
+
+/// One input to the C2 merge: a per-subswath covariance matrix paired with
+/// its subswath geometry metadata.
+pub struct C2SwathInput<'a> {
+    pub c2: &'a C2SubswathData,
+    pub swath: &'a SubSwathMetadata,
+    pub azimuth_start_time: DateTime<Utc>,
+}
+
+/// Build per-pixel C2 covariance components from co-registered complex VV and VH arrays.
+///
+/// Both inputs must have the same `lines`, `samples`, and `valid_sample_offset`.
+///
+/// Computes per pixel:
+/// ```text
+/// c11    = max(|Svv|² − NESZ_vv, 0)
+/// c22    = max(|Svh|² − NESZ_vh, 0)
+/// c12_re = Re[Svv · Svh*] = I_vv·I_vh + Q_vv·Q_vh
+/// c12_im = Im[Svv · Svh*] = Q_vv·I_vh − I_vv·Q_vh
+/// ```
+pub fn build_c2_from_complex(
+    vv: &CalibratedComplexArray,
+    vh: &CalibratedComplexArray,
+) -> C2SubswathData {
+    debug_assert_eq!(vv.lines, vh.lines);
+    debug_assert_eq!(vv.samples, vh.samples);
+    debug_assert_eq!(vv.valid_sample_offset, vh.valid_sample_offset);
+
+    let n = vv.lines * vv.samples;
+    let mut c11 = vec![0.0f32; n];
+    let mut c22 = vec![0.0f32; n];
+    let mut c12_re = vec![0.0f32; n];
+    let mut c12_im = vec![0.0f32; n];
+
+    c11.par_iter_mut()
+        .zip(c22.par_iter_mut())
+        .zip(c12_re.par_iter_mut())
+        .zip(c12_im.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, (((c11v, c22v), c12rv), c12iv))| {
+            let [vi, vq] = vv.data[i];
+            let [hi, hq] = vh.data[i];
+            let nesz_vv = vv.nesz[i];
+            let nesz_vh = vh.nesz[i];
+            *c11v = (vi * vi + vq * vq - nesz_vv).max(0.0);
+            *c22v = (hi * hi + hq * hq - nesz_vh).max(0.0);
+            *c12rv = vi * hi + vq * hq;
+            *c12iv = vq * hi - vi * hq;
+        });
+
+    C2SubswathData {
+        c11,
+        c22,
+        c12_re,
+        c12_im,
+        lines: vv.lines,
+        samples: vv.samples,
+        valid_sample_offset: vv.valid_sample_offset,
+    }
+}
+
+/// Merge per-subswath C2 data into a single slant-range C2 image.
+///
+/// Follows the same geometry (integer-offset seam at midpoint of overlap) as
+/// [`merge_subswaths`].  Inputs must be ordered by increasing near-range slant
+/// time (IW1, IW2, IW3).
+pub fn merge_c2_subswaths(inputs: &[C2SwathInput<'_>]) -> Result<MergedC2, MergeError> {
+    if inputs.is_empty() {
+        return Err(MergeError::EmptyInputs);
+    }
+
+    if inputs.len() == 1 {
+        let inp = &inputs[0];
+        if inp.c2.samples == 0 {
+            return Err(MergeError::EmptySwath { idx: 0 });
+        }
+        let rps_m = inp.swath.range_pixel_spacing_m;
+        let dt = rps_m * 2.0 / SPEED_OF_LIGHT_M_S;
+        let near = inp.swath.slant_range_time_s + inp.c2.valid_sample_offset as f64 * dt;
+        return Ok(MergedC2 {
+            c11: inp.c2.c11.clone(),
+            c22: inp.c2.c22.clone(),
+            c12_re: inp.c2.c12_re.clone(),
+            c12_im: inp.c2.c12_im.clone(),
+            lines: inp.c2.lines,
+            samples: inp.c2.samples,
+            near_slant_range_time_s: near,
+            range_pixel_spacing_s: dt,
+            range_pixel_spacing_m: rps_m,
+            azimuth_start_time: inp.azimuth_start_time,
+            azimuth_time_interval_s: inp.swath.azimuth_time_interval_s,
+        });
+    }
+
+    let rps_m = inputs[0].swath.range_pixel_spacing_m;
+    for (idx, sw) in inputs.iter().enumerate().skip(1) {
+        let rps = sw.swath.range_pixel_spacing_m;
+        if (rps - rps_m).abs() > 1e-3 {
+            return Err(MergeError::InconsistentPixelSpacing { first: rps_m, idx, found: rps });
+        }
+    }
+    for (idx, inp) in inputs.iter().enumerate() {
+        if inp.c2.samples == 0 {
+            return Err(MergeError::EmptySwath { idx });
+        }
+    }
+
+    let dt = rps_m * 2.0 / SPEED_OF_LIGHT_M_S;
+
+    let sw_start_times: Vec<f64> = inputs
+        .iter()
+        .map(|inp| inp.swath.slant_range_time_s + inp.c2.valid_sample_offset as f64 * dt)
+        .collect();
+    let t_out_start = sw_start_times[0];
+    let sw_out_offsets: Vec<i64> = sw_start_times
+        .iter()
+        .map(|&t| ((t - t_out_start) / dt).round() as i64)
+        .collect();
+    let sw_out_ends: Vec<i64> = inputs
+        .iter()
+        .zip(sw_out_offsets.iter())
+        .map(|(inp, &off)| off + inp.c2.samples as i64)
+        .collect();
+    let out_cols_i64 = *sw_out_ends.last().unwrap();
+    if out_cols_i64 <= 0 {
+        return Err(MergeError::NegativeOutputColumns { value: out_cols_i64 });
+    }
+    let out_cols = out_cols_i64 as usize;
+
+    let mut seams: Vec<usize> = Vec::with_capacity(inputs.len() - 1);
+    for i in 0..inputs.len() - 1 {
+        let seam = ((sw_out_ends[i] + sw_out_offsets[i + 1]) / 2) as usize;
+        seams.push(seam);
+    }
+
+    let out_lines = inputs.iter().map(|inp| inp.c2.lines).min().unwrap();
+
+    struct C2FillRange {
+        col_end: usize,
+        valid_out_start: usize,
+        valid_out_end: usize,
+        in_start: usize,
+    }
+
+    let fill_ranges: Vec<C2FillRange> = inputs
+        .iter()
+        .enumerate()
+        .map(|(sw_idx, inp)| {
+            let col_start: usize = if sw_idx == 0 { 0 } else { seams[sw_idx - 1] };
+            let col_end: usize = if sw_idx == inputs.len() - 1 { out_cols } else { seams[sw_idx] };
+            let off = sw_out_offsets[sw_idx] as usize;
+            let valid_out_start = col_start.max(off);
+            let valid_out_end = col_end.min(off.saturating_add(inp.c2.samples));
+            let in_start = valid_out_start.saturating_sub(off);
+            C2FillRange { col_end, valid_out_start, valid_out_end, in_start }
+        })
+        .collect();
+
+    let n = out_lines * out_cols;
+    let mut out_c11: Vec<f32> = vec![f32::NAN; n];
+    let mut out_c22: Vec<f32> = vec![f32::NAN; n];
+    let mut out_c12_re: Vec<f32> = vec![f32::NAN; n];
+    let mut out_c12_im: Vec<f32> = vec![f32::NAN; n];
+
+    out_c11
+        .par_chunks_mut(out_cols)
+        .zip(out_c22.par_chunks_mut(out_cols))
+        .zip(out_c12_re.par_chunks_mut(out_cols))
+        .zip(out_c12_im.par_chunks_mut(out_cols))
+        .enumerate()
+        .for_each(|(out_line, (((row_c11, row_c22), row_c12_re), row_c12_im))| {
+            let mut fill_end = 0usize;
+            for (sw_idx, inp) in inputs.iter().enumerate() {
+                let fr = &fill_ranges[sw_idx];
+                // NaN-fill gap before valid data.
+                if fill_end < fr.valid_out_start {
+                    row_c11[fill_end..fr.valid_out_start].fill(f32::NAN);
+                    row_c22[fill_end..fr.valid_out_start].fill(f32::NAN);
+                    row_c12_re[fill_end..fr.valid_out_start].fill(f32::NAN);
+                    row_c12_im[fill_end..fr.valid_out_start].fill(f32::NAN);
+                }
+                if fr.valid_out_start < fr.valid_out_end {
+                    let n_copy = fr.valid_out_end - fr.valid_out_start;
+                    let base = out_line * inp.c2.samples + fr.in_start;
+                    row_c11[fr.valid_out_start..fr.valid_out_end]
+                        .copy_from_slice(&inp.c2.c11[base..base + n_copy]);
+                    row_c22[fr.valid_out_start..fr.valid_out_end]
+                        .copy_from_slice(&inp.c2.c22[base..base + n_copy]);
+                    row_c12_re[fr.valid_out_start..fr.valid_out_end]
+                        .copy_from_slice(&inp.c2.c12_re[base..base + n_copy]);
+                    row_c12_im[fr.valid_out_start..fr.valid_out_end]
+                        .copy_from_slice(&inp.c2.c12_im[base..base + n_copy]);
+                }
+                // NaN-fill gap after valid data within owned range.
+                let after_valid = fr.valid_out_end;
+                if after_valid < fr.col_end {
+                    row_c11[after_valid..fr.col_end].fill(f32::NAN);
+                    row_c22[after_valid..fr.col_end].fill(f32::NAN);
+                    row_c12_re[after_valid..fr.col_end].fill(f32::NAN);
+                    row_c12_im[after_valid..fr.col_end].fill(f32::NAN);
+                }
+                fill_end = fr.col_end;
+            }
+            if fill_end < out_cols {
+                row_c11[fill_end..out_cols].fill(f32::NAN);
+                row_c22[fill_end..out_cols].fill(f32::NAN);
+                row_c12_re[fill_end..out_cols].fill(f32::NAN);
+                row_c12_im[fill_end..out_cols].fill(f32::NAN);
+            }
+        });
+
+    Ok(MergedC2 {
+        c11: out_c11,
+        c22: out_c22,
+        c12_re: out_c12_re,
+        c12_im: out_c12_im,
+        lines: out_lines,
+        samples: out_cols,
+        near_slant_range_time_s: t_out_start,
+        range_pixel_spacing_s: dt,
+        range_pixel_spacing_m: rps_m,
+        azimuth_start_time: inputs
+            .iter()
+            .map(|s| s.azimuth_start_time)
+            .min()
+            .unwrap_or_else(|| inputs[0].azimuth_start_time),
         azimuth_time_interval_s: inputs[0].swath.azimuth_time_interval_s,
     })
 }

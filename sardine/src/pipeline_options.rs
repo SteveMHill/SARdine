@@ -38,6 +38,8 @@ pub enum OutputMode {
     Rtc,
     /// RTC with mandatory LIA, quality mask, and STAC sidecars (NRB profile).
     Nrb,
+    /// Dual-pol H/A/Alpha Cloude–Pottier decomposition (three geocoded bands).
+    Polsar,
 }
 
 impl Default for OutputMode {
@@ -777,8 +779,9 @@ pub fn parse_output_mode(s: &str) -> Result<OutputMode> {
         "rtc" => Ok(OutputMode::Rtc),
         "grd" => Ok(OutputMode::Grd),
         "nrb" => Ok(OutputMode::Nrb),
+        "polsar" => Ok(OutputMode::Polsar),
         other => bail!(
-            "unknown mode '{}'; expected 'rtc', 'grd', or 'nrb'",
+            "unknown mode '{}'; expected 'rtc', 'grd', 'nrb', or 'polsar'",
             other
         ),
     }

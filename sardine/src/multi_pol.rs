@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 
 use crate::pipeline_options::{derive_pol_output_path, parse_polarizations, GrdOptions,
-    InsarOptions, ProcessOptions};
+    InsarOptions, OutputMode, ProcessOptions};
 
 /// Multi-polarization wrapper around [`crate::run::run_process`].
 ///
@@ -17,6 +17,12 @@ use crate::pipeline_options::{derive_pol_output_path, parse_polarizations, GrdOp
 /// Each per-pol invocation writes its own `.provenance.json`,
 /// `.lia.tif`, and `.mask.tif` sidecars next to its own raster.
 pub fn run_process_multi(opts: &ProcessOptions) -> Result<()> {
+    // Polsar mode: dispatch to the dedicated dual-pol decomposition pipeline.
+    // It consumes both polarizations jointly and does not use the per-pol loop.
+    if opts.mode == OutputMode::Polsar {
+        return crate::run_polsar::run_polsar(opts);
+    }
+
     let pols = parse_polarizations(&opts.polarization)?;
     if pols.len() == 1 {
         // Single-pol fast path: keep the user's output path exactly as given.

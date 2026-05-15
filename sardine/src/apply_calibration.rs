@@ -595,6 +595,156 @@ pub fn apply_calibration(
     })
 }
 
+// ─── Complex calibration ──────────────────────────────────────────────────────
+
+/// Calibrated complex SLC samples for one debursted subswath.
+///
+/// Each element is `[I/K, Q/K]` where `K` is the sigma-nought calibration
+/// LUT value at that pixel.  Dividing by `K` (not `K²`) keeps the data
+/// complex so that cross-polarisation products `S_vv · S_vh*` can be formed
+/// downstream.
+///
+/// The NESZ array stores `N / K²` per pixel — the same noise floor used by
+/// [`Sigma0Array`] — for noise removal on the diagonal C2 elements.
+pub struct CalibratedComplexArray {
+    /// Calibrated [I, Q] samples. Length = `lines × samples`.
+    pub data: Vec<[f32; 2]>,
+    /// Number of azimuth lines.
+    pub lines: usize,
+    /// Number of range samples.
+    pub samples: usize,
+    /// Column offset: output col 0 = TIFF col `valid_sample_offset`.
+    pub valid_sample_offset: usize,
+    /// Per-pixel NESZ = N/K² (same units and layout as [`Sigma0Array::nesz`]).
+    pub nesz: Vec<f32>,
+}
+
+/// Per-column kernel: scale CInt16 [i, q] by 1/K and write [f32; 2].
+/// Also write NESZ = noise * az_factor / K².
+#[inline(always)]
+fn apply_cal_complex_row(
+    in_row: &[[i16; 2]],
+    noise: &[f32],
+    k: &[f32],
+    az_factor: f32,
+    out: &mut [[f32; 2]],
+    nesz: &mut [f32],
+) {
+    debug_assert_eq!(in_row.len(), noise.len());
+    debug_assert_eq!(in_row.len(), k.len());
+    debug_assert_eq!(in_row.len(), out.len());
+    debug_assert_eq!(in_row.len(), nesz.len());
+    for idx in 0..in_row.len() {
+        let [i, q] = in_row[idx];
+        let kv = k[idx];
+        if kv > 0.0 {
+            let inv_k = 1.0 / kv;
+            out[idx] = [i as f32 * inv_k, q as f32 * inv_k];
+            nesz[idx] = noise[idx] * az_factor * inv_k * inv_k;
+        } else {
+            out[idx] = [0.0, 0.0];
+            nesz[idx] = 0.0;
+        }
+    }
+}
+
+/// Apply radiometric calibration to a debursted subswath, retaining complex phase.
+///
+/// Produces calibrated `[I/K, Q/K]` per pixel and the per-pixel NESZ `N/K²`.
+/// The argument contract is identical to [`apply_calibration`].
+pub fn apply_calibration_complex(
+    deburst: &DeburstArray,
+    cal: &SwathCalibration,
+    noise: &SwathNoise,
+    tiff_line_origin: usize,
+) -> Result<CalibratedComplexArray, CalibrationError> {
+    if cal.vectors.is_empty() {
+        return Err(CalibrationError::NoCalibrationVectors);
+    }
+    if noise.range_vectors.is_empty() {
+        return Err(CalibrationError::NoNoiseRangeVectors);
+    }
+
+    let out_lines = deburst.lines;
+    let out_cols = deburst.samples;
+    let col_offset = deburst.valid_sample_offset;
+
+    let cal_lines: Vec<i64> = cal.vectors.iter().map(|v| v.line as i64).collect();
+    let cal_pixels: Vec<&[u32]> = cal.vectors.iter().map(|v| v.pixels.as_slice()).collect();
+    let cal_values: Vec<&[f32]> = cal.vectors.iter().map(|v| v.sigma_nought.as_slice()).collect();
+
+    let nr_lines: Vec<i64> = noise.range_vectors.iter().map(|v| v.line as i64).collect();
+    let nr_pixels: Vec<&[u32]> = noise.range_vectors.iter().map(|v| v.pixels.as_slice()).collect();
+    let nr_values: Vec<&[f32]> = noise.range_vectors.iter().map(|v| v.noise_range_lut.as_slice()).collect();
+
+    debug_assert!(
+        noise.azimuth_vectors.len() <= 1,
+        "expected at most 1 azimuth noise vector, got {}",
+        noise.azimuth_vectors.len()
+    );
+    let az_noise_available = !noise.azimuth_vectors.is_empty();
+    let az_lines: Vec<i64>;
+    let az_values: &[f32];
+    if az_noise_available {
+        let av = &noise.azimuth_vectors[0];
+        az_lines = av.lines.iter().map(|&l| l as i64).collect();
+        az_values = &av.noise_azimuth_lut;
+    } else {
+        az_lines = Vec::new();
+        az_values = &[];
+    }
+
+    let n = out_lines * out_cols;
+    let mut out: Vec<[f32; 2]> = vec![[0.0, 0.0]; n];
+    let mut nesz_out: Vec<f32> = vec![0.0; n];
+
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH_COMPLEX: RefCell<[Vec<f32>; 2]> = RefCell::new(
+            [Vec::new(), Vec::new()]
+        );
+    }
+
+    out.par_chunks_mut(out_cols)
+        .zip(nesz_out.par_chunks_mut(out_cols))
+        .enumerate()
+        .for_each(|(out_line, (out_row, nesz_row))| {
+            let tiff_line = (tiff_line_origin + out_line) as i64;
+
+            SCRATCH_COMPLEX.with(|cell| {
+                let mut bufs = cell.borrow_mut();
+                let [k_row, nr_row] = &mut *bufs;
+                k_row.resize(out_cols, 0.0f32);
+                nr_row.resize(out_cols, 0.0f32);
+
+                bilinear_row_into(
+                    &cal_lines, &cal_pixels, &cal_values, tiff_line, col_offset, k_row,
+                );
+                bilinear_row_into(
+                    &nr_lines, &nr_pixels, &nr_values, tiff_line, col_offset, nr_row,
+                );
+
+                let az_factor = if az_noise_available && !az_lines.is_empty() {
+                    let (lo, hi) = bracket_azimuth(&az_lines, tiff_line);
+                    interp_azimuth(az_lines[lo], az_lines[hi], az_values[lo], az_values[hi], tiff_line)
+                } else {
+                    1.0
+                };
+
+                let in_row = &deburst.data[out_line * out_cols..(out_line + 1) * out_cols];
+                apply_cal_complex_row(in_row, nr_row, k_row, az_factor, out_row, nesz_row);
+            });
+        });
+
+    Ok(CalibratedComplexArray {
+        data: out,
+        lines: out_lines,
+        samples: out_cols,
+        valid_sample_offset: col_offset,
+        nesz: nesz_out,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
