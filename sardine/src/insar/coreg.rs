@@ -473,18 +473,29 @@ fn sec_deburst_valid_offset(sec_swath: &SubSwathMetadata, _ref_swath: &SubSwathM
 
 /// Bilinearly interpolate the secondary Deramped SLC at floating-point
 /// coordinates (l, c).  Returns `[0.0, 0.0]` for out-of-bounds coordinates.
+///
+/// When (l, c) falls exactly on the last row or column of the image, `l1`
+/// and `c1` are clamped to the boundary rather than returning zero.  Without
+/// clamping, a pixel at `l == sec.lines - 1` (or `c == sec.samples - 1`)
+/// would be treated as out-of-bounds and return `[0.0, 0.0]`, introducing a
+/// spurious zero phase at the image boundary.
 fn bilinear(sec: &Deramped, l: f64, c: f64) -> [f32; 2] {
     if l < 0.0 || c < 0.0 {
         return [0.0, 0.0];
     }
     let l0 = l.floor() as usize;
     let c0 = c.floor() as usize;
-    let l1 = l0 + 1;
-    let c1 = c0 + 1;
 
-    if l1 >= sec.lines || c1 >= sec.samples {
+    // True out-of-bounds: l0 or c0 is beyond the last valid pixel.
+    if l0 >= sec.lines || c0 >= sec.samples {
         return [0.0, 0.0];
     }
+
+    // Clamp l1/c1 to the boundary so pixels at the last row/column
+    // are handled by extrapolation (repeating the edge value) instead
+    // of being returned as zero.
+    let l1 = (l0 + 1).min(sec.lines - 1);
+    let c1 = (c0 + 1).min(sec.samples - 1);
 
     let wl = (l - l0 as f64) as f32;
     let wc = (c - c0 as f64) as f32;

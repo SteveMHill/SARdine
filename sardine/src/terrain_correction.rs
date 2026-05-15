@@ -874,12 +874,20 @@ fn bicubic_sample_slice(
         let row = (l_floor + li).clamp(0, max_l) as usize;
         let wl = keys_weight(li as f64 - dl);
         for si in -1_isize..=2 {
+            let ws = keys_weight(si as f64 - ds);
+            let w = wl * ws;
+            // Skip zero-weight taps without reading the pixel value.
+            // When dl == 0.0 exactly, the tap at li == 2 has keys_weight(2.0) = 0.0
+            // and should not propagate NaN even if the clamped border pixel is nodata.
+            if w == 0.0 {
+                continue;
+            }
             let col = (s_floor + si).clamp(0, max_s) as usize;
             let v = data[row * n_samples + col];
             if v.is_nan() {
                 return f32::NAN;
             }
-            acc += v as f64 * wl * keys_weight(si as f64 - ds);
+            acc += v as f64 * w;
         }
     }
     acc as f32
@@ -992,12 +1000,19 @@ fn lanczos_sample_slice(
         let row = (l_floor + li).clamp(0, max_l) as usize;
         let wl = lanczos_weight(line - (l_floor + li) as f64);
         for si in -2_isize..=3 {
+            let ws = lanczos_weight(sample - (s_floor + si) as f64);
+            let w = wl * ws;
+            // Skip zero-weight taps (li==3 when dl==0.0 gives lanczos_weight(-3.0)==0.0).
+            // Avoids propagating NaN from clamped border pixels that have zero weight.
+            if w == 0.0 {
+                continue;
+            }
             let col = (s_floor + si).clamp(0, max_s) as usize;
             let v = data[row * n_samples + col];
             if v.is_nan() {
                 return f32::NAN;
             }
-            acc += v as f64 * wl * lanczos_weight(sample - (s_floor + si) as f64);
+            acc += v as f64 * w;
         }
     }
     acc as f32
