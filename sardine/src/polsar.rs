@@ -227,14 +227,17 @@ pub fn multilook_c2(c2: &MergedC2, rg_looks: usize, az_looks: usize) -> MergedC2
                     for rl in 0..rg_looks {
                         let in_s = out_s * rg_looks + rl;
                         let idx = in_l * c2.samples + in_s;
-                        let v = c2.c11[idx];
-                        if v.is_nan() {
+                        let c11 = c2.c11[idx];
+                        let c22 = c2.c22[idx];
+                        let c12_re = c2.c12_re[idx];
+                        let c12_im = c2.c12_im[idx];
+                        if c11.is_nan() || c22.is_nan() || c12_re.is_nan() || c12_im.is_nan() {
                             continue;
                         }
-                        sum_c11 += v as f64;
-                        sum_c22 += c2.c22[idx] as f64;
-                        sum_c12_re += c2.c12_re[idx] as f64;
-                        sum_c12_im += c2.c12_im[idx] as f64;
+                        sum_c11 += c11 as f64;
+                        sum_c22 += c22 as f64;
+                        sum_c12_re += c12_re as f64;
+                        sum_c12_im += c12_im as f64;
                         count += 1;
                     }
                 }

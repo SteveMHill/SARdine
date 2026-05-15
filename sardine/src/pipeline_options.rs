@@ -149,6 +149,14 @@ pub trait RadarImage: Send + Sync {
 
     /// Range pixel spacing in metres (slant-range domain).
     fn range_pixel_spacing_m(&self) -> f64;
+
+    /// Azimuth time interval between successive lines (seconds).
+    ///
+    /// For a full-resolution image this is the native burst ATI (~14.4 ms for
+    /// Sentinel-1 IW).  For a multilooked image this is `native_ati × az_looks`.
+    /// Used by [`crate::terrain_correction`] to convert a line index to an
+    /// absolute UTC time.
+    fn azimuth_time_interval_s(&self) -> f64;
 }
 
 /// Plain (non-clap) input set for [`crate::run::run_process`].

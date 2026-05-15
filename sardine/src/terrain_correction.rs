@@ -703,15 +703,23 @@ impl RadarGeometry {
         merged: &dyn RadarImage,
     ) -> Result<Self, TerrainCorrectionError> {
         // All IW subswaths share the same azimuth time interval to within
-        // numerical precision; pick the first available subswath.
-        let first_sw = scene
+        // numerical precision; pick the first available subswath only to
+        // verify the scene metadata is non-empty.
+        let _first_sw = scene
             .sub_swaths
             .first()
             .ok_or(TerrainCorrectionError::NoSubSwaths)?;
-        let ati = first_sw.azimuth_time_interval_s;
+
+        // Read the ATI from the *merged image*, not from the scene subswath
+        // metadata.  After apply_multilook, merged.azimuth_time_interval_s is
+        // already scaled by az_looks (native_ati × az_looks), which is
+        // required for correct line-to-time mapping when az_multilook > 1.
+        // For full-resolution images (az_multilook == 1) the two values are
+        // identical.
+        let ati = merged.azimuth_time_interval_s();
         if !ati.is_finite() || ati <= 0.0 {
             return Err(TerrainCorrectionError::Config(format!(
-                "invalid azimuth_time_interval_s in subswath metadata: {ati}"
+                "invalid azimuth_time_interval_s from merged image: {ati}"
             )));
         }
 
@@ -930,6 +938,10 @@ impl RadarImage for MergedSigma0 {
 
     fn range_pixel_spacing_m(&self) -> f64 {
         self.range_pixel_spacing_m
+    }
+
+    fn azimuth_time_interval_s(&self) -> f64 {
+        self.azimuth_time_interval_s
     }
 }
 
@@ -2873,6 +2885,7 @@ mod tests {
             fn azimuth_start_time(&self) -> chrono::DateTime<chrono::Utc> { Utc::now() }
             fn near_slant_range_time_s(&self) -> f64 { 0.005 }
             fn range_pixel_spacing_m(&self) -> f64 { 2.33 }
+            fn azimuth_time_interval_s(&self) -> f64 { 0.002 }
         }
         let img = ConstantImage(3.0);
         assert!(img.nesz_at(0.0, 0.0).is_none());
