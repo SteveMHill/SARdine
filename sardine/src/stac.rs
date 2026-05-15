@@ -453,6 +453,183 @@ pub fn write_insar_stac_item(input: &InsarStacInput<'_>, path: &Path) -> Result<
     Ok(())
 }
 
+// ─── PolSAR STAC writer ──────────────────────────────────────────────────────
+
+/// Inputs to [`write_polsar_stac_item`].  Constructed by `run_polsar` from the
+/// geocoded H-band output — all three bands share the same CRS and dimensions.
+pub struct PolsarStacInput<'a> {
+    /// Scene product ID (e.g. `"S1B_IW_SLC__1SDV_20190123T053348…"`).
+    pub product_id: &'a str,
+    /// Platform string, lower-case (e.g. `"sentinel-1b"`).
+    pub platform: &'a str,
+    /// Co-pol channel label, upper-case (e.g. `"VV"`).
+    pub pol_co: &'a str,
+    /// Cross-pol channel label, upper-case (e.g. `"VH"`).
+    pub pol_cross: &'a str,
+    /// Scene start UTC as RFC 3339 string.
+    pub scene_start_utc: &'a str,
+    /// Scene stop UTC as RFC 3339 string.
+    pub scene_stop_utc: &'a str,
+    /// Azimuth multilook factor applied to the C2 covariance matrix.
+    pub az_looks: usize,
+    /// Range multilook factor applied to the C2 covariance matrix.
+    pub rg_looks: usize,
+    /// Output CRS EPSG code (same for all three bands).
+    pub crs_epsg: u32,
+    /// GDAL geotransform of the geocoded output (same for all three bands).
+    pub geotransform: [f64; 6],
+    /// Raster width in pixels.
+    pub cols: usize,
+    /// Raster height in pixels.
+    pub rows: usize,
+    /// `true` when a POEORB file was supplied.
+    pub orbit_is_poeorb: bool,
+    /// Acquisition mode, lower-case (e.g. `"iw"`).
+    pub acquisition_mode: &'a str,
+    /// DEM source identifier (e.g. `"srtm1"`).
+    pub dem_source: &'a str,
+    /// Geoid model spec (e.g. `"auto"`, `"zero"`, or a file path).
+    pub geoid_spec: &'a str,
+    /// Orbit pass direction (`"ascending"` or `"descending"`).
+    pub orbit_pass_direction: &'a str,
+    /// Absolute orbit number.
+    pub absolute_orbit_number: u32,
+    /// Filesystem path of the entropy (H) GeoTIFF.
+    pub h_path: &'a str,
+    /// Filesystem path of the anisotropy (A) GeoTIFF.
+    pub a_path: &'a str,
+    /// Filesystem path of the mean-alpha (α) GeoTIFF.
+    pub alpha_path: &'a str,
+}
+
+/// Generate and write a STAC 1.0.0 Feature item for a PolSAR H/A/Alpha output.
+///
+/// The item ID is `<product_id>_polsar_<pol_co>+<pol_cross>`.
+/// Assets include `entropy` (H), `anisotropy` (A), and `mean_alpha` (α).
+/// The bounding box is derived from the geocoded geotransform.
+///
+/// The `path` argument is the destination file (e.g. `<output>.polsar.stac.json`).
+pub fn write_polsar_stac_item(
+    input: &PolsarStacInput<'_>,
+    path: &Path,
+) -> Result<(), StacError> {
+    let bbox = compute_wgs84_bbox_from_gt(
+        input.geotransform,
+        input.cols,
+        input.rows,
+        input.crs_epsg,
+    )?;
+    let [west, south, east, north] = bbox;
+
+    let ring = vec![
+        [west, south],
+        [east, south],
+        [east, north],
+        [west, north],
+        [west, south],
+    ];
+
+    let item_id = format!(
+        "{}_polsar_{}+{}",
+        input.product_id,
+        input.pol_co,
+        input.pol_cross,
+    );
+
+    let properties = StacProperties {
+        datetime: input.scene_start_utc.to_owned(),
+        start_datetime: input.scene_start_utc.to_owned(),
+        end_datetime: input.scene_stop_utc.to_owned(),
+        platform: input.platform.to_owned(),
+        instruments: vec!["c-sar"],
+        sar_instrument_mode: input.acquisition_mode.to_uppercase(),
+        sar_frequency_band: "C",
+        sar_center_frequency: 5.405,
+        sar_observation_direction: "right",
+        sar_polarizations: vec![
+            input.pol_co.to_owned(),
+            input.pol_cross.to_owned(),
+        ],
+        sar_product_type: "PolSAR".to_owned(),
+        sar_looks_range: input.rg_looks,
+        sar_looks_azimuth: input.az_looks,
+        sar_pixel_spacing_range: None,
+        sar_pixel_spacing_azimuth: None,
+        proj_epsg: Some(input.crs_epsg),
+        sat_orbit_state: Some(input.orbit_pass_direction.to_owned()),
+        sat_absolute_orbit: Some(input.absolute_orbit_number),
+        sardine_version: env!("CARGO_PKG_VERSION").to_owned(),
+        sardine_orbit_source: if input.orbit_is_poeorb {
+            "poeorb"
+        } else {
+            "annotation"
+        }
+        .to_owned(),
+        processing_software: serde_json::json!({ "sardine": env!("CARGO_PKG_VERSION") }),
+        processing_level: "L2",
+        sardine_dem_source: infer_dem_source(input.dem_source),
+        sardine_geoid: infer_geoid_name(input.geoid_spec),
+        sardine_terrain_flattening: Some(false),
+        sardine_noise_floor_db: 0.0,
+    };
+
+    let mut assets: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    assets.insert(
+        "entropy".to_owned(),
+        stac_asset(
+            input.h_path,
+            "image/tiff; application=geotiff",
+            "Polarimetric entropy H ∈ [0, 1]",
+            &["data"],
+        ),
+    );
+    assets.insert(
+        "anisotropy".to_owned(),
+        stac_asset(
+            input.a_path,
+            "image/tiff; application=geotiff",
+            "Polarimetric anisotropy A ∈ [0, 1]",
+            &["data"],
+        ),
+    );
+    assets.insert(
+        "mean_alpha".to_owned(),
+        stac_asset(
+            input.alpha_path,
+            "image/tiff; application=geotiff",
+            "Mean scattering angle alpha ∈ [0°, 90°]",
+            &["data"],
+        ),
+    );
+
+    let item = StacItem {
+        item_type: "Feature",
+        stac_version: "1.0.0",
+        stac_extensions: vec![
+            "https://stac-extensions.github.io/sar/v1.0.0/schema.json",
+            "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+            "https://stac-extensions.github.io/processing/v1.2.0/schema.json",
+            "https://stac-extensions.github.io/sat/v1.0.0/schema.json",
+        ],
+        id: item_id,
+        geometry: GeoJsonPolygon {
+            geometry_type: "Polygon",
+            coordinates: vec![ring],
+        },
+        bbox,
+        properties,
+        assets,
+        links: vec![],
+    };
+
+    let bytes = serde_json::to_vec_pretty(&item)?;
+    std::fs::write(path, &bytes).map_err(|source| StacError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Infer a human-readable DEM source identifier from the DEM directory path.

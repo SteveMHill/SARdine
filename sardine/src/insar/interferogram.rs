@@ -375,6 +375,11 @@ pub fn form_interferogram(
                 for wl in l0..l1 {
                     for wc in c0..c1 {
                         let wi = wl * samples + wc;
+                        // Skip non-finite pixels (e.g. from noise subtraction)
+                        // rather than letting NaN contaminate the whole window.
+                        if !igram_re[wi].is_finite() {
+                            continue;
+                        }
                         sum_ig_re += igram_re[wi] as f64;
                         sum_ig_im += igram_im[wi] as f64;
                         sum_rp += ref_power[wi] as f64;
@@ -409,6 +414,9 @@ pub fn form_interferogram(
                     for wl in l0..l1 {
                         for wc in c0..c1 {
                             let wi = wl * samples + wc;
+                            if !igram_re[wi].is_finite() {
+                                continue;
+                            }
                             sum_ig_re += igram_re[wi] as f64;
                             sum_ig_im += igram_im[wi] as f64;
                         }

@@ -221,6 +221,7 @@ pub(crate) fn build_provenance(
                 OutputMode::Rtc => "rtc",
                 OutputMode::Nrb => "nrb",
                 OutputMode::Grd => "grd",
+                OutputMode::Polsar => "polsar",
             }.to_owned()),
             pixel_spacing_deg: Some(if geocoded.crs.is_metric() {
                 opts.pixel_spacing_m
@@ -421,6 +422,169 @@ pub(crate) fn build_grd_provenance(
         warnings: WarningsInfo {
             cal_lut_extrapolation_gap_px: merged.cal_lut_extrapolation_gap_px,
             noise_lut_extrapolation_gap_px: merged.noise_lut_extrapolation_gap_px,
+        },
+        quality_flags,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PolSAR provenance builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a full [`Provenance`] record for one H/A/Alpha decomposition run.
+///
+/// The geocoded H-band image is used as the representative output for all
+/// geometry fields; all three bands share the same CRS, dimensions, and
+/// geotransform.  `raster_path` in [`OutputInfo`] is left empty — the three
+/// band paths are enumerated in the paired STAC sidecar instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_polsar_provenance(
+    opts: &crate::pipeline_options::ProcessOptions,
+    scene: &crate::types::SceneMetadata,
+    orbit_source: crate::provenance::OrbitSource,
+    dem_dir_str: &str,
+    dem_tile_count: usize,
+    geocoded_h: &crate::terrain_correction::GeocodedImage,
+    quality_flags: Vec<crate::provenance::QualityFlagEntry>,
+    pol_co: Polarization,
+    pol_cross: Polarization,
+    az_looks: usize,
+    rg_looks: usize,
+) -> Result<crate::provenance::Provenance> {
+    use crate::provenance::{
+        BoundingBoxJson, DemInfo, GeoidInfo, InputInfo, OrbitInfo, OutputInfo, ProcessingInfo,
+        Provenance, StatsInfo, WarningsInfo, SCHEMA_VERSION,
+    };
+
+    let bb = scene.bounding_box;
+
+    let safe_path_str = opts
+        .safe
+        .to_str()
+        .ok_or_else(|| anyhow!("--safe path contains non-UTF-8 characters"))?
+        .to_owned();
+
+    let orbit_file_path = match orbit_source {
+        crate::provenance::OrbitSource::Poeorb => Some(
+            opts.orbit
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .unwrap_or("auto")
+                .to_owned(),
+        ),
+        crate::provenance::OrbitSource::Annotation => None,
+    };
+
+    // Report both channels as a combined polarization string, e.g. "VV+VH".
+    let pol_str = format!("{}+{}", pol_co, pol_cross);
+
+    Ok(Provenance {
+        schema_version: SCHEMA_VERSION,
+        generated_utc: chrono::Utc::now().to_rfc3339(),
+        sardine: Provenance::sardine_info(),
+        input: InputInfo {
+            safe_path: safe_path_str,
+            product_id: scene.product_id.clone(),
+            mission: scene.mission.to_string(),
+            acquisition_mode: scene.acquisition_mode.to_string(),
+            orbit_pass_direction: scene.orbit_pass_direction.clone(),
+            absolute_orbit_number: scene.absolute_orbit_number,
+            polarization: pol_str,
+            radar_frequency_hz: scene.radar_frequency_hz,
+            scene_start_utc: scene.start_time.to_rfc3339(),
+            scene_stop_utc: scene.stop_time.to_rfc3339(),
+            scene_bbox_deg: BoundingBoxJson {
+                min_lat: bb.min_lat_deg,
+                max_lat: bb.max_lat_deg,
+                min_lon: bb.min_lon_deg,
+                max_lon: if bb.max_lon_deg > 180.0 {
+                    bb.max_lon_deg - 360.0
+                } else {
+                    bb.max_lon_deg
+                },
+            },
+        },
+        orbit: OrbitInfo {
+            source: orbit_source,
+            file_path: orbit_file_path,
+            reference_epoch_utc: scene.orbit.reference_epoch.to_rfc3339(),
+            state_vector_count: scene.orbit.state_vectors.len(),
+        },
+        dem: DemInfo {
+            directory: dem_dir_str.to_owned(),
+            tile_count: dem_tile_count,
+        },
+        geoid: GeoidInfo {
+            spec: opts.geoid.clone(),
+        },
+        processing: ProcessingInfo {
+            mode: Some("polsar".to_owned()),
+            pixel_spacing_deg: Some(if geocoded_h.crs.is_metric() {
+                opts.pixel_spacing_m
+            } else {
+                opts.pixel_spacing_deg
+            }),
+            target_spacing_m: None,
+            flatten: Some(false), // H/A/Alpha are scattering parameters; no terrain flattening
+            compute_lia: Some(false),
+            noise_floor_db: 0.0, // no noise-floor masking in polsar complex path
+            threads: opts.threads,
+            speckle_filter: None, // polsar operates in complex covariance domain
+            speckle_window: None,
+            speckle_enl: None,
+            speckle_damping: None,
+            speckle_order: None,
+            resampling_kernel: Some(
+                match opts.resampling {
+                    crate::pipeline_options::ResamplingKernel::Bilinear => "bilinear",
+                    crate::pipeline_options::ResamplingKernel::Bicubic => "bicubic",
+                    crate::pipeline_options::ResamplingKernel::Lanczos3 => "lanczos3",
+                }
+                .to_owned(),
+            ),
+        },
+        output: OutputInfo {
+            // polsar writes three bands; individual paths are listed in the STAC sidecar.
+            raster_path: String::new(),
+            lia_sidecar_path: None,
+            mask_sidecar_path: None,
+            cols: geocoded_h.cols,
+            rows: geocoded_h.rows,
+            geotransform: Some(geocoded_h.geotransform),
+            crs_epsg: Some(geocoded_h.crs.epsg()),
+            range_pixel_spacing_m: if geocoded_h.crs.is_metric() {
+                Some(geocoded_h.geotransform[1])
+            } else {
+                None
+            },
+            azimuth_pixel_spacing_m: if geocoded_h.crs.is_metric() {
+                Some(-geocoded_h.geotransform[5])
+            } else {
+                None
+            },
+            range_looks: if rg_looks > 1 { Some(rg_looks) } else { None },
+            azimuth_looks: if az_looks > 1 { Some(az_looks) } else { None },
+            gcps_count: None,
+            units: "dimensionless".to_owned(), // H∈[0,1], A∈[0,1], alpha∈[0°,90°]
+            nodata: "NaN".to_owned(),
+        },
+        stats: StatsInfo {
+            total_pixel_count: geocoded_h.rows * geocoded_h.cols,
+            valid_pixel_count: geocoded_h.valid_pixel_count,
+            dem_missing_count: Some(geocoded_h.dem_missing_count),
+            non_converged_count: Some(geocoded_h.non_converged_count),
+            flat_masked_count: Some(0), // no terrain flattening in polsar mode
+            noise_masked_count: None,
+            db_converted_count: None,
+            db_min: None,
+            db_max: None,
+            db_mean: None,
+            db_median: None,
+        },
+        warnings: WarningsInfo {
+            // polsar complex calibration path does not track per-pixel LUT gaps
+            cal_lut_extrapolation_gap_px: 0,
+            noise_lut_extrapolation_gap_px: 0,
         },
         quality_flags,
     })
