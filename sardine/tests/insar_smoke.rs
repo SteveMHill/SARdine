@@ -44,7 +44,7 @@ fn read_coherence_values(path: &str) -> Vec<f32> {
     let mut decoder = tiff::decoder::Decoder::new(BufReader::new(f)).expect("tiff decoder");
     match decoder.read_image().expect("read tiff") {
         tiff::decoder::DecodingResult::F32(v) => v,
-        other => panic!("expected F32 tiff, got {:?}", other.as_buffer(0).len()),
+        other => panic!("expected F32 tiff, got {other:?}"),
     }
 }
 
